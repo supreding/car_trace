@@ -1,0 +1,9 @@
+[Unit]
+Description=园区车辆轨迹 每日流水线（备份+全园区同步+OCR+GPU，只处理新增）
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/car-trace
+ExecStart=/opt/car-trace/deploy_linux/daily_pipeline.sh
+TimeoutStartSec=8h

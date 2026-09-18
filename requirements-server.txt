@@ -1,0 +1,6 @@
+# 查询服务（含对外开放接口）运行所需依赖，无需 GPU/CUDA。
+# 离线服务器可用: pip install -r requirements-server.txt --find-links <wheels目录>
+flask>=3.0
+numpy>=1.26
+pillow>=10.0
+waitress>=3.0

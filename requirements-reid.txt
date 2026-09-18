@@ -1,0 +1,94 @@
+# 识别流水线（PaddleDetection 检测/属性 + FastReID 特征）环境依赖。
+# 由开发机（Python 3.12 + Windows + CUDA 12.6）pip freeze 整理；适用于 Linux 服务器。
+# 仅跑查询服务不需要本清单（用 requirements-server.txt）。
+# 要求：Python 3.11/3.12 + NVIDIA 显卡及驱动。
+#
+# 平台相关依赖说明（不要跨平台照搬冻结值）：
+#   - nvidia-* 各 CUDA 运行库由 torch/paddle 在 Linux 上自带依赖声明（版本互有钉定，
+#     Windows 上 torch 则把 DLL 打进轮子内），故本清单不钉 nvidia-*；
+#   - protobuf 由 paddle 的版本要求决定，同样不钉。
+#
+# Linux 服务器安装（在项目根目录执行）：
+#   python3.11 -m venv .venv-reid
+#   .venv-reid/bin/pip install "torch==2.12.1+cu126" "torchvision==0.27.1+cu126" \
+#       --find-links https://mirrors.aliyun.com/pytorch-wheels/cu126/ -i https://mirrors.aliyun.com/pypi/simple/
+#   .venv-reid/bin/pip install paddlepaddle-gpu==3.3.1 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
+#   .venv-reid/bin/pip install -r requirements-reid.txt -i https://mirrors.aliyun.com/pypi/simple/
+#
+# Windows 离线安装：先在有网机器 pip download -r requirements-reid.txt -d _wheels，
+# 拷到目标机后 pip install --no-index --find-links=_wheels -r requirements-reid.txt。
+
+# ---- torch cu126（Windows 本地轮子在 _wheels/ 内；Linux 走上面镜像）----
+torch==2.12.1+cu126
+torchvision==0.27.1+cu126
+
+absl-py==2.5.0
+anyio==4.12.1
+beautifulsoup4==4.15.0
+blinker==1.9.0
+certifi==2026.7.22
+charset-normalizer==3.5.1
+click==8.5.0
+colorama==0.4.6
+contourpy==1.3.3
+cycler==0.12.1
+faiss-cpu==1.15.0
+filelock==3.32.4
+Flask==3.1.3
+flatbuffers==25.12.19
+fonttools==4.63.0
+fsspec==2026.7.0
+gdown==6.1.0
+grpcio==1.83.1
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.19
+ImageIO==2.37.4
+imgaug==0.4.0
+itsdangerous==2.2.0
+Jinja2==3.1.6
+joblib==1.5.3
+kiwisolver==1.5.1
+lazy-loader==0.5
+Markdown==3.10.3
+MarkupSafe==3.0.3
+matplotlib==3.11.1
+mpmath==1.3.0
+narwhals==2.25.0
+networkx==3.6.1
+numpy==1.26.4
+onnxruntime==1.29.0
+opencv-python-headless==4.11.0.86
+opt-einsum==3.3.0
+packaging==26.3
+paddlepaddle-gpu==3.3.1
+pillow==12.3.0
+pyclipper==1.4.0
+pyparsing==3.3.2
+PySocks==1.7.1
+python-dateutil==2.9.0.post0
+PyYAML==6.0.3
+rapidocr-onnxruntime==1.4.4
+requests==2.34.2
+safetensors==0.7.0
+scikit-image==0.26.0
+scikit-learn==1.9.0
+scipy==1.17.1
+setuptools==80.9.0
+shapely==2.1.2
+six==1.17.0
+soupsieve==2.9.2
+sympy==1.14.0
+tabulate==0.10.0
+tensorboard==2.21.0
+tensorboard-data-server==0.7.2
+termcolor==3.3.0
+threadpoolctl==3.6.0
+tifffile==2026.3.3
+tqdm==4.70.0
+typing_extensions==4.15.0
+urllib3==2.7.0
+waitress==3.0.2
+Werkzeug==3.1.8
+yacs==0.1.8

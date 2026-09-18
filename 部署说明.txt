@@ -1,0 +1,38 @@
+园区车辆轨迹查询 + 识别流水线 —— 系统速查
+================================================
+
+一、线上服务器（阿里云 ECS 47.101.32.59，当前生产环境）
+  查询页面    http://47.101.32.59/          （标注页 /annotate）
+  开放接口    http://47.101.32.59/api/open/...
+              token: 8cc5318daf2faaeb93dbf21c030dcc053deae8afc5f4c10d
+              （同存于 /data/car-trace/deploy_linux/open_api_token.txt）
+  接口文档    /data/car-trace/app/API接口清单.md（第一节约可直接发给对接方）
+
+  服务管理（SSH 到服务器后）：
+    systemctl status  car-trace            # 查询服务（80 端口，开机自启）
+    systemctl restart car-trace
+    journalctl -u car-trace -f
+
+  每日流水线（systemd 定时器，每天 03:00 北京时间自动跑）：
+    备份数据库（/data/backups/，保留 7 份）
+    → 全园区照片同步（自动发现 data/ 下新园区）+ OCR
+    → GPU 流水线（只处理新增/未处理的抓拍）
+    无新增图片时自动跳过 GPU（状态记为 SKIPPED）。
+    cat  /data/pipeline_status.txt          # 最近一次结果
+    systemctl start car-trace-pipeline      # 手动立即触发
+    journalctl -u car-trace-pipeline -f     # 运行日志
+
+  新园区接入：照片放 /data/car-trace/data/<园区名>/<月份照片根>/<日期>/<订单号>/，
+  等 03:00 自动处理（或手动触发）；页面园区下拉框自动出现，无需改配置。
+
+二、Windows 开发机（建库/流水线也可在此跑，需 NVIDIA GPU）
+  查询服务    双击 启动查询服务.bat
+  流水线      双击 启动识别流水线.bat（需 Python 3.12 + GPU）
+  全量流程    bash run_full_pipeline.sh（Linux）或逐库跑 run_reid_pipeline.ps1
+
+三、数据布局
+  /data/car-trace/app/granary.db    主库（单库多园区：山高荃银丰麦田库 + 农易行临泉辉煌库）
+  /data/car-trace/data/<园区>/...   原始抓拍照片（按 月份照片根/日期/订单 分层）
+  /data/car-trace/app/reid_crops*/  车辆裁剪图
+  /data/backups/                    数据库每日备份（gzip，保留 7 份）
+  /data/car-trace/app/API接口清单.md 全部接口清单与运维手册

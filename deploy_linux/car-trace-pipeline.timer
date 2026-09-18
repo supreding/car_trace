@@ -1,0 +1,9 @@
+[Unit]
+Description=每天 03:00 触发园区车辆流水线（服务器本地时间，北京时间）
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

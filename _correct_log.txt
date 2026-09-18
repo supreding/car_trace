@@ -1,0 +1,258 @@
+ĞÅÏ¢: ÓÃÌá¹©µÄÄ£Ê½ÎŞ·¨ÕÒµ½ÎÄ¼ş¡£
+D:\WorkSpace\car_trace\.venv-reid\Lib\site-packages\paddle\utils\cpp_extension\extension_utils.py:712: UserWarning: No ccache found. Please be aware that recompiling all source files may be required. You can download and install ccache from: https://github.com/ccache/ccache/blob/master/doc/INSTALL.md
+  warnings.warn(warning_message)
+WARNING: Logging before InitGoogleLogging() is written to STDERR
+W0904 10:47:04.703837 16432 gpu_resources.cc:116] Please NOTE: device: 0, GPU Compute Capability: 8.6, Driver API Version: 12.4, Runtime API Version: 12.6
+e[1me[35m--- Running analysis [ir_graph_build_pass]e[0m
+e[1me[35m--- Running analysis [ir_analysis_pass]e[0m
+e[32m--- Running IR pass [map_op_to_another_pass]e[0m
+e[32m--- Running IR pass [is_test_pass]e[0m
+e[32m--- Running IR pass [simplify_with_basic_ops_pass]e[0m
+e[32m--- Running IR pass [delete_quant_dequant_linear_op_pass]e[0m
+e[32m--- Running IR pass [delete_weight_dequant_linear_op_pass]e[0m
+e[32m--- Running IR pass [constant_folding_pass]e[0m
+e[32m--- Running IR pass [silu_fuse_pass]e[0m
+e[32m--- Running IR pass [conv_bn_fuse_pass]e[0m
+e[32m--- Running IR pass [conv_eltwiseadd_bn_fuse_pass]e[0m
+e[32m--- Running IR pass [embedding_eltwise_layernorm_fuse_pass]e[0m
+e[32m--- Running IR pass [multihead_matmul_fuse_pass_v2]e[0m
+e[32m--- Running IR pass [vit_attention_fuse_pass]e[0m
+e[32m--- Running IR pass [fused_multi_transformer_encoder_pass]e[0m
+e[32m--- Running IR pass [fused_multi_transformer_decoder_pass]e[0m
+e[32m--- Running IR pass [fused_multi_transformer_encoder_fuse_qkv_pass]e[0m
+e[32m--- Running IR pass [fused_multi_transformer_decoder_fuse_qkv_pass]e[0m
+e[32m--- Running IR pass [multi_devices_fused_multi_transformer_encoder_pass]e[0m
+e[32m--- Running IR pass [multi_devices_fused_multi_transformer_encoder_fuse_qkv_pass]e[0m
+e[32m--- Running IR pass [multi_devices_fused_multi_transformer_decoder_fuse_qkv_pass]e[0m
+e[32m--- Running IR pass [fuse_multi_transformer_layer_pass]e[0m
+e[32m--- Running IR pass [gpu_cpu_squeeze2_matmul_fuse_pass]e[0m
+e[32m--- Running IR pass [gpu_cpu_reshape2_matmul_fuse_pass]e[0m
+e[32m--- Running IR pass [gpu_cpu_flatten2_matmul_fuse_pass]e[0m
+e[32m--- Running IR pass [gpu_cpu_map_matmul_v2_to_mul_pass]e[0m
+e[32m--- Running IR pass [gpu_cpu_map_matmul_v2_to_matmul_pass]e[0m
+e[32m--- Running IR pass [matmul_scale_fuse_pass]e[0m
+e[32m--- Running IR pass [multihead_matmul_fuse_pass_v3]e[0m
+e[32m--- Running IR pass [gpu_cpu_map_matmul_to_mul_pass]e[0m
+e[32m--- Running IR pass [fc_fuse_pass]e[0m
+e[32m--- Running IR pass [fc_elementwise_layernorm_fuse_pass]e[0m
+e[32m--- Running IR pass [conv_elementwise_add_act_fuse_pass]e[0m
+e[32m--- Running IR pass [conv_elementwise_add2_act_fuse_pass]e[0m
+e[32m--- Running IR pass [conv_elementwise_add_fuse_pass]e[0m
+e[32m--- Running IR pass [transpose_flatten_concat_fuse_pass]e[0m
+e[32m--- Running IR pass [transfer_layout_pass]e[0m
+e[32m--- Running IR pass [transfer_layout_elim_pass]e[0m
+e[32m--- Running IR pass [auto_mixed_precision_pass]e[0m
+e[32m--- Running IR pass [identity_op_clean_pass]e[0m
+e[32m--- Running IR pass [inplace_op_var_pass]e[0m
+e[1me[35m--- Running analysis [ir_params_sync_among_devices_pass]e[0m
+e[1me[35m--- Running analysis [adjust_cudnn_workspace_size_pass]e[0m
+e[1me[35m--- Running analysis [inference_op_replace_pass]e[0m
+e[1me[35m--- Running analysis [save_optimized_model_pass]e[0m
+e[1me[35m--- Running analysis [ir_graph_to_program_pass]e[0m
+-----------  Model Configuration -----------
+Model Arch: YOLO
+Transform Order: 
+--transform op: Resize
+--transform op: Permute
+--------------------------------------------
+[correct] å±æ€§å¤æ ¸ 197 å¼ å¯ç–‘é€‰æ¡†ï¼ˆé‡æ£€é˜ˆå€¼ 0.2ï¼‰ã€‚
+W0904 10:47:06.299630 16432 gpu_resources.cc:245] WARNING: device: 0. The installed Paddle is compiled with CUDNN 9.9, but CUDNN version in your machine is 9.5, which may cause serious incompatible bug. Please recompile or reinstall Paddle with compatible CUDNN version.
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+[correct] å·²å¤„ç† 100/197
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+Test iter 0
+{"selected": 197, "processed": 135, "replaced": 0, "flagged": 120, "unchanged": 15, "skipped": 62}

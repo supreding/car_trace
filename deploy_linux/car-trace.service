@@ -1,0 +1,17 @@
+[Unit]
+Description=园区车辆轨迹查询服务 (Flask/waitress)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/car-trace/app
+ExecStart=/opt/car-trace/.venv-server/bin/python -m waitress --host=0.0.0.0 --port=80 server:app
+Restart=always
+RestartSec=3
+# 开放接口 token：安装脚本会替换成生成的随机值；也可按需追加其他环境变量
+Environment=OPEN_API_TOKEN=__REPLACE_ME__
+# 主库切换（多园区时默认 granary.db；如以农易行为主改这里）
+# Environment=GRANARY_DB=/opt/car-trace/app/nongyixing.db
+
+[Install]
+WantedBy=multi-user.target

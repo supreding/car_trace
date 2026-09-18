@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>车辆 ReID 人工标注工作台</title>
+<style>
+:root{--navy:#143a59;--blue:#1670ad;--teal:#17715f;--amber:#b56a14;--red:#b33b3b;--ink:#26343e;--muted:#687985;--line:#d9e3e9;--bg:#edf2f5;--paper:#fff}
+*{box-sizing:border-box}body{margin:0;font-family:"Microsoft YaHei","PingFang SC",sans-serif;background:var(--bg);color:var(--ink);font-size:13px}button,input,select,textarea{font:inherit}
+header{height:68px;padding:10px 18px;background:linear-gradient(120deg,#123b5d,#176fa9);color:white;display:flex;align-items:center;gap:22px}h1{font-size:19px;margin:0 0 4px}.sub{font-size:11px;opacity:.75}.spacer{flex:1}.stats{display:flex;gap:20px}.stat b{display:block;font-size:18px}.stat span{font-size:10px;opacity:.73}.header-link{color:white;text-decoration:none;border:1px solid rgba(255,255,255,.35);padding:7px 11px;border-radius:6px}
+.workspace{height:calc(100vh - 68px);display:grid;grid-template-columns:310px minmax(450px,1fr) 430px;gap:1px;background:#cfdbe2}.pane{background:var(--paper);min-width:0;overflow:hidden}.pane-title{height:47px;border-bottom:1px solid var(--line);padding:0 13px;display:flex;align-items:center;gap:8px;font-weight:650;color:var(--navy)}
+.filters{padding:10px;border-bottom:1px solid var(--line);display:grid;grid-template-columns:1fr 1fr;gap:7px}.filters select,.filters input{height:33px;border:1px solid #c7d4dc;border-radius:6px;padding:0 8px;min-width:0}.filters .wide{grid-column:1/-1}.queue{height:calc(100% - 151px);overflow:auto;padding:6px}.queue-card{display:grid;grid-template-columns:86px 1fr;gap:8px;padding:7px;border:1px solid transparent;border-radius:8px;cursor:pointer}.queue-card:hover{background:#f3f7f9}.queue-card.active{border-color:#72acd2;background:#eaf4fa}.queue-card img{width:86px;height:62px;object-fit:cover;border-radius:6px;background:#e5ecef}.name{font-weight:650;color:var(--navy);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.small{color:var(--muted);font-size:10px;line-height:1.55}.badge{display:inline-block;padding:2px 5px;border-radius:8px;background:#e8f2f8;color:#165a84;font-size:10px;margin:2px 3px 0 0}.badge.green{background:#e5f3ef;color:#12604f}.badge.amber{background:#faeedf;color:#874c0d}.badge.red{background:#f9e6e6;color:#923636}
+.main{height:100%;display:flex;flex-direction:column}.main-scroll{overflow:auto;flex:1;padding:14px}.current-head{display:flex;justify-content:space-between;gap:10px;margin-bottom:9px}.current-head h2{font-size:16px;margin:0;color:var(--navy)}.current-image{width:100%;max-height:46vh;object-fit:contain;background:#16222b;border-radius:9px;display:block;cursor:zoom-in}.metadata{display:flex;flex-wrap:wrap;gap:5px;margin:9px 0}.tag{background:#edf2f5;padding:4px 7px;border-radius:5px;color:#536570;font-size:11px}.tag.blue{background:#e8f3fa;color:#155c89}.tag.green{background:#e5f3ef;color:#12604f}.form-row{display:grid;grid-template-columns:170px 1fr;gap:7px;margin:8px 0}.form-row input,.form-row textarea{border:1px solid #c7d4dc;border-radius:6px;padding:7px;min-width:0}.form-row textarea{height:58px;resize:vertical}.actions{display:flex;flex-wrap:wrap;gap:7px;padding:12px 14px;border-top:1px solid var(--line);background:#f8fafb}.btn{height:36px;border:0;border-radius:6px;padding:0 13px;color:white;background:var(--blue);cursor:pointer}.btn:hover{filter:brightness(.9)}.btn.same{background:var(--teal)}.btn.different{background:var(--red)}.btn.uncertain{background:var(--amber)}.btn.secondary{background:#dfe8ed;color:var(--navy)}.btn:disabled{opacity:.4;cursor:not-allowed}.hint{margin-left:auto;color:var(--muted);font-size:10px;align-self:center}
+.candidate-pane{height:100%;display:flex;flex-direction:column}.selected-compare{padding:10px;border-bottom:1px solid var(--line);background:#f6f9fa;min-height:126px}.compare-empty{height:105px;display:grid;place-items:center;color:#8797a1}.compare-card{display:grid;grid-template-columns:145px 1fr;gap:10px}.compare-card img{width:145px;height:105px;object-fit:cover;border-radius:7px;cursor:zoom-in}.candidates{overflow:auto;flex:1;padding:7px;display:grid;grid-template-columns:1fr 1fr;gap:7px;align-content:start}.candidate{border:1px solid var(--line);border-radius:8px;overflow:hidden;cursor:pointer;background:white;position:relative}.candidate:hover{border-color:#75acd0}.candidate.selected{border:2px solid var(--blue)}.candidate img{width:100%;height:105px;object-fit:cover;display:block;background:#e6ecef}.candidate-body{padding:6px}.score{position:absolute;right:5px;top:5px;background:rgba(11,40,60,.82);color:#fff;padding:3px 6px;border-radius:9px;font-size:10px}.relation{position:absolute;left:5px;top:5px;color:#fff;padding:3px 6px;border-radius:9px;font-size:10px}.relation.same{background:var(--teal)}.relation.different{background:var(--red)}.relation.uncertain{background:var(--amber)}
+.empty{padding:50px 15px;text-align:center;color:#82929c}.toast{position:fixed;left:50%;bottom:25px;transform:translateX(-50%);background:#173e5b;color:white;padding:9px 16px;border-radius:7px;z-index:30;box-shadow:0 5px 18px #0004}.modal{display:none;position:fixed;inset:0;background:#071017eF;z-index:40;align-items:center;justify-content:center}.modal.show{display:flex}.modal img{max-width:94vw;max-height:92vh;object-fit:contain}.modal button{position:absolute;right:18px;top:14px;border:0;background:none;color:white;font-size:29px;cursor:pointer}
+@media(max-width:1150px){.workspace{grid-template-columns:270px 1fr 360px}}@media(max-width:850px){header{height:auto;flex-wrap:wrap}.stats{order:3;width:100%}.workspace{height:auto;display:block}.pane{min-height:420px}.queue{height:450px}.candidate-pane{height:700px}.hint{display:none}}
+</style>
+</head>
+<body>
+<header>
+  <div><h1>车辆 ReID 人工标注工作台</h1><div class="sub">人工真值独立保存 · 不改写自动车辆编号 · 支持 FastReID 训练清单导出</div></div>
+  <div class="stats" id="stats"><div class="stat"><b>—</b><span>加载中</span></div></div>
+  <div class="spacer"></div><a class="header-link" href="/api/annotations/export.csv">导出训练清单</a><a class="header-link" href="/">返回轨迹系统</a>
+</header>
+<main class="workspace">
+  <section class="pane">
+    <div class="pane-title">待标注队列 <span class="badge" id="queueCount">0</span></div>
+    <div class="filters">
+      <select id="parkSel" class="wide" aria-label="园区"><option value="">全部园区</option></select>
+      <select id="dateSel" aria-label="日期"></select>
+      <select id="stageSel" aria-label="阶段"><option value="">全部阶段</option></select>
+      <select id="stateSel" class="wide" aria-label="标注状态">
+        <option value="unlabeled">未标注</option><option value="assigned">已分配车辆</option>
+        <option value="uncertain">不确定</option><option value="invalid">不可用</option>
+        <option value="reviewed">全部已复核</option><option value="all">全部有效抓拍</option>
+      </select>
+      <input id="annotator" class="wide" placeholder="标注员姓名（会自动记住）" aria-label="标注员">
+    </div>
+    <div class="queue" id="queue"><div class="empty">正在加载…</div></div>
+  </section>
+
+  <section class="pane main">
+    <div class="pane-title">当前抓拍 <span class="badge" id="currentIdentity">尚未分组</span></div>
+    <div class="main-scroll" id="current"><div class="empty">从左侧选择一张抓拍开始标注</div></div>
+    <div class="actions">
+      <button class="btn same" id="sameBtn" disabled>同一辆车 S</button>
+      <button class="btn different" id="differentBtn" disabled>不同车辆 D</button>
+      <button class="btn uncertain" id="pairUncertainBtn" disabled>关系不确定 U</button>
+      <button class="btn" id="newBtn" disabled>新建车辆 N</button>
+      <button class="btn secondary" id="invalidBtn" disabled>图片不可用 X</button>
+      <button class="btn secondary" id="skipBtn" disabled>暂不确定 K</button>
+      <span class="hint">点击右侧候选后判断关系；快捷键在输入框聚焦时禁用</span>
+    </div>
+  </section>
+
+  <section class="pane candidate-pane">
+    <div class="pane-title">相似候选 <span class="small">外观向量仅用于排序</span></div>
+    <div class="selected-compare" id="compare"><div class="compare-empty">选择候选后在这里对比</div></div>
+    <div class="candidates" id="candidates"><div class="empty" style="grid-column:1/-1">尚未选择抓拍</div></div>
+  </section>
+</main>
+<div class="modal" id="modal"><button aria-label="关闭">×</button><img id="modalImage" alt="原图"></div>
+<script>
+const state={date:"",stage:"",park:"",filter:"unlabeled",queue:[],current:null,candidates:[],selected:null};
+const $=id=>document.getElementById(id);const esc=v=>String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const api=async(url,options={})=>{const r=await fetch(url,options),d=await r.json();if(!r.ok){const e=new Error(d.error||`请求失败 ${r.status}`);e.data=d;e.status=r.status;throw e}return d};
+const post=(url,data)=>api(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});
+const timeOnly=v=>v?.includes(" ")?v.split(" ")[1]:(v||"时间未知");
+const annotator=()=>$("annotator").value.trim();
+
+async function init(){
+  $("annotator").value=localStorage.getItem("reidAnnotator")||"";
+  const [dates,stages,parks]=await Promise.all([api("/api/dates"),api("/api/stages"),api("/api/parks")]);
+  $("parkSel").innerHTML='<option value="">全部园区</option>'+parks.map(x=>`<option value="${esc(x.park)}">${esc(x.park||"未标注园区")} · ${x.captures}张</option>`).join("");
+  $("dateSel").innerHTML='<option value="">全部日期</option>'+dates.map(x=>`<option value="${esc(x.date)}">${esc(x.date)} · ${x.count}张</option>`).join("");
+  $("stageSel").innerHTML='<option value="">全部阶段</option>'+stages.map(x=>`<option value="${esc(x.stage)}">${esc(x.stage)} · ${x.count}张</option>`).join("");
+  await Promise.all([loadStats(),loadQueue()]);
+}
+async function loadStats(){const s=await api("/api/annotations/stats");$("stats").innerHTML=[[s.total,"有效抓拍"],[s.reviewed,"已复核"],[s.assigned,"已分组"],[s.identities,"真值车辆"],[s.remaining,"待复核"]].map(x=>`<div class="stat"><b>${x[0]}</b><span>${x[1]}</span></div>`).join("")}
+async function loadQueue(preferredId=0){
+  $("queue").innerHTML='<div class="empty">正在加载…</div>';
+  const url=`/api/annotations/queue?date=${encodeURIComponent(state.date)}&stage=${encodeURIComponent(state.stage)}&park=${encodeURIComponent(state.park)}&state=${encodeURIComponent(state.filter)}&limit=500`;
+  state.queue=await api(url);$("queueCount").textContent=state.queue.length;
+  if(!state.queue.length){$("queue").innerHTML='<div class="empty">当前筛选条件下没有抓拍</div>';return}
+  $("queue").innerHTML=state.queue.map(queueTemplate).join("");
+  const id=preferredId&&state.queue.some(x=>x.id===preferredId)?preferredId:(!state.current?state.queue[0].id:0);
+  if(id)await selectItem(id);
+}
+function queueTemplate(x){const status=x.identity_id?`真值车辆 #${x.identity_id}`:(x.usability==="invalid"?"不可用":x.usability==="uncertain"?"不确定":"未分组");const image=x.vehicle_crop_path?`/api/crop/${x.id}`:`/api/thumb/${x.id}`;return `<article class="queue-card ${state.current?.id===x.id?'active':''}" data-id="${x.id}"><img src="${image}" loading="lazy"><div><div class="name">${esc(x.corrected_plate||x.plate_final||`抓拍 #${x.id}`)}</div><div class="small">${esc(x.stage)} · ${esc(timeOnly(x.capture_time))}<br><span class="badge ${x.identity_id?'green':x.usability?'amber':''}">${esc(status)}</span>${x.identity_size>1?`<span class="badge">${x.identity_size}张</span>`:""}</div></div></article>`}
+async function selectItem(id){
+  $("current").innerHTML='<div class="empty">正在读取抓拍和候选…</div>';$("candidates").innerHTML='<div class="empty" style="grid-column:1/-1">正在计算候选…</div>';state.selected=null;
+  const data=await api(`/api/annotations/item/${id}?limit=30`);state.current=data.item;state.candidates=data.candidates;renderCurrent();renderCandidates();renderCompare();
+  document.querySelectorAll(".queue-card").forEach(x=>x.classList.toggle("active",Number(x.dataset.id)===id));setButtons(true);
+}
+function renderCurrent(){const x=state.current;$("currentIdentity").textContent=x.identity_id?`真值车辆 #${x.identity_id} · ${x.identity_size}张`:(x.usability==="invalid"?"图片不可用":x.usability==="uncertain"?"暂不确定":"尚未分组");$("current").innerHTML=`
+  <div class="current-head"><div><h2>${esc(x.corrected_plate||x.plate_final||`抓拍 #${x.id}`)}</h2><div class="small">${esc(x.filename)}</div></div><button class="btn secondary" data-full="${x.id}">查看原图</button></div>
+  <img class="current-image" src="${x.vehicle_crop_path?`/api/crop/${x.id}`:`/api/image/${x.id}`}" data-full="${x.id}" alt="${x.vehicle_crop_path?'PaddleDetection车辆裁剪':'原始抓拍（尚未生成车辆裁剪）'}">
+  <div class="metadata"><span class="tag blue">${esc(x.stage||"未知阶段")} · ${esc(x.order_id||"")}</span><span class="tag">${esc(x.capture_time||"时间未知")}</span>${x.vehicle_color?`<span class="tag">${esc(x.vehicle_color)}</span>`:""}${x.vehicle_type?`<span class="tag">${esc(x.vehicle_type)}</span>`:""}${x.vehicle_id?`<span class="tag">自动车辆 #${x.vehicle_id}</span>`:""}<span class="tag green">画质 ${esc(x.quality_score??"—")}</span><span class="tag ${x.reid_source==='FastReID'?'green':'amber'}">${esc(x.reid_source||'尚未运行 FastReID')}</span>${x.crop_source?`<span class="tag blue">裁剪：${esc(x.crop_source)}</span>`:""}</div>
+  <div class="form-row"><input id="correctedPlate" value="${esc(x.corrected_plate||"")}" placeholder="人工确认车牌"><textarea id="annotationNotes" placeholder="备注，例如遮挡、挂车变化、判断依据">${esc(x.annotation_notes||"")}</textarea></div>
+  <button class="btn secondary" id="saveMeta">保存车牌与备注</button>`}
+function relationLabel(value){return value==="same"?"同车":value==="different"?"不同":"不确定"}
+function renderCandidates(){$("candidates").innerHTML=state.candidates.length?state.candidates.map(x=>`<article class="candidate ${state.selected?.id===x.id?'selected':''}" data-id="${x.id}"><img src="${x.vehicle_crop_path?`/api/crop/${x.id}`:`/api/thumb/${x.id}`}" loading="lazy"><span class="score">${Math.round(x.similarity*100)}%</span>${x.pair_relation?`<span class="relation ${x.pair_relation}">${relationLabel(x.pair_relation)}</span>`:""}<div class="candidate-body"><div class="name">${esc(x.corrected_plate||x.plate_final||`抓拍 #${x.id}`)}</div><div class="small">${esc(x.stage)} · ${esc(timeOnly(x.capture_time))}${x.identity_id?`<br><span class="badge green">真值 #${x.identity_id} · ${x.identity_size}张</span>`:""}</div></div></article>`).join(""):'<div class="empty" style="grid-column:1/-1">没有可比较的外观候选</div>'}
+function renderCompare(){const x=state.selected;if(!x){$("compare").innerHTML='<div class="compare-empty">选择候选后在这里对比</div>';return}$("compare").innerHTML=`<div class="compare-card"><img src="${x.vehicle_crop_path?`/api/crop/${x.id}`:`/api/image/${x.id}`}" data-full="${x.id}"><div><div class="name">${esc(x.corrected_plate||x.plate_final||`抓拍 #${x.id}`)}</div><div class="small">相似度 ${Math.round(x.similarity*100)}%<br>${esc(x.stage)} · ${esc(x.capture_time||"时间未知")}<br>${esc(x.vehicle_color||"颜色未知")} · ${esc(x.vehicle_type||"车型未知")}${x.identity_id?`<br><span class="badge green">真值车辆 #${x.identity_id}</span>`:""}</div></div></div>`}
+function setButtons(enabled){["newBtn","invalidBtn","skipBtn"].forEach(id=>$(id).disabled=!enabled);["sameBtn","differentBtn","pairUncertainBtn"].forEach(id=>$(id).disabled=!(enabled&&state.selected))}
+function payload(extra={}){return {capture_id:state.current.id,annotator:annotator(),corrected_plate:$("correctedPlate")?.value||"",notes:$("annotationNotes")?.value||"",...extra}}
+async function saveCapture(action,usability="valid"){if(!state.current)return;await post("/api/annotations/capture",payload({action,usability}));toast("已保存");await afterDecision()}
+async function savePair(relation,confirmMerge=false){if(!state.current||!state.selected)return;try{const d=await post("/api/annotations/pair",payload({candidate_id:state.selected.id,relation,confirm_merge:confirmMerge}));toast(d.message||({same:"已确认同车",different:"已确认不同车",uncertain:"已标记关系不确定"}[relation]));if(relation==="same")await afterDecision();else await selectItem(state.current.id);await loadStats()}catch(e){if(e.status===409&&e.data?.requires_confirmation&&confirm(`两张抓拍已分别属于真值车辆 ${e.data.identity_ids.join(" 和 ")}。\n确认合并两个真值车辆组吗？`))return savePair(relation,true);throw e}}
+async function afterDecision(){const oldId=state.current.id;state.current=null;state.selected=null;await Promise.all([loadStats(),loadQueue()]);if(state.queue.length){const index=Math.max(0,state.queue.findIndex(x=>x.id>oldId));await selectItem(state.queue[index]?.id||state.queue[0].id)}else{$("current").innerHTML='<div class="empty">当前队列已完成</div>';$("candidates").innerHTML='<div class="empty" style="grid-column:1/-1">没有候选</div>';setButtons(false)}}
+function toast(text){const n=document.createElement("div");n.className="toast";n.textContent=text;document.body.appendChild(n);setTimeout(()=>n.remove(),1800)}
+function openImage(id){$("modalImage").src=`/api/image/${id}`;$("modal").classList.add("show")}
+
+$("queue").addEventListener("click",e=>{const card=e.target.closest("[data-id]");if(card)selectItem(Number(card.dataset.id))});
+$("candidates").addEventListener("click",e=>{const card=e.target.closest("[data-id]");if(!card)return;state.selected=state.candidates.find(x=>x.id===Number(card.dataset.id));renderCandidates();renderCompare();setButtons(true)});
+$("current").addEventListener("click",e=>{const full=e.target.closest("[data-full]");if(full)openImage(full.dataset.full);if(e.target.id==="saveMeta")saveCapture("update",state.current.usability||"valid").catch(showError)});
+$("compare").addEventListener("click",e=>{const full=e.target.closest("[data-full]");if(full)openImage(full.dataset.full)});
+$("sameBtn").onclick=()=>savePair("same").catch(showError);$("differentBtn").onclick=()=>savePair("different").catch(showError);$("pairUncertainBtn").onclick=()=>savePair("uncertain").catch(showError);$("newBtn").onclick=()=>saveCapture("new_identity").catch(showError);$("invalidBtn").onclick=()=>saveCapture("clear_identity","invalid").catch(showError);$("skipBtn").onclick=()=>saveCapture("clear_identity","uncertain").catch(showError);
+$("annotator").addEventListener("change",e=>localStorage.setItem("reidAnnotator",e.target.value));
+$("dateSel").onchange=e=>{state.date=e.target.value;loadQueue().catch(showError)};$("stageSel").onchange=e=>{state.stage=e.target.value;loadQueue().catch(showError)};$("parkSel").onchange=e=>{state.park=e.target.value;state.current=null;loadQueue().catch(showError)};$("stateSel").onchange=e=>{state.filter=e.target.value;state.current=null;loadQueue().catch(showError)};
+$("modal").addEventListener("click",e=>{if(e.target===$("modal")||e.target.tagName==="BUTTON"){$("modal").classList.remove("show");$("modalImage").src=""}});
+document.addEventListener("keydown",e=>{if(["INPUT","TEXTAREA","SELECT"].includes(document.activeElement.tagName))return;if(e.key==="Escape")$("modal").classList.remove("show");if(e.key.toLowerCase()==="s"&&!$("sameBtn").disabled)$("sameBtn").click();if(e.key.toLowerCase()==="d"&&!$("differentBtn").disabled)$("differentBtn").click();if(e.key.toLowerCase()==="u"&&!$("pairUncertainBtn").disabled)$("pairUncertainBtn").click();if(e.key.toLowerCase()==="n"&&!$("newBtn").disabled)$("newBtn").click();if(e.key.toLowerCase()==="x"&&!$("invalidBtn").disabled)$("invalidBtn").click();if(e.key.toLowerCase()==="k"&&!$("skipBtn").disabled)$("skipBtn").click()});
+function showError(e){console.error(e);toast(e.message||String(e))}init().catch(showError);
+</script>
+</body>
+</html>

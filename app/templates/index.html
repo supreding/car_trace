@@ -1,0 +1,848 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>园区车辆轨迹系统</title>
+  <style>
+    :root {
+      --bg: #ffffff;
+      --panel: #f7f8fa;
+      --line: #e5e7eb;
+      --text: #111827;
+      --muted: #6b7280;
+      --blue: #2563eb;
+      --blue-soft: #eff6ff;
+      --green: #16a34a;
+      --amber: #d97706;
+      --red: #dc2626;
+      --purple: #7c3aed
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0
+    }
+
+    html,
+    body {
+      height: 100%
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.55 "Segoe UI", "Microsoft YaHei", sans-serif;
+      display: flex;
+      flex-direction: column
+    }
+
+    a {
+      color: var(--blue);
+      text-decoration: none
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      padding: 10px 18px;
+      background: var(--bg);
+      border-bottom: 1px solid var(--line)
+    }
+
+    header h1 {
+      font-size: 16px;
+      font-weight: 600;
+      color: var(--text)
+    }
+
+    header .spacer {
+      flex: 1
+    }
+
+    #statChips {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap
+    }
+
+    .chip {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 2px 10px;
+      font-size: 12px;
+      color: var(--muted)
+    }
+
+    .chip b {
+      color: var(--text)
+    }
+
+    .toolbar {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      padding: 10px 18px;
+      border-bottom: 1px solid var(--line);
+      background: var(--bg);
+      flex-wrap: wrap
+    }
+
+    .toolbar input,
+    .toolbar select {
+      background: var(--bg);
+      border: 1px solid var(--line);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 6px 10px;
+      font-size: 13px;
+      outline: none
+    }
+
+    .toolbar input:focus {
+      border-color: var(--blue);
+      box-shadow: 0 0 0 2px var(--blue-soft)
+    }
+
+    .toolbar input {
+      width: 200px
+    }
+
+    .toolbar .go {
+      background: var(--blue);
+      border: none;
+      color: #fff;
+      padding: 7px 18px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 13px
+    }
+
+    .toolbar .go:hover {
+      filter: brightness(1.08)
+    }
+
+    .tabs {
+      display: flex;
+      gap: 4px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 3px;
+      margin-right: 14px
+    }
+
+    .tabs button {
+      background: transparent;
+      border: none;
+      color: var(--muted);
+      padding: 7px 26px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 14px
+    }
+
+    .tabs button.active {
+      background: var(--blue);
+      color: #fff;
+      font-weight: 600
+    }
+
+    .side-date {
+      width: 130px
+    }
+
+    .layout {
+      flex: 1;
+      display: flex;
+      min-height: 0
+    }
+
+    #sidebar {
+      width: 300px;
+      flex: none;
+      border-right: 1px solid var(--line);
+      overflow-y: auto;
+      background: var(--bg)
+    }
+
+    .side-item {
+      display: flex;
+      gap: 10px;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      cursor: pointer
+    }
+
+    .side-item:hover {
+      background: var(--panel)
+    }
+
+    .side-item.active {
+      background: var(--blue-soft);
+      box-shadow: inset 3px 0 0 var(--blue)
+    }
+
+    .side-item img {
+      width: 86px;
+      height: 60px;
+      object-fit: cover;
+      border-radius: 6px;
+      border: 1px solid var(--line);
+      background: #f1f3f7;
+      flex: none
+    }
+
+    .side-item .t {
+      font-size: 13px;
+      font-weight: 600;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap
+    }
+
+    .side-item .s {
+      font-size: 12px;
+      color: var(--muted);
+      margin-top: 2px
+    }
+
+    .side-empty {
+      color: var(--muted);
+      text-align: center;
+      padding: 40px 16px;
+      font-size: 13px
+    }
+
+    main {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px 22px;
+      min-width: 0
+    }
+
+    .main-head {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 6px
+    }
+
+    .main-head h2 {
+      font-size: 16px
+    }
+
+    .main-head .sub {
+      color: var(--muted);
+      font-size: 13px
+    }
+
+    .main-head .actions {
+      margin-left: auto;
+      display: flex;
+      gap: 8px
+    }
+
+    .main-head .actions button {
+      background: var(--bg);
+      border: 1px solid var(--line);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 4px 12px;
+      cursor: pointer;
+      font-size: 12px
+    }
+
+    .main-head .actions button:hover {
+      border-color: var(--blue);
+      color: var(--blue)
+    }
+
+    .attr-tags {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin-bottom: 14px
+    }
+
+    .tl {
+      border-top: 1px solid var(--line)
+    }
+
+    .tl-row {
+      display: flex;
+      gap: 14px;
+      padding: 12px 0;
+      border-bottom: 1px solid var(--line);
+      align-items: flex-start
+    }
+
+    .tl-time {
+      width: 110px;
+      flex: none
+    }
+
+    .tl-time .hms {
+      font-size: 15px;
+      font-weight: 600
+    }
+
+    .tl-time .d {
+      font-size: 12px;
+      color: var(--muted)
+    }
+
+    .tl-img {
+      width: 250px;
+      flex: none
+    }
+
+    .tl-img img {
+      width: 250px;
+      height: 160px;
+      object-fit: cover;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: #f1f3f7;
+      cursor: zoom-in
+    }
+
+    .tl-body {
+      flex: 1;
+      min-width: 0
+    }
+
+    .tl-body .row1 {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      align-items: center;
+      margin-bottom: 6px
+    }
+
+    .tl-body .meta {
+      font-size: 12px;
+      color: var(--muted);
+      display: grid;
+      grid-template-columns: 96px 1fr;
+      gap: 2px 8px
+    }
+
+    .tl-body .meta b {
+      color: var(--text);
+      font-weight: 500
+    }
+
+    .badge {
+      display: inline-block;
+      font-size: 11px;
+      border-radius: 9px;
+      padding: 1px 8px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      color: var(--muted)
+    }
+
+    .badge.green {
+      color: var(--green);
+      border-color: #bbf7d0;
+      background: #f0fdf4
+    }
+
+    .badge.amber {
+      color: var(--amber);
+      border-color: #fde68a;
+      background: #fffbeb
+    }
+
+    .badge.red {
+      color: var(--red);
+      border-color: #fecaca;
+      background: #fef2f2
+    }
+
+    .badge.blue {
+      color: var(--blue);
+      border-color: #bfdbfe;
+      background: var(--blue-soft)
+    }
+
+    .badge.purple {
+      color: var(--purple);
+      border-color: #ddd6fe;
+      background: #f5f3ff
+    }
+
+    .rowbtn {
+      background: var(--bg);
+      border: 1px solid var(--line);
+      color: var(--muted);
+      border-radius: 6px;
+      padding: 2px 10px;
+      cursor: pointer;
+      font-size: 12px
+    }
+
+    .rowbtn:hover {
+      color: var(--blue);
+      border-color: var(--blue)
+    }
+
+    .rowbtn.accent {
+      background: var(--blue-soft);
+      border-color: var(--blue);
+      color: var(--blue);
+      font-weight: 600
+    }
+
+    .rowbtn.accent:hover {
+      background: var(--blue);
+      color: #fff
+    }
+
+    .empty {
+      color: var(--muted);
+      padding: 60px 20px;
+      text-align: center
+    }
+
+    #modal {
+      position: fixed;
+      inset: 0;
+      background: rgba(17, 24, 39, .75);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 50;
+      cursor: zoom-out
+    }
+
+    #modal.show {
+      display: flex
+    }
+
+    #modal img {
+      max-width: 96vw;
+      max-height: 96vh;
+      border-radius: 8px;
+      background: #fff
+    }
+
+    #toast {
+      position: fixed;
+      bottom: 24px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: #111827;
+      color: #fff;
+      padding: 8px 20px;
+      border-radius: 8px;
+      display: none;
+      z-index: 60;
+      font-size: 13px
+    }
+  </style>
+</head>
+
+<body>
+  <header>
+    <h1>园区车辆轨迹系统</h1>
+    <div class="spacer"></div>
+    <div id="statChips"></div>
+  </header>
+
+  <div class="toolbar">
+    <div class="tabs">
+      <button id="tabVehicle" class="active" onclick="switchTab('vehicle')">车辆</button>
+      <button id="tabOrder" onclick="switchTab('order')">订单</button>
+    </div>
+    <select id="parkSel" title="园区筛选：车辆轨迹按园区隔离，不会跨园区追踪"></select>
+    <input type="text" id="plateInput" placeholder="车牌搜索，如 KDV691">
+    <input type="text" id="orderInput" placeholder="订单号搜索">
+    <select id="dateSel" class="side-date">
+      <option value="">全部日期</option>
+    </select>
+    <button class="go" onclick="doSearch()">搜索</button>
+  </div>
+
+  <div class="layout">
+    <aside id="sidebar">
+      <div class="side-empty">加载中…</div>
+    </aside>
+    <main id="main">
+      <div class="empty">从左侧选择一辆车或一个订单，查看按时间排列的完整轨迹</div>
+    </main>
+  </div>
+
+  <div id="modal" onclick="this.classList.remove('show')"><img id="modalImage" alt=""></div>
+  <div id="toast"></div>
+
+  <script>
+    "use strict";
+    const $ = id => document.getElementById(id);
+    const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+    async function api(url, opts) {const r = await fetch(url, opts); if (!r.ok) {let msg; try {msg = (await r.json()).error} catch (_) {msg = r.statusText} throw new Error(msg)} return r.json()}
+    function toast(msg) {const t = $("toast"); t.textContent = msg; t.style.display = "block"; clearTimeout(t._h); t._h = setTimeout(() => t.style.display = "none", 2200)}
+    function hmsOf(v) {const m = String(v || "").match(/(\d{2}:\d{2}:\d{2})$/); return m ? m[1] : ""}
+    function dateOf(v) {return String(v || "").slice(0, 10)}
+    const stageColor = {"入磅": "blue", "出磅": "green", "抓拍": "purple", "质检": "amber"};
+    const COLOR_CN = {yellow: "黄色", orange: "橙色", green: "绿色", gray: "灰色", red: "红色", blue: "蓝色", white: "白色", golden: "金色", brown: "棕色", black: "黑色"};
+    const TYPE_CN = {sedan: "轿车", suv: "SUV", van: "厢式车", hatchback: "两厢车", mpv: "MPV", pickup: "皮卡", bus: "客车", truck: "货车", estate: "旅行车"};
+
+    const state = {tab: "vehicle", date: "", park: "", items: [], active: null};
+    let multiPark = false; // 系统内是否多于一个园区（决定是否显示园区标签）
+
+    function parkQ() {return state.park ? `&park=${encodeURIComponent(state.park)}` : "";}
+    // 用在没有任何查询参数的路径上（需要 ? 开头）；parkQ() 的 & 形式只用于追加到已有查询串
+    function parkQ2() {const q = parkQ(); return q ? "?" + q.slice(1) : "";}
+
+    function imgTag(x, w) { // 优先车辆裁剪，缺失回退原图
+      const src = x.vehicle_crop_path ? `/api/crop/${x.id}` : `/api/thumb/${x.id}`;
+      return `<img src="${src}" loading="lazy" onerror="this.onerror=null;this.src='/api/thumb/${x.id}'" onclick="showModal('/api/image/${x.id}')" alt="">`;
+    }
+
+    /* ---------------- 左侧竖栏 ---------------- */
+    function sideItemHTML(it) {
+      const thumb = state.tab === "vehicle" ? `/api/crop/${it.rep_id}` : `/api/crop/${it.rep_id || ""}`;
+      const img = `<img src="${thumb}" loading="lazy" onerror="this.onerror=null;this.src='/api/thumb/${it.rep_id}'" alt="">`;
+      // 园区标签只在"全部园区"视图显示（选定了园区时本园区内无需区分）
+      const parkTag = (multiPark && !state.park) ? `<span class="badge">${esc(it.park || "未标注园区")}</span>` : "";
+      if (state.tab === "vehicle") {
+        const t = `车辆 #${it.vehicle_id}`;
+        const s = [esc(it.plate || "无车牌"), esc(COLOR_CN[it.color] || it.color || "色未知"),
+        esc(TYPE_CN[it.vehicle_type] || it.vehicle_type || ""), `${it.count}张`].filter(Boolean).join(" · ");
+        return `<div class="side-item" data-key="v${it.vehicle_id}">${img}<div style="min-width:0"><div class="t">${t} ${parkTag}</div><div class="s">${s}</div>
+      <div class="s">${esc((it.first_seen || "").slice(5, 16))} ~ ${esc((it.last_seen || "").slice(11, 19))}</div></div></div>`;
+      }
+      const t = `订单 ${it.order_id}`;
+      const s = [`${it.count}张`, it.date_span > 1 ? `跨${it.date_span}天` : "",
+      esc(COLOR_CN[it.vehicle_color] || it.vehicle_color || ""), esc(TYPE_CN[it.vehicle_type] || it.vehicle_type || "")]
+        .filter(Boolean).join(" · ");
+      return `<div class="side-item" data-key="o${esc(it.order_id)}">${img}<div style="min-width:0"><div class="t">${t} ${parkTag}</div><div class="s">${s}</div>
+    <div class="s">${esc((it.first_seen || "").slice(0, 16))}起</div></div></div>`;
+    }
+
+    async function loadSidebar() {
+      const side = $("sidebar");
+      try {
+        const q = `${state.date ? `&date=${encodeURIComponent(state.date)}` : ""}${parkQ()}`;
+        if (state.tab === "vehicle") {
+          state.items = await api(`/api/vehicles?limit=500${q}`);
+        } else {
+          state.items = await api(`/api/orders?limit=500${q}`);
+        }
+        side.innerHTML = state.items.length ? state.items.map(sideItemHTML).join("")
+          : '<div class="side-empty">没有数据</div>';
+        side.querySelectorAll(".side-item").forEach((el, i) => {
+          el.onclick = () => selectItem(state.items[i], el);
+        });
+      } catch (e) {side.innerHTML = `<div class="side-empty">${esc(e.message)}</div>`}
+    }
+
+    function markActive(key) {
+      document.querySelectorAll(".side-item").forEach(el => el.classList.toggle("active", el.dataset.key === key));
+    }
+
+    async function selectItem(it, el) {
+      state.active = it;
+      markActive((state.tab === "vehicle" ? "v" : "o") + (state.tab === "vehicle" ? it.vehicle_id : it.order_id));
+      if (state.tab === "vehicle") await showVehicle(it.vehicle_id);
+      else await showOrder(it.order_id);
+    }
+
+    /* ---------------- 主区时间线 ---------------- */
+    function tlRow(x) {
+      const badges = [
+        x.stage ? `<span class="badge ${stageColor[x.stage] || ""}">${esc(x.stage)}</span>` : "",
+        x.capture_status === "no_vehicle" ? '<span class="badge red">未检测到车辆</span>' : "",
+        x.detection_count > 1 ? `<span class="badge amber">多目标 ${x.detection_count}</span>` : "",
+        x.extra_vehicles > 0 ? `<span class="badge purple">同帧另有 ${x.extra_vehicles} 辆车</span>` : "",
+        x.vehicle_det_score != null ? (x.vehicle_det_score < 0.8
+          ? `<span class="badge amber">检测置信度 ${Math.round(x.vehicle_det_score * 100)}%（低）</span>`
+          : `<span class="badge green">检测置信度 ${Math.round(x.vehicle_det_score * 100)}%</span>`) : "",
+        x.ocr_status && x.ocr_status !== "ok" ? '<span class="badge amber">时间不确定</span>' : "",
+        (x.status_reason || "").includes("待人工复核") ? '<span class="badge red">属性冲突待复核</span>' : "",
+        x.plate_final ? `<span class="badge blue">${esc(x.plate_final)}</span>` : "",
+        x.vehicle_color ? `<span class="badge">${esc(COLOR_CN[x.vehicle_color] || x.vehicle_color)}${x.vehicle_color_conf ? ` ${Math.round(x.vehicle_color_conf * 100)}%` : ""}</span>` : "",
+        x.vehicle_type ? `<span class="badge">${esc(TYPE_CN[x.vehicle_type] || x.vehicle_type)}${x.vehicle_type_conf ? ` ${Math.round(x.vehicle_type_conf * 100)}%` : ""}</span>` : "",
+      ].join("");
+      return `<div id="tlw-${x.id}">
+    <div class="tl-row">
+    <div class="tl-time"><div class="hms">${esc(hmsOf(x.capture_time) || "--:--:--")}</div><div class="d">${esc(x.date || "")}</div>
+      <button class="rowbtn accent" style="margin-top:6px" onclick="trackByImg(${x.id})">查询该车其他出现地点</button>
+      <button class="rowbtn" style="margin-top:6px" onclick="toggleReview(${x.id})">人工复核</button>
+      <button class="rowbtn" style="margin-top:6px" onclick="toggleMove(${x.id})">移动/拆出</button>
+      ${x.extra_vehicles > 0 ? `<button class="rowbtn" style="margin-top:6px" onclick="toggleInstances(${x.id}, this)">同帧车辆 ${x.extra_vehicles}</button>` : ""}</div>
+    <div class="tl-img">${imgTag(x)}</div>
+    <div class="tl-body"><div class="row1">${badges}</div>
+      <div class="meta">
+        <span>订单号</span><b><a href="javascript:void 0" onclick="gotoOrder('${esc(x.order_id || "")}')">${esc(x.order_id || "—")}</a></b>
+        ${multiPark ? `<span>园区</span><b>${esc(x.park || "未标注园区")}</b>` : ""}
+        <span>阶段/摄像头</span><b>${esc(x.camera_key || "—")}</b>
+        <span>车牌(OSD参考)</span><b>${esc(x.osd_plate || "—")}</b>
+        <span>抓拍编号</span><b>#${x.id} · 画质 ${x.quality_score ?? "—"}</b>
+        <span>状态</span><b>${esc(x.capture_status === "no_vehicle" ? "未检测到车辆" : (x.status_reason || "正常"))}</b>
+      </div></div>
+  </div><div class="inst-panel" id="inst-${x.id}" style="display:none"></div><div id="rev-${x.id}" style="display:none"></div><div id="mv-${x.id}" style="display:none"></div></div>`;
+    }
+
+    /* 移动/拆出：把本帧车辆从当前聚合中分出去（新开或并入其他车辆） */
+    async function toggleMove(id) {
+      const panel = $("mv-" + id);
+      if (panel.style.display === "block") {panel.style.display = "none"; return}
+      const x = await api(`/api/capture/${id}`);
+      panel.innerHTML = `<div class="tl-row" style="display:block">
+        <div style="font-size:12px;color:var(--muted);padding:4px 0">移动/拆出 · 抓拍 #${id}（当前车辆 #${x.vehicle_id ?? "无"}）：该车与当前聚合不是同一辆车时，从这里分开。决定会被记住，重跑聚类后仍生效。</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;max-width:640px;font-size:13px">
+          <button class="go" onclick="doMove(${id}, 'new')">拆出为新车辆</button>
+          <input id="mv-target-${id}" placeholder="移动到目标车牌，如 皖KG5M39" style="border:1px solid var(--line);border-radius:6px;padding:5px 8px;background:var(--bg);color:var(--text)">
+          <button class="rowbtn" onclick="doMove(${id}, 'plate', document.getElementById('mv-target-${id}').value)">移动到该车辆聚合</button>
+          <label style="color:var(--muted)"><input type="checkbox" id="mv-order-${id}"> 整个订单一起移动</label>
+        </div>
+        <div id="mv-msg-${id}" style="color:var(--muted);font-size:12px;margin-top:4px"></div>
+      </div>`;
+      panel.style.display = "block";
+    }
+    async function doMove(id, mode, targetPlate) {
+      const body = {id: id, scope: $("mv-order-" + id) && $("mv-order-" + id).checked ? "order" : "capture"};
+      if (mode === "plate") {
+        body.target_plate = (targetPlate || "").trim();
+        if (!body.target_plate) {toast("请输入目标车牌"); return}
+      }
+      try {
+        const res = await api("/api/vehicle_move", {
+          method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify(body)});
+        toast(`已${res.scope === "order" ? "整单" : ""}${res.target === "新开独立聚合" ? "拆出新车辆" : "移动到 " + res.target}`);
+        if (state.reload) await state.reload();
+      } catch (e) {toast(e.message)}
+    }
+
+    /* 人工复核：编辑单个截取车辆的各字段并保存 */
+    let codeCache = null;
+    async function getCodeCache() {
+      if (!codeCache) codeCache = await api("/api/color_type_codes");
+      return codeCache;
+    }
+    async function toggleReview(id) {
+      const panel = $("rev-" + id);
+      if (panel.style.display === "block") {panel.style.display = "none"; return}
+      const x = await api(`/api/capture/${id}`);
+      const codes = await getCodeCache();
+      const opt = (map, sel) => '<option value=""></option>' +
+        Object.entries(map).map(([k, cn]) =>
+          `<option value="${k}"${k === sel ? " selected" : ""}>${cn}（${k}）</option>`).join("");
+      panel.innerHTML = `<div class="tl-row" style="display:block">
+        <div style="font-size:12px;color:var(--muted);padding:4px 0">人工复核 · 抓拍 #${id}：修正各字段后保存；保存即视为完成人工复核。</div>
+        <div style="display:grid;grid-template-columns:110px 1fr;gap:6px 10px;max-width:560px;font-size:13px">
+          <label>车牌</label><input id="rv-plate-${id}" value="${esc(x.plate_final || "")}" placeholder="如 皖K12345，留空清除">
+          <label>颜色</label><select id="rv-color-${id}">${opt(codes.colors, x.vehicle_color || "")}</select>
+          <label>车型</label><select id="rv-type-${id}">${opt(codes.types, x.vehicle_type || "")}</select>
+          <label>拍摄时间</label><input id="rv-time-${id}" value="${esc(x.capture_time || "")}" placeholder="YYYY-MM-DD HH:MM:SS，留空清除">
+          <label>订单号</label><input id="rv-order-${id}" value="${esc(x.order_id || "")}" placeholder="转移到其他订单时填写">
+          <label>备注</label><input id="rv-note-${id}" value="" placeholder="复核说明（可空）">
+        </div>
+        <div style="margin-top:8px;display:flex;gap:8px">
+          <button class="go" onclick="saveReview(${id})">保存修改</button>
+          <button class="rowbtn" onclick="toggleReview(${id})">取消</button>
+          <span id="rv-msg-${id}" style="color:var(--muted);font-size:12px;align-self:center"></span>
+        </div></div>`;
+      panel.style.display = "block";
+    }
+    async function saveReview(id) {
+      const body = {
+        id: id,
+        plate: $("rv-plate-" + id).value.trim(),
+        color: $("rv-color-" + id).value,
+        type: $("rv-type-" + id).value,
+        capture_time: $("rv-time-" + id).value.trim(),
+        order_id: $("rv-order-" + id).value.trim(),
+        note: $("rv-note-" + id).value.trim(),
+        reviewed: true,
+      };
+      try {
+        const res = await api("/api/capture_update", {
+          method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify(body)});
+        toast("已保存：" + (res.touched || []).join("、"));
+        $("rev-" + id).style.display = "none";
+        if (state.lastReload) state.lastReload();
+      } catch (e) {toast(e.message)}
+    }
+
+    /* 同帧其他车辆：每车一条记录，独立裁剪/车牌/属性，分开跟踪 */
+    async function toggleInstances(id, btn) {
+      const panel = $("inst-" + id);
+      if (panel.style.display === "block") {panel.style.display = "none"; return}
+      const list = await api(`/api/instances/${id}`);
+      panel.innerHTML = list.length ? `<div style="font-size:12px;color:var(--muted);padding:8px 0 4px">同帧检测到的其他车辆（独立记录，不属于本订单主车）：</div>
+        <div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(180px,1fr))">
+        ${list.map(v => `<div class="card" style="max-width:220px">
+          <img src="${v.crop_url}" loading="lazy" style="width:100%;height:110px;object-fit:cover">
+          <div class="body" style="padding:6px 8px">
+            <div class="t" style="font-size:12px">同帧车辆 #${v.id}${v.vehicle_id ? ` · 车辆 #${v.vehicle_id}` : ""}</div>
+            <div class="s" style="font-size:12px;color:var(--muted)">
+              ${v.lpr_plate ? "车牌 " + esc(v.lpr_plate) + "<br>" : ""}${esc(v.vehicle_color || "")} ${esc(v.vehicle_type || "")} · 置信度 ${Math.round((v.vehicle_det_score || 0) * 100)}%</div>
+          </div></div>`).join("")}</div>` : '<div class="s" style="padding:6px 0">同帧车辆暂无更多数据</div>';
+      panel.style.display = "block";
+    }
+
+    function mainHead(title, sub, attrs) {
+      const attrTags = attrs ? (attrs.vehicle_color || attrs.vehicle_type ? `
+    <div class="attr-tags">
+      ${attrs.vehicle_color ? `<span class="badge blue">订单颜色 ${esc(COLOR_CN[attrs.vehicle_color] || attrs.vehicle_color)} ${Math.round((attrs.vehicle_color_conf || 0) * 100)}%</span>` : ""}
+      ${attrs.vehicle_type ? `<span class="badge">订单车型 ${esc(TYPE_CN[attrs.vehicle_type] || attrs.vehicle_type)} ${Math.round((attrs.vehicle_type_conf || 0) * 100)}%</span>` : ""}
+      <span class="badge">${attrs.sample_count || 0} 张投票</span>
+    </div>`: "") : "";
+      $("main").innerHTML = `<div class="main-head"><h2>${title}</h2><span class="sub">${sub || ""}</span>
+      <div class="actions"><button onclick="switchTab(state.tab,true)">刷新列表</button></div></div>${attrTags}<div class="tl" id="tl"></div>`;
+    }
+
+    async function showVehicle(vid) {
+      state.reload = () => showVehicle(vid);
+      try {
+        const rows = await api(`/api/track?vid=${vid}`);
+        const it = state.active || {};
+        mainHead(`车辆 #${vid}`,
+          `${rows.length} 张 · ${esc(it.plate || "无车牌")} · 订单 ${esc(it.order_ids || it.order_id || "—")}${multiPark ? ` · ${esc(rows[0]?.park || it.park || "未标注园区")}` : ""}`);
+        $("tl").innerHTML = rows.length ? rows.map(tlRow).join("") : '<div class="empty">没有抓拍</div>';
+      } catch (e) {toast(e.message)}
+    }
+
+    async function showOrder(oid, park) {
+      state.reload = () => showOrder(oid, park);
+      try {
+        const data = await api(`/api/order/${encodeURIComponent(oid)}${parkQ2()}`);
+        const items = data.items || [];
+        const parkLabel = data.park || items[0]?.park || "";
+        mainHead(`订单 ${esc(oid)}`,
+          `${items.length} 张 · 跨 ${new Set(items.map(i => i.date)).size} 个日期文件夹${multiPark ? ` · ${esc(parkLabel || "未标注园区")}` : ""}`, data.attributes);
+        $("tl").innerHTML = items.length ? items.map(tlRow).join("") : '<div class="empty">没有抓拍</div>';
+      } catch (e) {
+        $("main").innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+        toast(e.message);
+      }
+    }
+
+    async function gotoOrder(oid) {if (!oid) return; setTabUI("order"); await loadSidebar(); await showOrder(oid); markActive("o" + oid); window.scrollTo(0, 0)}
+
+    /* ---------------- 搜索 ---------------- */
+    async function doSearch() {
+      const plate = $("plateInput").value.trim();
+      const order = $("orderInput").value.trim();
+      if (!plate && !order) {toast("请输入车牌或订单号"); return }
+      if (order) {
+        // 订单号搜索：过滤左侧列表；完整单号直接打开对应轨迹。
+        // 注意不能调用 switchTab：它会在异步重载列表后自动选中第一项，
+        // 把刚打开的搜索结果覆盖掉（竞态）。
+        setTabUI("order");
+        state.items = await api(`/api/orders?q=${encodeURIComponent(order)}&limit=500${parkQ()}`);
+        renderSidebarWithItems();
+        const exact = state.items.find(x => x.order_id === order);
+        if (exact) {await selectItem(exact)}
+        else if (state.items.length === 1) {await selectItem(state.items[0])}
+        else if (state.items.length === 0) {
+          try {
+            await showOrder(order); markActive("o" + order);
+          } catch (e) {$("main").innerHTML = `<div class="empty">没有匹配「${esc(order)}」的订单</div>`}
+        }
+        else {$("main").innerHTML = `<div class="empty">匹配 ${state.items.length} 个订单，从左侧选择查看轨迹</div>`}
+        $("orderInput").value = ""; return;
+      }
+      if (plate) {
+        state.reload = () => {$("plateInput").value = plate; doSearch();};
+        const rows = await api(`/api/track?plate=${encodeURIComponent(plate)}${state.date ? `&date=${state.date}` : ""}${parkQ()}`);
+        mainHead(`车牌「${esc(plate)}」`, `命中 ${rows.length} 张（含摄像头OSD参考值）${multiPark ? " · 同牌车跨园区时身份独立，可按园区筛选" : ""}`);
+        $("tl").innerHTML = rows.length ? rows.map(tlRow).join("") : '<div class="empty">没有命中的抓拍</div>';
+        // 高亮命中的车辆
+        const vids = [...new Set(rows.map(r => r.vehicle_id).filter(Boolean))];
+        if (vids.length === 1 && state.tab === "vehicle") markActive("v" + vids[0]);
+      }
+    }
+
+    function renderSidebarWithItems() {
+      const side = $("sidebar");
+      side.innerHTML = state.items.length ? state.items.map(sideItemHTML).join("") : '<div class="side-empty">没有匹配结果</div>';
+      side.querySelectorAll(".side-item").forEach((el, i) => el.onclick = () => selectItem(state.items[i], el));
+    }
+
+    /* ---------------- 以图搜车 ---------------- */
+    async function trackByImg(id) {
+      state.reload = () => trackByImg(id);
+      try {
+        const data = await api(`/api/track_by_img?id=${id}`);
+        const items = (data.items || []).filter(x => x.id !== id);
+        mainHead(`查询该车其他出现地点（抓拍 #${id}）`, `${data.method} · ${items.length} 个候选`);
+        $("tl").innerHTML = items.length ? items.map(x => {
+          const row = tlRow(x);
+          return row.replace('<div class="tl-time">', `<div class="tl-time"><span class="badge green">${Math.round((x.similarity || 0) * 100)}%</span><br>`);
+        }).join("") : '<div class="empty">没有相似候选（或被车型冲突过滤）</div>';
+      } catch (e) {toast(e.message)}
+    }
+
+    /* ---------------- 切换与初始化 ---------------- */
+    function showModal(src) {$("modalImage").src = src; $("modal").classList.add("show")}
+
+    // 回车搜索：直接绑定，不等待接口初始化，避免初始化期间按回车无效。
+    $("plateInput").addEventListener("keydown", e => {if (e.key === "Enter") doSearch()});
+    $("orderInput").addEventListener("keydown", e => {if (e.key === "Enter") doSearch()});
+    function setTabUI(tab) {
+      state.tab = tab;
+      $("tabVehicle").classList.toggle("active", tab === "vehicle");
+      $("tabOrder").classList.toggle("active", tab === "order");
+    }
+    async function switchTab(tab, keep) {
+      setTabUI(tab);
+      await loadSidebar();
+      if (keep) return;
+      $("main").innerHTML = '<div class="empty">从左侧选择一辆车或一个订单，查看按时间排列的完整轨迹</div>';
+      // 与初始加载一致：自动选中第一项
+      if (state.items.length) await selectItem(state.items[0]);
+    }
+
+    (async function init() {
+      try {
+        const [stats, dates, parks] = await Promise.all([
+          api(`/api/stats${parkQ2()}`), api(`/api/dates${parkQ2()}`), api("/api/parks")]);
+        multiPark = parks.length > 1;
+        $("statChips").innerHTML = [
+          ["抓拍", stats.total], ["订单", stats.orders], ["车辆", stats.vehicles],
+          ["已裁剪", stats.cropped], ["无车", stats.no_vehicle], ["多目标", stats.multi_vehicle],
+        ].map(([k, v]) => `<span class="chip"><b>${v}</b> ${k}</span>`).join("");
+        $("parkSel").innerHTML = `<option value="">全部园区</option>` + parks.map(p =>
+          `<option value="${esc(p.park)}"${state.park === p.park ? " selected" : ""}>${esc(p.park || "未标注园区")}（${p.captures}）</option>`).join("");
+        $("parkSel").onchange = e => {state.park = e.target.value; onParkChange()};
+        $("dateSel").innerHTML = `<option value="">全部日期</option>` + dates.map(d => `<option value="${esc(d.date)}">${esc(d.date)}（${d.count}）</option>`).join("");
+        $("dateSel").onchange = e => {state.date = e.target.value; loadSidebar()};
+        await loadSidebar();
+        // 默认选中第一辆车
+        if (state.items.length) await selectItem(state.items[0]);
+      } catch (e) {
+        $("statChips").innerHTML = `<span class="chip">数据库暂不可用：${esc(e.message)}</span>`;
+      }
+    })();
+
+    // 园区切换：统计/日期/列表/主区全部按园区刷新
+    async function onParkChange() {
+      try {
+        const [stats, dates] = await Promise.all([api(`/api/stats${parkQ2()}`), api(`/api/dates${parkQ2()}`)]);
+        $("statChips").innerHTML = [
+          ["抓拍", stats.total], ["订单", stats.orders], ["车辆", stats.vehicles],
+          ["已裁剪", stats.cropped], ["无车", stats.no_vehicle], ["多目标", stats.multi_vehicle],
+        ].map(([k, v]) => `<span class="chip"><b>${v}</b> ${k}</span>`).join("");
+        $("dateSel").innerHTML = `<option value="">全部日期</option>` + dates.map(d => `<option value="${esc(d.date)}">${esc(d.date)}（${d.count}）</option>`).join("");
+      } catch (e) {toast(e.message)}
+      state.date = "";
+      $("main").innerHTML = '<div class="empty">从左侧选择一辆车或一个订单，查看按时间排列的完整轨迹</div>';
+      await loadSidebar();
+      if (state.items.length) await selectItem(state.items[0]);
+    }
+  </script>
+</body>
+
+</html>
