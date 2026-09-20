@@ -24,7 +24,11 @@
 常用命令：
   python build_db.py --sync-only            # 只扫描目录入库，不跑 OCR
   python build_db.py --process-missing      # 对未 OCR 的记录补充时间戳/OSD
+  python build_db.py --retry-failed         # 重跑左上角OCR失败的帧（时刻带抢救通道）
   python build_db.py --associate-only       # 只重新聚合订单内车辆
+  python build_db.py --assign-loose         # 试运行：未关联货车归类到订单
+  python build_db.py --assign-loose --apply # 真正移动文件并写库（可 --undo-loose-assign 撤销）
+  python build_db.py --undo-loose-assign    # 撤销全部归类；--capture-id 123 只撤销单张
   python build_db.py --root data --park 农易行临泉辉煌库   # 只处理指定园区
 """
 from __future__ import annotations
@@ -32,6 +36,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shutil
 import sqlite3
 import time
 from collections import Counter, defaultdict
@@ -81,6 +86,16 @@ def resolve_stored_path(stored: str) -> Path:
         if candidate.is_file():
             return candidate
     return APP_DIR / path
+
+
+def project_file(path: str | Path) -> Path:
+    """把库存相对路径锚定到项目根的绝对路径（文件系统操作专用）。
+
+    归类移动文件时若用相对路径，mkdir/shutil 会相对当前工作目录解析，
+    在 app/ 下误建 data/ 目录树——所有落盘操作必须走本函数转绝对路径。
+    """
+    path = Path(path)
+    return path if path.is_absolute() else APP_DIR.parent / path
 
 # 摄像头叠字常把省份/字母认错，车牌只做归一化保存，匹配规则见实施文档 13.1。
 PLATE_RE = re.compile(
@@ -483,11 +498,92 @@ def run_ocr_text(image: np.ndarray, large: bool = False) -> list[tuple[str, floa
     return [(str(text), float(conf)) for _, text, conf in result]
 
 
+def _cc_text_mask(gray: np.ndarray) -> np.ndarray:
+    """OSD 像素字字形掩膜：白色字芯（>=226）连通域过滤。
+
+    叠字是固定尺寸的像素字：连通域高度落在字高范围内、宽度有限，据此
+    滤掉大块背景（白色车身/天空/墙面）与细碎噪声；面积阈值放宽到 5
+    是为了保留冒号的上下点（两点互不相连，各只有几个像素）。
+    """
+    import cv2
+
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(
+        (gray >= 226).astype(np.uint8), connectivity=8)
+    keep = np.zeros_like(gray, dtype=np.uint8)
+    for i in range(1, n):
+        x, y, w, h, area = stats[i]
+        if 8 <= h <= 90 and w <= 95 and area >= 5:
+            keep[labels == i] = 1
+    return keep
+
+
+def _parse_time_candidates(joined: str) -> set[str]:
+    """从 OCR 文本枚举合法时刻 HH:MM:SS。
+
+    冒号常被读成 . - 空格或干脆丢字符：分隔符放宽为任意 0-2 个非数字；
+    时分秒越界（如把 '07929' 读出 79 分）直接判非法，不生成候选。
+    """
+    candidates = set()
+    for match in re.finditer(r"(\d{1,2})\D{0,2}(\d{2})\D{0,2}(\d{2})", joined):
+        hh, mm, ss = int(match[1]), int(match[2]), int(match[3])
+        if hh <= 23 and mm <= 59 and ss <= 59:
+            candidates.add(f"{hh:02d}:{mm:02d}:{ss:02d}")
+    return candidates
+
+
+def _rescue_timestamp(rgb: np.ndarray, date_box: tuple) -> str:
+    """时刻带抢救：以日期框为锚裁出右侧时刻带，多路预处理重试。
+
+    入磅/出磅镜头的时刻常压在白车/栏杆/树枝等复杂背景上，整条时间带
+    直接 OCR 检测不到文本框（日期部分在深色篷布上反而都能读出）。利用
+    叠字位置相对日期框固定、字芯纯白的特点：裁出右侧等高时刻带后，
+    字形掩膜二值图与原图多倍放大并行重试；不同预处理通道读出同一个
+    合法时刻才采信——单路结果可能把背景纹理误读成数字，宁缺毋滥。
+    """
+    import cv2
+
+    _, x0, y0, x1, y1 = date_box
+    height, width = rgb.shape[:2]
+    box_h = max(8.0, y1 - y0)
+    tx0 = max(0, int(x1 + box_h * 0.15))
+    tx1 = min(width, int(x1 + box_h * 8.6))
+    ty0 = max(0, int(y0 - box_h * 0.35))
+    ty1 = min(height, int(y1 + box_h * 0.35))
+    if tx1 - tx0 < box_h * 2:
+        return ""
+    band = rgb[ty0:ty1, tx0:tx1]
+    gray = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
+    mask_img = np.where(_cc_text_mask(gray) > 0, 0, 255).astype(np.uint8)
+    variants = [
+        cv2.resize(band, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC),
+        cv2.resize(band, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC),
+        cv2.resize(mask_img, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC),
+    ]
+    band_w = band.shape[1]
+    if band_w >= 120:
+        # 宽带切左右两半分别识别：检测网络有最大边长限制，整条宽带会被
+        # 压缩导致小字漏检，切半后有效分辨率翻倍（两端各留 20px 重叠防切字）。
+        variants.append(cv2.resize(band[:, : band_w // 2 + 20], None, fx=2.5, fy=2.5,
+                                   interpolation=cv2.INTER_CUBIC))
+        variants.append(cv2.resize(band[:, band_w // 2 - 20:], None, fx=2.5, fy=2.5,
+                                   interpolation=cv2.INTER_CUBIC))
+    votes: dict[str, int] = {}
+    for image in variants:
+        texts = run_ocr_text(image, large=True)
+        for cand in _parse_time_candidates("".join(t for t, _ in texts)):
+            votes[cand] = votes.get(cand, 0) + 1
+    if not votes:
+        return ""
+    best = max(votes, key=lambda k: votes[k])
+    return best if votes[best] >= 2 else ""
+
+
 def ocr_capture(payload: dict) -> dict:
     """OCR 单张抓拍的时间戳与（抓拍镜头的）底部车辆描述。
 
-    进程池工作函数：时间戳先走小图快速通道，失败再走宽区域大字号重试通道；
-    底部OSD只出现在抓拍镜头，其他阶段跳过。
+    进程池工作函数：时间戳先走小图快速通道，失败再走宽区域大字号重试
+    通道，仍失败则用日期框锚定时刻带走抢救通道；底部OSD只出现在抓拍
+    镜头，其他阶段跳过。
     """
     import cv2
 
@@ -500,14 +596,21 @@ def ocr_capture(payload: dict) -> dict:
     height, width = rgb.shape[:2]
 
     def ocr_region(y0: float, y1: float, x1: float, scale: float,
-                   large: bool = False) -> tuple[str, list[float]]:
+                   large: bool = False) -> tuple[str, list[float], list[tuple]]:
         region = rgb[int(height * y0) : int(height * y1), 0 : int(width * x1)]
         if scale != 1.0:
             region = cv2.resize(region, None, fx=scale, fy=scale,
                                 interpolation=cv2.INTER_AREA)
-        texts = run_ocr_text(region, large=large)
-        return (re.sub(r"\s+", "", " ".join(text for text, _ in texts)),
-                [conf for _, conf in texts])
+        result, _ = get_ocr(large)(region)
+        texts, confs, boxes = [], [], []
+        if result:
+            for box, text, conf in result:
+                texts.append(str(text))
+                confs.append(float(conf))
+                xs = [p[0] / scale for p in box]
+                ys = [p[1] / scale for p in box]
+                boxes.append((str(text), min(xs), min(ys), max(xs), max(ys)))
+        return (re.sub(r"\s+", "", " ".join(texts)), confs, boxes)
 
     def parse_datetime(joined: str) -> tuple[str, str]:
         date_part = time_part = ""
@@ -518,13 +621,19 @@ def ocr_capture(payload: dict) -> dict:
         return date_part, time_part
 
     # 时间戳是轨迹排序的基石：先小图快速识别，失败再走大字号重试通道。
-    top_joined, top_confs = ocr_region(0.0, 0.20, 0.60, 0.6)
+    top_joined, top_confs, top_boxes = ocr_region(0.0, 0.20, 0.60, 0.6)
     capture_date, hms = parse_datetime(top_joined)
+    date_box = next((b for b in top_boxes if DATE_RE.search(b[0])), None)
     confidence_values = list(top_confs)
     if not (capture_date and hms):
-        top_joined, retry_confs = ocr_region(0.0, 0.22, 0.80, 0.9, large=True)
+        top_joined, retry_confs, retry_boxes = ocr_region(0.0, 0.22, 0.80, 0.9, large=True)
         capture_date, hms = parse_datetime(top_joined)
+        date_box = date_box or next((b for b in retry_boxes if DATE_RE.search(b[0])), None)
         confidence_values += list(retry_confs)
+    if not hms and capture_date and date_box:
+        rescued = _rescue_timestamp(rgb, date_box)
+        if rescued:
+            hms = rescued
     time_ok = bool(capture_date and hms)
 
     plate = color = vehicle_type = camera = ""
@@ -605,18 +714,28 @@ def image_quality(image: Image.Image) -> float:
     return round(100.0 * (0.45 * sharpness + 0.35 * contrast + 0.20 * exposure), 1)
 
 
-def process_missing(conn: sqlite3.Connection, limit: int = 0, force: bool = False) -> int:
+def process_missing(conn: sqlite3.Connection, limit: int = 0, force: bool = False,
+                    retry_failed: bool = False) -> int:
     """补充 OCR：时间戳、底部OSD参考、质量分。失败时降级为阶段顺序，不伪造时间。
 
-    OCR 在进程池中并行执行（每个 worker 独立加载 RapidOCR），主进程写库。
+    OCR 在进程池中并行执行（每个 worker 独立加载 RapidOCR），主进程写库；
+    结束后对仍无时间的帧做兄弟帧补时（fill_times_from_siblings）。
+    retry_failed=True 只重跑 ocr_status='fallback' 的历史失败帧（启用时刻带
+    抢救通道后再试一次），不动已成功的帧。
     """
     from concurrent.futures import ProcessPoolExecutor
 
     # 流水线/服务可能并发写库：逐条自动提交，避免长事务长期持有写锁。
     conn.isolation_level = None
+    if force:
+        where = "1=1"
+    elif retry_failed:
+        where = "coalesce(ocr_status,'')='fallback'"
+    else:
+        where = "coalesce(ocr_status,'')=''"
     rows = conn.execute(
         f"""SELECT id, filepath, stage FROM captures
-            WHERE {'1=1' if force else "coalesce(ocr_status,'')=''"}
+            WHERE {where}
             ORDER BY date, order_id, stage_rank, filename"""
         + (" LIMIT ?" if limit else ""),
         () if not limit else (limit,),
@@ -681,19 +800,25 @@ def process_missing(conn: sqlite3.Connection, limit: int = 0, force: bool = Fals
                     status_reason = "人脸抓拍，非车辆图片"
                 elif ocr_status != "ok":
                     status_reason = "时间戳OCR不可用，时间不确定（按阶段顺序推断）"
+                # 车牌字段只在本次读到新 OSD 车牌时覆盖：重跑/重试的帧此前
+                # 可能已由 LPR/correct_pass 写入更可靠的车牌，空读数不得清掉。
                 conn.execute(
                     """UPDATE captures SET capture_time=?, hour=?, ocr_status=?, quality_score=?,
                               osd_plate=?, osd_color=?, osd_type=?, osd_camera=?,
-                              plate_final=?, plate_observed=?, plate_confidence=?,
-                              recognition_source=?, capture_status=CASE
+                              plate_final=CASE WHEN ?!='' THEN ? ELSE plate_final END,
+                              plate_observed=CASE WHEN ?!='' THEN ? ELSE plate_observed END,
+                              plate_confidence=CASE WHEN ?!='' THEN ? ELSE plate_confidence END,
+                              recognition_source=CASE WHEN ?!='' THEN ? ELSE recognition_source END,
+                              capture_status=CASE
                                 WHEN capture_status='no_vehicle' THEN capture_status ELSE 'vehicle' END,
                               status_reason=?
                        WHERE id=?""",
                     (capture_time, hour, ocr_status, osd["quality"],
                      osd_plate, str(osd["osd_color"]), str(osd["osd_type"]),
                      str(osd["osd_camera"]),
-                     osd_plate, osd_plate, float(osd["ocr_conf"]),
-                     "OSD文字" if osd_plate else "", status_reason, capture_id),
+                     osd_plate, osd_plate, osd_plate, osd_plate,
+                     osd_plate, float(osd["ocr_conf"]), osd_plate, "OSD文字",
+                     status_reason, capture_id),
                 )
                 processed += 1
             except Exception as exc:
@@ -706,7 +831,70 @@ def process_missing(conn: sqlite3.Connection, limit: int = 0, force: bool = Fals
     conn.commit()
     print(f"OCR完成：{processed}张（fallback {fallback}，conflict {conflict}，失败 {failed}）",
           flush=True)
+    filled = fill_times_from_siblings(conn)
+    if filled:
+        print(f"兄弟帧补时：{filled}张（同订单同阶段连拍帧继承）", flush=True)
     return processed
+
+
+def fill_times_from_siblings(conn: sqlite3.Connection) -> int:
+    """兄弟帧补时：左上角OCR失败的帧，从同订单同阶段连拍帧继承时间。
+
+    实测同订单同阶段相邻帧 96% 间隔 <=10 秒（NVR 对同一事件连拍数张），
+    失败帧中 95% 存在带可信时间（ocr_status='ok'）的兄弟帧。继承规则：
+    兄弟时间聚成簇（簇内最大间隔 <=600 秒，覆盖实测 p99=481 秒），
+    恰好一簇才继承其中位时间——存在多簇说明同阶段有多个批次，无法判断
+    失败帧属于哪一批，宁可缺时间也不写错时间。
+    conflict 帧不补：其自身读数与归档日期矛盾（常见于跨午夜订单），
+    需要人工甄别，自动补时可能固化错误。
+    """
+    failed = conn.execute(
+        """SELECT id, park, order_id, stage FROM captures
+           WHERE coalesce(capture_time,'')='' AND ocr_status='fallback'
+             AND coalesce(order_id,'')!='' AND stage!='人脸'
+             AND coalesce(capture_status,'vehicle')!='no_vehicle'"""
+    ).fetchall()
+    if not failed:
+        return 0
+    by_group: dict[tuple[str, str, str], list[str]] = {}
+    for row in conn.execute(
+        """SELECT coalesce(park,''), order_id, stage, capture_time FROM captures
+           WHERE ocr_status='ok' AND capture_time IS NOT NULL AND capture_time!=''
+             AND stage!='人脸'
+             AND coalesce(capture_status,'vehicle')!='no_vehicle'"""
+    ).fetchall():
+        by_group.setdefault((row[0], row[1], row[2]), []).append(row[3])
+
+    def cluster(times: list[str]) -> list[list[datetime]]:
+        parsed = sorted(datetime.strptime(t, "%Y-%m-%d %H:%M:%S") for t in times)
+        clusters: list[list[datetime]] = [[parsed[0]]]
+        for current in parsed[1:]:
+            if (current - clusters[-1][-1]).total_seconds() <= 600:
+                clusters[-1].append(current)
+            else:
+                clusters.append([current])
+        return clusters
+
+    filled = 0
+    conn.isolation_level = None
+    for capture_id, park, order_id, stage in failed:
+        times = by_group.get((park or "", order_id, stage))
+        if not times:
+            continue
+        clusters = cluster(times)
+        if len(clusters) != 1:
+            continue
+        median = clusters[0][len(clusters[0]) // 2]
+        capture_time = median.strftime("%Y-%m-%d %H:%M:%S")
+        conn.execute(
+            """UPDATE captures SET capture_time=?, hour=?, ocr_status='sibling',
+                      status_reason='左上角时间OCR失败，按同订单同阶段连拍帧补时（帧间隔<=10分钟）'
+               WHERE id=?""",
+            (capture_time, median.hour, capture_id),
+        )
+        filled += 1
+    conn.commit()
+    return filled
 
 
 def _ocr_worker_init() -> None:
@@ -1202,6 +1390,402 @@ def associate_orders(conn: sqlite3.Connection) -> dict[str, int]:
             "linked_captures": linked}
 
 
+def ensure_loose_assignments_schema(conn: sqlite3.Connection) -> None:
+    """未关联货车归类日志：每行是一次"未关联图片 -> 订单"的文件移动决定。
+
+    记录原路径/原日期等完整现场，支持 --undo-loose-assign 逐张或全部撤销；
+    capture_id 为主键（同一张图只会被归类一次，撤销后可再次归类）。
+    """
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS loose_assignments (
+             capture_id INTEGER PRIMARY KEY,
+             park TEXT NOT NULL DEFAULT '',
+             from_order TEXT NOT NULL DEFAULT '',
+             to_order TEXT NOT NULL DEFAULT '',
+             date_old TEXT, date_new TEXT,
+             filepath_old TEXT, filepath_new TEXT,
+             filename_old TEXT, filename_new TEXT,
+             similarity REAL, time_diff_seconds INTEGER,
+             plate_note TEXT NOT NULL DEFAULT '',
+             reason TEXT NOT NULL DEFAULT '',
+             moved_at TEXT NOT NULL
+           )"""
+    )
+
+
+def _refresh_order_attributes(conn: sqlite3.Connection,
+                              keys: set[tuple[str, str]]) -> None:
+    """局部刷新订单属性多数投票（与 reid_pipeline.aggregate_order_attributes
+    同一套权重：颜色/车型按置信度求和取最大，避免 build_db 反向依赖流水线模块）。
+    """
+    now = datetime.now().isoformat(timespec="seconds")
+    for park, order_id in keys:
+        rows = conn.execute(
+            """SELECT vehicle_color, vehicle_color_conf, vehicle_type, vehicle_type_conf
+               FROM captures
+               WHERE coalesce(park,'')=? AND order_id=?
+                 AND coalesce(capture_status,'vehicle')!='no_vehicle'
+                 AND (coalesce(vehicle_color,'')!='' OR coalesce(vehicle_type,'')!='')""",
+            (park, order_id),
+        ).fetchall()
+        if not rows:
+            continue
+        colors: dict[str, float] = {}
+        types: dict[str, float] = {}
+        for color, color_conf, vtype, type_conf in rows:
+            if color:
+                colors[color] = colors.get(color, 0.0) + max(0.05, float(color_conf or 0))
+            if vtype:
+                types[vtype] = types.get(vtype, 0.0) + max(0.05, float(type_conf or 0))
+        best_color = max(colors, key=lambda k: colors[k]) if colors else ""
+        best_type = max(types, key=lambda k: types[k]) if types else ""
+        conn.execute(
+            """INSERT INTO order_attributes
+                 (park, order_id, vehicle_color, vehicle_color_conf,
+                  vehicle_type, vehicle_type_conf, sample_count, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(park, order_id) DO UPDATE SET
+                 vehicle_color=excluded.vehicle_color,
+                 vehicle_color_conf=excluded.vehicle_color_conf,
+                 vehicle_type=excluded.vehicle_type,
+                 vehicle_type_conf=excluded.vehicle_type_conf,
+                 sample_count=excluded.sample_count,
+                 updated_at=excluded.updated_at""",
+            (park, order_id, best_color,
+             round(colors[best_color] / len(rows), 4) if best_color else 0.0,
+             best_type,
+             round(types[best_type] / len(rows), 4) if best_type else 0.0,
+             len(rows), now),
+        )
+
+
+def _match_loose_capture(loose: dict, orders: dict, window_seconds: int,
+                         sim_threshold: float, sim_margin: float) -> tuple:
+    """单张未关联抓拍的订单匹配。返回 (命中订单key或None, 证据dict, 跳过原因)。
+
+    证据分两级：
+    - 车牌锚定（最强）：loose 读到车牌且订单共识车牌去省份差 <=1 -> 直接归入
+      时间差最小者（同一辆车多次进场时，时间窗负责挑出"这一次"）；
+    - 外观+时间（无车牌可用时）：与订单主车特征最大余弦 >= 阈值，且领先
+      次优订单 >= margin（园区同时在场货车常达 7-10 单，不设领先幅度会把
+      相邻车道的同型货车错挂）；车型与订单主体车型矛盾者先被否决。
+    标定（granary.db 隐藏车牌模拟，86 个可评估样本）：阈值0.55+领先0.03
+    精度 92.9%、召回 75.6%；阈值提升对精度增益有限，主要靠 margin 拦误挂。
+    """
+    evidence = {"similarity": 0.0, "time_diff_seconds": -1, "plate_note": ""}
+    candidates = []
+    loose_dt = loose["dt"]
+    for key, order in orders.items():
+        if order["park"] != loose["park"] or not order["times"]:
+            continue
+        time_diff = min(abs((loose_dt - t).total_seconds()) for t in order["times"])
+        if time_diff > window_seconds:
+            continue
+        # 车型否决：抓拍选框车型与订单主体车型都非空且不同 -> 不可能是主车
+        if loose["vehicle_type"] and order["main_type"] and \
+                loose["vehicle_type"] != order["main_type"]:
+            continue
+        plate_distance = -1
+        if loose["plate"] and order["consensus_plate"]:
+            plate_distance = _plate_edit_distance(loose["plate"],
+                                                  order["consensus_plate"])
+            if plate_distance >= 2:
+                continue  # 车牌明显不同：否决（宁可漏归类不可错归类）
+        sim = max((cosine(loose["emb"], emb) for emb in order["embs"]),
+                  default=-1.0)
+        candidates.append({"key": key, "sim": sim, "time_diff": time_diff,
+                           "plate_distance": plate_distance})
+    if not candidates:
+        return None, evidence, "时间窗内无可兼容订单"
+
+    plate_matched = [c for c in candidates if c["plate_distance"] >= 0]
+    if plate_matched:
+        plate_matched.sort(key=lambda c: (c["time_diff"], -c["sim"]))
+        best = plate_matched[0]
+        # 两笔车牌一致的订单时间差彼此接近（<300秒）说明无法确定是哪一次
+        # 进场（快速折返），不强行归类
+        if len(plate_matched) > 1 and \
+                plate_matched[1]["time_diff"] - best["time_diff"] < 300:
+            return None, evidence, "多笔车牌一致订单时间接近，待人工判断"
+        evidence.update(similarity=best["sim"],
+                        time_diff_seconds=int(best["time_diff"]),
+                        plate_note=f"车牌去省份差{best['plate_distance']}")
+        return best["key"], evidence, ""
+
+    # 无车牌锚定：外观相似度阈值 + 对次优的领先幅度
+    candidates.sort(key=lambda c: (-c["sim"], c["time_diff"]))
+    best = candidates[0]
+    second = candidates[1] if len(candidates) > 1 else None
+    lead = best["sim"] - second["sim"] if second else 1.0
+    if best["sim"] < sim_threshold:
+        return None, evidence, "最高相似度低于阈值"
+    if lead < sim_margin:
+        return None, evidence, "领先幅度不足，存在歧义"
+    evidence.update(similarity=best["sim"],
+                    time_diff_seconds=int(best["time_diff"]),
+                    plate_note="无车牌，外观+时间匹配")
+    return best["key"], evidence, ""
+
+
+def assign_loose_orders(conn: sqlite3.Connection, apply_changes: bool = False,
+                        types: tuple[str, ...] = ("truck",),
+                        window_seconds: int = 7200,
+                        sim_threshold: float = 0.55,
+                        sim_margin: float = 0.03) -> dict:
+    """把"未关联图片"里的抓拍归类到时间相近且同一辆车的订单。
+
+    背景：NVR 靠自己的车牌识别做图片归档，读不到牌的抓拍全部落进
+    "未关联图片"文件夹（granary.db 中 985 张，其中货车 606 张）。本函数
+    用三类证据恢复归属：OCR时间差（是否同一次在场）、ReID 外观相似度
+    （是否同一辆车）、车牌（读到则一票定音/否决）。
+
+    归类 = 物理移动文件到订单文件夹 + 更新 captures.order_id（订单归属
+    的唯一事实来源，与目录结构保持一致，sync_files 的聚合键才不会把图
+    重新扫回"未关联图片"），并写 loose_assignments 日志支持撤销。
+    默认只试运行打印报告，apply_changes=True 才真正移动/写库。
+
+    车辆分组（vehicle_id）不在此重算：归类后重跑 associate_orders 即可
+    把这些抓拍随订单并入车簇（它们此刻已是订单成员）。
+    """
+    ensure_loose_assignments_schema(conn)
+    type_list = tuple(t for t in types if t)
+    loose_rows = conn.execute(
+        """SELECT id, coalesce(park,''), date, capture_time, plate_final,
+                  reid_embedding, vehicle_type, filepath, filename
+           FROM captures
+           WHERE order_id='未关联图片' AND reid_embedding IS NOT NULL
+             AND capture_time IS NOT NULL AND capture_time!=''
+             AND coalesce(capture_status,'vehicle')!='no_vehicle'
+             AND vehicle_type IS NOT NULL"""
+    ).fetchall()
+    loose_rows = [row for row in loose_rows if row[6] in type_list]
+
+    # 订单索引：只收有可靠时间的车辆帧（ok/兄弟帧；conflict 无时间不可作锚）
+    orders: dict[tuple[str, str], dict] = {}
+    for park, order_id, capture_time, plate, blob, vtype, filepath in conn.execute(
+        """SELECT coalesce(park,''), order_id, capture_time, plate_final,
+                  reid_embedding, vehicle_type, filepath
+           FROM captures
+           WHERE coalesce(order_id,'')!='' AND order_id!='未关联图片'
+             AND capture_time IS NOT NULL AND capture_time!=''
+             AND coalesce(capture_status,'vehicle')!='no_vehicle'"""
+    ).fetchall():
+        order = orders.setdefault(
+            (park, order_id),
+            {"park": park, "times": [], "plates": Counter(), "embs": [],
+             "types": Counter(), "dirs": {}, "nearest_anchor": {}})
+        order["times"].append(datetime.strptime(capture_time, "%Y-%m-%d %H:%M:%S"))
+        if plate:
+            order["plates"][plate] += 1
+        if blob:
+            feature = np.frombuffer(blob, np.float32)
+            norm = np.linalg.norm(feature)
+            if norm > 0 and len(order["embs"]) < 12:
+                order["embs"].append(feature / norm)
+        if vtype:
+            order["types"][vtype] += 1
+        if filepath:
+            parent = str(Path(filepath).parent)
+            order["dirs"].setdefault(parent, capture_time[:10])
+            order["nearest_anchor"][parent] = capture_time
+    for order in orders.values():
+        order["main_type"] = order["types"].most_common(1)[0][0] if order["types"] else ""
+        # 共识车牌：出现>=2次；整单只读过一种车牌时取其本身（与
+        # associate_orders 的共识规则一致，单帧噪声车牌不当锚点）
+        if order["plates"]:
+            top_plate, top_count = order["plates"].most_common(1)[0]
+            order["consensus_plate"] = top_plate if (top_count >= 2 or len(order["plates"]) == 1) else ""
+        else:
+            order["consensus_plate"] = ""
+
+    plan = []
+    skips: dict[str, int] = {}
+    for row in loose_rows:
+        (capture_id, park, _date, capture_time, plate, blob,
+         vehicle_type, filepath, filename) = row
+        feature = np.frombuffer(blob, np.float32)
+        norm = np.linalg.norm(feature)
+        if norm <= 0:
+            skips["无效特征"] = skips.get("无效特征", 0) + 1
+            continue
+        loose = {"id": capture_id, "park": park, "plate": plate or "",
+                 "vehicle_type": vehicle_type, "filepath": filepath,
+                 "filename": filename, "date": _date,
+                 "dt": datetime.strptime(capture_time, "%Y-%m-%d %H:%M:%S"),
+                 "emb": feature / norm}
+        key, evidence, skip_reason = _match_loose_capture(
+            loose, orders, window_seconds, sim_threshold, sim_margin)
+        if key is None:
+            skips[skip_reason] = skips.get(skip_reason, 0) + 1
+            continue
+        plan.append((loose, key, evidence))
+
+    moved = failed = 0
+    touched_orders: set[tuple[str, str]] = set()
+    now = datetime.now().isoformat(timespec="seconds")
+    if apply_changes:
+        conn.isolation_level = None
+    for loose, key, evidence in plan:
+        order = orders[key]
+        target_dir, target_date = _pick_order_dir(order, loose, key)
+        target_stored = f"{target_dir}/{loose['filename']}"
+        target_abs = project_file(target_stored)
+        final_name = loose["filename"]
+        if target_abs.exists():
+            stem, suffix = target_abs.stem, target_abs.suffix
+            k = 1
+            while target_abs.with_name(f"{stem}_reid{k}{suffix}").exists():
+                k += 1
+            final_name = f"{stem}_reid{k}{suffix}"
+            target_abs = target_abs.with_name(final_name)
+        reason = (f"未关联货车归类：车牌一致({evidence['plate_note']})，"
+                  f"时间差{evidence['time_diff_seconds'] // 60}分钟"
+                  if evidence["plate_note"].startswith("车牌")
+                  else f"未关联货车归类：时间差{evidence['time_diff_seconds'] // 60}分钟，"
+                       f"外观相似度{evidence['similarity']:.2f}（{evidence['plate_note']}）")
+        print(f"  {'归类' if apply_changes else '试运行'} #{loose['id']} "
+              f"{loose['date']} {loose['dt'].strftime('%H:%M:%S')} -> 订单{key[1]} "
+              f"({reason.split('：')[1]})")
+        if not apply_changes:
+            continue
+        try:
+            target_abs.parent.mkdir(parents=True, exist_ok=True)
+            source_abs = project_file(loose["filepath"])
+            if not source_abs.is_file():
+                source_abs = resolve_stored_path(loose["filepath"])
+            shutil.move(str(source_abs), str(target_abs))
+        except OSError as exc:
+            failed += 1
+            print(f"  移动失败 #{loose['id']}: {exc}")
+            continue
+        # 归入订单当前主车组：取订单内出现最多的 vehicle_id（拆分遗留的
+        # NULL 帧不参与投票）；订单尚无分组则留空，等 associate_orders 重算。
+        vehicle_id = conn.execute(
+            """SELECT vehicle_id, COUNT(*) AS cnt FROM captures
+               WHERE coalesce(park,'')=? AND order_id=? AND vehicle_id IS NOT NULL
+               GROUP BY vehicle_id ORDER BY cnt DESC LIMIT 1""",
+            (key[0], key[1]),
+        ).fetchone()
+        conn.execute(
+            """UPDATE captures SET order_id=?, date=?, filepath=?, filename=?,
+                      plate_match_reason=?, vehicle_id=?
+               WHERE id=?""",
+            (key[1], target_date, to_stored_path(target_abs), final_name,
+             reason, vehicle_id[0] if vehicle_id else None, loose["id"]),
+        )
+        conn.execute(
+            """INSERT OR REPLACE INTO loose_assignments
+                 (capture_id, park, from_order, to_order, date_old, date_new,
+                  filepath_old, filepath_new, filename_old, filename_new,
+                  similarity, time_diff_seconds, plate_note, reason, moved_at)
+               VALUES (?, ?, '未关联图片', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (loose["id"], key[0], key[1], loose["date"], target_date,
+             loose["filepath"], to_stored_path(target_abs), loose["filename"],
+             final_name, evidence["similarity"], evidence["time_diff_seconds"],
+             evidence["plate_note"], reason, now),
+        )
+        moved += 1
+        touched_orders.add(key)
+    if apply_changes:
+        conn.commit()
+        if touched_orders:
+            _refresh_order_attributes(conn, touched_orders)
+            conn.commit()
+
+    result = {
+        "loose_trucks": len(loose_rows), "planned": len(plan),
+        "moved": moved, "failed": failed,
+        "plate_anchored": sum(1 for _, _, e in plan if e["plate_note"].startswith("车牌")),
+        "sim_matched": sum(1 for _, _, e in plan if not e["plate_note"].startswith("车牌")),
+        "skips": skips,
+    }
+    mode = "已归类" if apply_changes else "试运行（加 --apply 落盘）"
+    print(f"未关联货车归类{mode}：货车{result['loose_trucks']}张，"
+          f"命中{result['planned']}张（车牌锚定{result['plate_anchored']}，"
+          f"外观+时间{result['sim_matched']}），"
+          f"移动失败{result['failed']}张")
+    for reason_text, count in sorted(skips.items(), key=lambda kv: -kv[1]):
+        print(f"  跳过 {count}张：{reason_text}")
+    return result
+
+
+def _pick_order_dir(order: dict, loose: dict, key: tuple[str, str]) -> tuple[str, str]:
+    """选择归类目标文件夹：优先与抓拍同日期的订单文件夹，其次时间最近的
+    订单抓拍所在文件夹；订单在该日期还没有文件夹时（跨天订单另一头）
+    按月份照片根新建 <M月D日>/<订单号>。"""
+    if loose["date"] in order["dirs"].values():
+        for directory, directory_date in order["dirs"].items():
+            if directory_date == loose["date"]:
+                return directory, directory_date
+    nearest_dir, nearest_dt, nearest_date = "", None, loose["date"]
+    for directory, capture_time in order["nearest_anchor"].items():
+        dt = datetime.strptime(capture_time, "%Y-%m-%d %H:%M:%S")
+        if nearest_dt is None or abs((dt - loose["dt"]).total_seconds()) < \
+                abs((nearest_dt - loose["dt"]).total_seconds()):
+            nearest_dir, nearest_dt, nearest_date = directory, dt, capture_time[:10]
+    if nearest_dir:
+        return nearest_dir, nearest_date
+    # 订单还没有任何已落盘文件夹可参照：按 loose 自身路径推月份照片根
+    loose_dir = Path(loose["filepath"]).parent.parent  # .../月份根/日期/未关联图片
+    month_root = loose_dir.parent
+    y, m, d = (int(part) for part in loose["date"].split("-"))
+    target = month_root / f"{m}月{d}日" / key[1]
+    return str(target), loose["date"]
+
+
+def undo_loose_assign(conn: sqlite3.Connection, capture_id: int | None = None) -> int:
+    """撤销未关联归类：按 loose_assignments 日志把文件移回原处并还原字段。
+
+    capture_id=None 撤销全部。恢复后建议重跑 associate_orders 重聚车辆。
+    """
+    ensure_loose_assignments_schema(conn)
+    rows = conn.execute(
+        """SELECT capture_id, park, from_order, date_old, filepath_old,
+                  filename_old, filepath_new, filename_new
+           FROM loose_assignments""" + (" WHERE capture_id=?" if capture_id else ""),
+        (capture_id,) if capture_id else (),
+    ).fetchall()
+    conn.isolation_level = None
+    restored = failed = 0
+    for row in rows:
+        (cid, park, from_order, date_old, filepath_old, filename_old,
+         filepath_new, filename_new) = row
+        current = conn.execute(
+            "SELECT filepath, filename FROM captures WHERE id=?", (cid,)).fetchone()
+        if not current:
+            continue
+        # 现文件可能记在 current.filepath 或日志 filepath_new（撤销后重归类的
+        # 场景两者不同）；一律项目根锚定，避免 app/ 相对路径歧义。
+        source = None
+        for stored in (current[0], filepath_new):
+            candidate = project_file(stored)
+            if candidate.is_file():
+                source = candidate
+                break
+        old_dir = project_file(Path(filepath_old).parent)
+        target_old = old_dir / (filename_old or current[1])
+        try:
+            old_dir.mkdir(parents=True, exist_ok=True)
+            if source and source.resolve() != target_old.resolve():
+                shutil.move(str(source), str(target_old))
+        except OSError as exc:
+            failed += 1
+            print(f"  撤销失败 #{cid}: {exc}")
+            continue
+        conn.execute(
+            """UPDATE captures SET order_id=?, date=?, filepath=?, filename=?,
+                      plate_match_reason='', vehicle_id=NULL
+               WHERE id=?""",
+            (from_order, date_old, filepath_old, filename_old or current[1], cid),
+        )
+        conn.execute("DELETE FROM loose_assignments WHERE capture_id=?", (cid,))
+        restored += 1
+    conn.commit()
+    print(f"撤销归类：恢复{restored}张，失败{failed}张"
+          + ("，建议重跑 associate_orders 重聚车辆" if restored else ""))
+    return restored
+
+
 def print_stats(conn: sqlite3.Connection) -> None:
     total = conn.execute("SELECT COUNT(*) FROM captures").fetchone()[0]
     orders = conn.execute(
@@ -1243,25 +1827,55 @@ def main() -> None:
     parser.add_argument("--sync-only", action="store_true", help="只扫描目录，不跑OCR")
     parser.add_argument("--process-missing", action="store_true", help="补充OCR时间戳/OSD")
     parser.add_argument("--force-process", action="store_true", help="强制重跑OCR")
+    parser.add_argument("--retry-failed", action="store_true",
+                        help="只重跑 ocr_status=fallback 的帧（启用时刻带抢救通道）")
     parser.add_argument("--associate-only", action="store_true", help="只重新聚合订单内车辆")
+    parser.add_argument("--assign-loose", action="store_true",
+                        help="未关联货车归类到订单（默认试运行，加 --apply 落盘）")
+    parser.add_argument("--apply", action="store_true",
+                        help="与 --assign-loose 联用：真正移动文件并写库")
+    parser.add_argument("--undo-loose-assign", action="store_true",
+                        help="撤销未关联归类（全部，或配合 --capture-id 撤销单张）")
+    parser.add_argument("--capture-id", type=int, default=0,
+                        help="--undo-loose-assign 的单张撤销目标")
+    parser.add_argument("--loose-types", default="truck",
+                        help="参与归类的车型，逗号分隔（默认 truck；空串=不限）")
+    parser.add_argument("--loose-window-min", type=int, default=120,
+                        help="归类时间窗（分钟）：与订单抓拍时刻的最小距离上限")
+    parser.add_argument("--loose-sim", type=float, default=0.55,
+                        help="无车牌归类的外观相似度阈值")
+    parser.add_argument("--loose-margin", type=float, default=0.03,
+                        help="无车牌归类对次优订单的相似度领先幅度下限")
     parser.add_argument("--limit", type=int, default=0)
     args = parser.parse_args()
 
     conn = sqlite3.connect(args.db)
     ensure_schema(conn)
     capture_count = conn.execute("SELECT COUNT(*) FROM captures").fetchone()[0]
+    standalone = args.assign_loose or args.undo_loose_assign
     if not args.associate_only and (args.sync_only or capture_count == 0):
         if not args.root.is_dir():
             parser.error(f"照片目录不存在: {args.root}")
         summary = sync_files(conn, args.root, args.park)
         print(f"目录同步完成：{summary}")
+    if args.retry_failed:
+        process_missing(conn, args.limit, retry_failed=True)
     if args.process_missing or args.force_process or not (
-        args.sync_only or args.associate_only
+        args.sync_only or args.associate_only or standalone or args.retry_failed
     ):
         process_missing(conn, args.limit, args.force_process)
-    if not args.sync_only:
+    if args.undo_loose_assign:
+        undo_loose_assign(conn, args.capture_id or None)
+    elif args.assign_loose:
+        assign_loose_orders(
+            conn, apply_changes=args.apply,
+            types=tuple(t.strip() for t in args.loose_types.split(",") if t.strip()),
+            window_seconds=args.loose_window_min * 60,
+            sim_threshold=args.loose_sim, sim_margin=args.loose_margin)
+    elif not args.sync_only:
         print(f"订单内车辆聚合：{associate_orders(conn)}")
-    print_stats(conn)
+    if not standalone:
+        print_stats(conn)
     conn.close()
 
 
