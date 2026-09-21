@@ -56,7 +56,10 @@ YEAR_RE = re.compile(r"(20\d{2})年")
 DATE_DIR_RE = re.compile(r"^(\d{1,2})月(\d{1,2})日$")
 # 从老库 filepath 推断园区名：...data\<园区名>\<月份照片根>\...
 PARK_PATH_RE = re.compile(r"[\\/]data[\\/]+([^\\/]+)[\\/]")
-STAGE_RE = re.compile(r"^(入磅|出磅|抓拍|质检|人脸)_(.+)$")
+STAGE_RE = re.compile(r"^(入磅|出磅|抓拍|质检|人脸)[_]?(.+)$")
+# 新版NVR命名自带拍摄时间（全角冒号）：入磅2026年9月20日08：48：11_2268117
+FILENAME_TIME_RE = re.compile(
+    r"(\d{4})年(\d{1,2})月(\d{1,2})日(\d{1,2})[：:](\d{2})[：:](\d{2})")
 DATE_RE = re.compile(r"(20\d{2})[-年/.](\d{1,2})[-月/.](\d{1,2})")
 TIME_RE = re.compile(r"(2[0-3]|[01]?\d)[:：]([0-5]\d)[:：]([0-5]\d)")
 
@@ -620,20 +623,31 @@ def ocr_capture(payload: dict) -> dict:
             time_part = f"{int(match[1]):02d}:{int(match[2]):02d}:{int(match[3]):02d}"
         return date_part, time_part
 
-    # 时间戳是轨迹排序的基石：先小图快速识别，失败再走大字号重试通道。
-    top_joined, top_confs, top_boxes = ocr_region(0.0, 0.20, 0.60, 0.6)
-    capture_date, hms = parse_datetime(top_joined)
-    date_box = next((b for b in top_boxes if DATE_RE.search(b[0])), None)
-    confidence_values = list(top_confs)
-    if not (capture_date and hms):
-        top_joined, retry_confs, retry_boxes = ocr_region(0.0, 0.22, 0.80, 0.9, large=True)
+    # 时间戳是轨迹排序的基石。新版NVR命名自带拍摄时间（阶段+日期时刻+序号，
+    # 如 入磅2026年9月20日08：48：11_2268117）：文件名时间是NVR写入的权威
+    # 时间，直接采用，省去左上角两通道OCR（底部OSD仍照常识别车辆形象）。
+    # 老命名（阶段_uuid）才走图像OCR：小图快速通道 -> 大字号重试 -> 时刻带抢救。
+    name_time = FILENAME_TIME_RE.search(Path(filepath).stem)
+    confidence_values: list[float] = []
+    if name_time:
+        capture_date = (f"{int(name_time[1]):04d}-{int(name_time[2]):02d}-"
+                        f"{int(name_time[3]):02d}")
+        hms = (f"{int(name_time[4]):02d}:{int(name_time[5]):02d}:"
+               f"{int(name_time[6]):02d}")
+    else:
+        top_joined, top_confs, top_boxes = ocr_region(0.0, 0.20, 0.60, 0.6)
         capture_date, hms = parse_datetime(top_joined)
-        date_box = date_box or next((b for b in retry_boxes if DATE_RE.search(b[0])), None)
-        confidence_values += list(retry_confs)
-    if not hms and capture_date and date_box:
-        rescued = _rescue_timestamp(rgb, date_box)
-        if rescued:
-            hms = rescued
+        date_box = next((b for b in top_boxes if DATE_RE.search(b[0])), None)
+        confidence_values = list(top_confs)
+        if not (capture_date and hms):
+            top_joined, retry_confs, retry_boxes = ocr_region(0.0, 0.22, 0.80, 0.9, large=True)
+            capture_date, hms = parse_datetime(top_joined)
+            date_box = date_box or next((b for b in retry_boxes if DATE_RE.search(b[0])), None)
+            confidence_values += list(retry_confs)
+        if not hms and capture_date and date_box:
+            rescued = _rescue_timestamp(rgb, date_box)
+            if rescued:
+                hms = rescued
     time_ok = bool(capture_date and hms)
 
     plate = color = vehicle_type = camera = ""
@@ -641,7 +655,7 @@ def ocr_capture(payload: dict) -> dict:
     if stage == "抓拍":
         # 底部OSD字号大但条带很宽：0.75缩放+更大检测边长，车牌召回率
         # 从约10%提升到90%+（0.5缩放时小字严重漏检）。
-        bottom_joined, bottom_confs = ocr_region(0.72, 1.0, 1.0, 0.75, large=True)
+        bottom_joined, bottom_confs, _ = ocr_region(0.72, 1.0, 1.0, 0.75, large=True)
         confidence_values += list(bottom_confs)
         bottom_date, bottom_hms = parse_datetime(bottom_joined)
         for pattern in (r"车牌号码[:：]?([^\s:：]{6,12})", r"车牌号[:：]?([^\s:：]{6,12})"):
@@ -680,6 +694,7 @@ def ocr_capture(payload: dict) -> dict:
         "date": capture_date,
         "hms": hms,
         "time_ok": time_ok,
+        "time_source": "filename" if name_time else "ocr",
         "bottom_date": bottom_date,
         "bottom_hms": bottom_hms,
         "osd_plate": plate,
@@ -776,7 +791,11 @@ def process_missing(conn: sqlite3.Connection, limit: int = 0, force: bool = Fals
                         or (embedded_date and str(osd["date"]) == embedded_date)
                     )
                     bottom_hms = str(osd.get("bottom_hms") or "")
-                    if bottom_hms and str(osd["hms"]):
+                    if osd.get("time_source") == "filename":
+                        # 文件名时间是NVR写入的权威拍摄时间（确定性解析，非OCR），
+                        # 与归档日期矛盾时（跨午夜按出磅日期归档）以文件名为准。
+                        date_trusted = True
+                    elif bottom_hms and str(osd["hms"]):
                         try:
                             t_top = datetime.strptime(str(osd["hms"]), "%H:%M:%S")
                             t_bottom = datetime.strptime(bottom_hms, "%H:%M:%S")
