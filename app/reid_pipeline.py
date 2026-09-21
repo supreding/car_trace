@@ -352,6 +352,10 @@ def detect_pass(
     where = ("coalesce(capture_status,'vehicle')!='no_vehicle' "
              "AND (status_reason IS NULL OR status_reason NOT LIKE '%与订单主车不符%') "
              "AND id NOT IN (SELECT DISTINCT capture_id FROM vehicle_instances)")
+    if not force:
+        # 已有裁剪图的帧是早期版本的检测产物，不可能再产生实例记录；
+        # 不排除会永久挂起在待处理队列里（每轮 GPU 都被重选又跳过）。
+        where += " AND vehicle_crop_path IS NULL"
     sql = (f"SELECT id, filepath FROM captures WHERE {where} "
            "ORDER BY date, order_id, stage_rank, filename")
     params: tuple[Any, ...] = ()
@@ -369,6 +373,14 @@ def detect_pass(
         capture_id = int(row["id"])
         source = build_db.resolve_stored_path(row["filepath"])
         if not source.is_file():
+            # 原始照片缺失（归档清理/复制遗漏）是永久状态：标记后不再进入
+            # 待处理队列，否则该帧每轮 GPU 都被选中又跳过，待处理数永不清零。
+            db.execute(
+                """UPDATE captures SET capture_status='no_vehicle',
+                          status_reason='原始照片缺失，无法检测'
+                   WHERE id=?""",
+                (capture_id,),
+            )
             skipped += 1
             continue
         try:
@@ -631,7 +643,10 @@ def plate_pass(
     db.row_factory = sqlite3.Row
     where = "vehicle_crop_path IS NOT NULL"
     if not force:
-        where += " AND (lpr_plate IS NULL OR lpr_plate='')"
+        # lpr_attempted_at：识别"已尝试"标记。模型读不出车牌的裁剪图也要落
+        # 标记，否则这些行永远满足 lpr_plate IS NULL，GPU 流水线每轮重复
+        # 识别上万张无牌图（服务器实测每 30 分钟空转一轮的根源）。
+        where += " AND lpr_attempted_at IS NULL"
     sql = (f"SELECT id, vehicle_crop_path, coalesce(osd_plate,'') AS osd "
            f"FROM captures WHERE {where} ORDER BY id")
     params: tuple[Any, ...] = ()
@@ -645,12 +660,17 @@ def plate_pass(
         capture_id = int(row["id"])
         crop_path = resolve_crop_path(db_path, row["vehicle_crop_path"])
         if not crop_path.is_file():
+            # 裁剪文件缺失是永久状态（归档清理/复制遗漏），落标记防止每轮重选。
+            db.execute("UPDATE captures SET lpr_attempted_at=? WHERE id=?",
+                       (datetime.now().isoformat(timespec="seconds"), capture_id))
             skipped += 1
             continue
         try:
             data = np.fromfile(str(crop_path), dtype=np.uint8)
             bgr = cv2.imdecode(data, cv2.IMREAD_COLOR)
             if bgr is None:
+                db.execute("UPDATE captures SET lpr_attempted_at=? WHERE id=?",
+                           (datetime.now().isoformat(timespec="seconds"), capture_id))
                 skipped += 1
                 continue
             result = lpr.recognize(bgr)
@@ -674,11 +694,14 @@ def plate_pass(
             db.execute(
                 """UPDATE captures SET lpr_plate=?, lpr_conf=?,
                           plate_final=?, plate_confidence=?,
+                          lpr_attempted_at=?,
                           recognition_source=CASE
                             WHEN ?!='' THEN ? ELSE recognition_source END
                    WHERE id=?""",
                 (lpr_plate or None, lpr_conf, plate_final,
-                 lpr_conf if lpr_plate else None, source, source, capture_id),
+                 lpr_conf if lpr_plate else None,
+                 datetime.now().isoformat(timespec="seconds"),
+                 source, source, capture_id),
             )
             processed += 1
             if processed % 200 == 0:
@@ -896,7 +919,8 @@ def instance_plate_pass(db_path: Path, lpr: PlateLPR, limit: int = 0) -> dict[st
     db.isolation_level = None
     rows = db.execute(
         """SELECT id, crop_path FROM vehicle_instances
-           WHERE lpr_plate IS NULL OR lpr_plate='' ORDER BY id"""
+           WHERE (lpr_plate IS NULL OR lpr_plate='') AND lpr_attempted_at IS NULL
+           ORDER BY id"""
         + (" LIMIT ?" if limit else ""),
         () if not limit else (limit,),
     ).fetchall()
@@ -906,12 +930,16 @@ def instance_plate_pass(db_path: Path, lpr: PlateLPR, limit: int = 0) -> dict[st
     for iid, crop_rel in rows:
         crop_path = resolve_crop_path(db_path, crop_rel)
         if not crop_path.is_file():
+            db.execute("UPDATE vehicle_instances SET lpr_attempted_at=? WHERE id=?",
+                       (datetime.now().isoformat(timespec="seconds"), iid))
             skipped += 1
             continue
         try:
             data = np.fromfile(str(crop_path), dtype=np.uint8)
             bgr = cv2.imdecode(data, cv2.IMREAD_COLOR)
             if bgr is None:
+                db.execute("UPDATE vehicle_instances SET lpr_attempted_at=? WHERE id=?",
+                           (datetime.now().isoformat(timespec="seconds"), iid))
                 skipped += 1
                 continue
             result = lpr.recognize(bgr)
@@ -920,8 +948,8 @@ def instance_plate_pass(db_path: Path, lpr: PlateLPR, limit: int = 0) -> dict[st
             if len(plate) < 5 or conf < 0.55:
                 plate, conf = "", 0.0
             db.execute(
-                "UPDATE vehicle_instances SET lpr_plate=?, lpr_conf=? WHERE id=?",
-                (plate or None, conf, iid),
+                "UPDATE vehicle_instances SET lpr_plate=?, lpr_conf=?, lpr_attempted_at=? WHERE id=?",
+                (plate or None, conf, datetime.now().isoformat(timespec="seconds"), iid),
             )
             processed += 1
         except Exception as exc:

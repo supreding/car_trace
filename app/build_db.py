@@ -131,6 +131,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
           vehicle_type TEXT, vehicle_type_conf REAL,
           attr_model_version TEXT,
           lpr_plate TEXT, lpr_conf REAL,
+          lpr_attempted_at TEXT,
           reid_embedding BLOB, reid_source TEXT, reid_model_version TEXT,
           vehicle_id INTEGER,
           UNIQUE(capture_id, instance_index)
@@ -139,6 +140,11 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_vi_vehicle ON vehicle_instances(vehicle_id);
         """
     )
+    # 老库补列：lpr_attempted_at 记录车牌识别"已尝试"时刻——模型读不出车牌的
+    # 裁剪图也要落标记，否则车牌阶段每轮重复处理上万张无牌图（GPU 空转循环）。
+    _vi_cols = {row[1] for row in conn.execute("PRAGMA table_info(vehicle_instances)")}
+    if "lpr_attempted_at" not in _vi_cols:
+        conn.execute("ALTER TABLE vehicle_instances ADD COLUMN lpr_attempted_at TEXT")
     conn.executescript(
         """
         -- 人工移动决定（聚类重跑后重新应用，人工意志优先于自动聚类）：
@@ -213,6 +219,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         "vehicle_box": "TEXT", "crop_source": "TEXT",
         "vehicle_det_score": "REAL",
         "stage_rank": "INTEGER",
+        "lpr_attempted_at": "TEXT",
     }
     for column, declaration in additions.items():
         if column not in existing:
@@ -1632,6 +1639,12 @@ def assign_loose_orders(conn: sqlite3.Connection, apply_changes: bool = False,
         norm = np.linalg.norm(feature)
         if norm <= 0:
             skips["无效特征"] = skips.get("无效特征", 0) + 1
+            continue
+        if not resolve_stored_path(filepath).is_file():
+            # 原始照片已从盘上清理的园区（服务器只留库记录与裁剪图）：物理
+            # 移动无从做起，跳过而不是报 558 个移动失败刷屏。
+            skips["原始照片不在盘上（归档已清理）"] = \
+                skips.get("原始照片不在盘上（归档已清理）", 0) + 1
             continue
         loose = {"id": capture_id, "park": park, "plate": plate or "",
                  "vehicle_type": vehicle_type, "filepath": filepath,

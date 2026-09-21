@@ -45,10 +45,14 @@ fi
 pending=$($PY - <<'PYEOF'
 import sqlite3
 conn = sqlite3.connect("/opt/car-trace/app/granary.db")
+# 与 detect_pass 的选择条件保持一致（含 vehicle_crop_path IS NULL）：
+# 否则旧版已裁剪/照片已清理的帧会把待处理数永久顶在 >0，
+# GPU 流水线每 30 分钟被定时器拉起重复空转。
 detect = conn.execute(
     """SELECT COUNT(*) FROM captures
        WHERE coalesce(capture_status,'vehicle')!='no_vehicle'
          AND (status_reason IS NULL OR status_reason NOT LIKE '%与订单主车不符%')
+         AND vehicle_crop_path IS NULL
          AND id NOT IN (SELECT DISTINCT capture_id FROM vehicle_instances)""").fetchone()[0]
 embed = conn.execute(
     """SELECT COUNT(*) FROM captures
