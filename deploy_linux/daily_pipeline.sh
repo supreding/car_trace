@@ -72,5 +72,17 @@ if ! bash run_reid_pipeline.sh --db app/granary.db; then
     exit 1
 fi
 
+# ---- 2.5/2 GPU后收尾：新特征就位后重聚车辆 + 未关联货车归类 ----
+# GPU 前的聚合看不到新抓拍的特征；归类依赖外观特征与时间窗，必须在
+# 特征入库之后执行。归类默认试运行阈值已在 build_db 内置（0.55/0.03），
+# 全部移动写 loose_assignments 日志，可 --undo-loose-assign 撤销。
+log "== 2.5/2 车辆重聚 + 未关联货车归类 =="
+if ! $PY app/build_db.py --db app/granary.db --associate-only; then
+    log "警告：车辆重聚失败（不阻断状态记录）"
+fi
+if ! $PY app/build_db.py --db app/granary.db --assign-loose --apply; then
+    log "警告：未关联货车归类失败（不阻断状态记录）"
+fi
+
 echo "OK $(date '+%F %H:%M:%S')" > /data/pipeline_status.txt
 log "== 每日流水线完成 =="

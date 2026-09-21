@@ -1550,7 +1550,8 @@ def assign_loose_orders(conn: sqlite3.Connection, apply_changes: bool = False,
                         types: tuple[str, ...] = ("truck",),
                         window_seconds: int = 7200,
                         sim_threshold: float = 0.55,
-                        sim_margin: float = 0.03) -> dict:
+                        sim_margin: float = 0.03,
+                        park_filter: str = "") -> dict:
     """把"未关联图片"里的抓拍归类到时间相近且同一辆车的订单。
 
     背景：NVR 靠自己的车牌识别做图片归档，读不到牌的抓拍全部落进
@@ -1577,6 +1578,11 @@ def assign_loose_orders(conn: sqlite3.Connection, apply_changes: bool = False,
              AND coalesce(capture_status,'vehicle')!='no_vehicle'
              AND vehicle_type IS NOT NULL"""
     ).fetchall()
+    # --park 过滤：多库共用一个 data 目录时，原始照片可能只保留了部分园区
+    # （其余园区只有库记录与裁剪图）——物理移动要求文件存在，只处理照片
+    # 在盘的园区。
+    if park_filter:
+        loose_rows = [row for row in loose_rows if row[1] == park_filter]
     loose_rows = [row for row in loose_rows if row[6] in type_list]
 
     # 订单索引：只收有可靠时间的车辆帧（ok/兄弟帧；conflict 无时间不可作锚）
@@ -1841,7 +1847,8 @@ def main() -> None:
                              "或某个月份照片根（老布局，园区名取 --park）")
     parser.add_argument("--park", default="",
                         help="只处理指定园区（名字为 data 下的一级目录名）；"
-                             "老布局照片根时作为其园区名，缺省为未标注")
+                             "老布局照片根时作为其园区名，缺省为未标注；"
+                             "与 --assign-loose 联用时限定归类的园区")
     parser.add_argument("--db", type=Path, default=DEFAULT_DB)
     parser.add_argument("--sync-only", action="store_true", help="只扫描目录，不跑OCR")
     parser.add_argument("--process-missing", action="store_true", help="补充OCR时间戳/OSD")
@@ -1870,9 +1877,11 @@ def main() -> None:
 
     conn = sqlite3.connect(args.db)
     ensure_schema(conn)
-    capture_count = conn.execute("SELECT COUNT(*) FROM captures").fetchone()[0]
     standalone = args.assign_loose or args.undo_loose_assign
-    if not args.associate_only and (args.sync_only or capture_count == 0):
+    # 默认流程始终全盘同步：每日流水线靠它发现新园区/新照片（库非空也必须
+    # 扫描，否则新数据永远进不了库——金冠库上线时踩过这个坑）。sync_files
+    # 对已有文件只做路径刷新，不会重复入库。
+    if not args.associate_only and not standalone:
         if not args.root.is_dir():
             parser.error(f"照片目录不存在: {args.root}")
         summary = sync_files(conn, args.root, args.park)
@@ -1890,7 +1899,8 @@ def main() -> None:
             conn, apply_changes=args.apply,
             types=tuple(t.strip() for t in args.loose_types.split(",") if t.strip()),
             window_seconds=args.loose_window_min * 60,
-            sim_threshold=args.loose_sim, sim_margin=args.loose_margin)
+            sim_threshold=args.loose_sim, sim_margin=args.loose_margin,
+            park_filter=args.park)
     elif not args.sync_only:
         print(f"订单内车辆聚合：{associate_orders(conn)}")
     if not standalone:
