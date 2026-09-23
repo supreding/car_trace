@@ -486,6 +486,27 @@
       color: #b45309
     }
 
+    /* 可疑照片组：车牌与订单主车不符（红色警示，与琥珀色未关联组区分） */
+    .ord-group.suspect {
+      border-color: #fecaca
+    }
+
+    .ord-group.suspect .ord-head {
+      background: #fef2f2
+    }
+
+    .ord-group.suspect .ord-head:hover {
+      background: #fee2e2
+    }
+
+    .ord-group.suspect .ord-head .t {
+      color: var(--red)
+    }
+
+    .ord-group.suspect .ord-head .s {
+      color: #b91c1c
+    }
+
     #modal {
       position: fixed;
       inset: 0;
@@ -772,6 +793,18 @@
        同一订单的抓拍折叠为一组；"未关联图片"（库内未归单占位 order_id）和
        空 order_id 的抓拍视为未归单，各自单独成组，用警示色置顶提醒补录；
        订单组保持轨迹时间顺序。 */
+    /* 可疑照片折叠组：车牌与订单主车不符（排队车辆/人工误放），红色警示 */
+    function suspectGroupHTML(rows, mainPlate, domId) {
+      return `<div class="ord-group suspect" id="${domId}">
+      <div class="ord-head" onclick="toggleGroup('${domId}')">
+        <span class="arrow">▶</span><span class="t">⚠ 可疑照片 ${rows.length} 张</span>
+        <span class="s">车牌与订单主车（${esc(mainPlate || "?")}）不符，可能是排队车辆或人工误放</span>
+        <span style="flex:1"></span>
+      </div>
+      <div class="ord-body">${rows.map(tlRow).join("")}</div>
+    </div>`;
+    }
+
     function groupedTimelineHTML(rows) {
       const LOOSE = "未关联图片";
       const groups = [];
@@ -787,7 +820,12 @@
         const times = g.items.map(x => x.capture_time || "").filter(Boolean).sort();
         const span = times.length ? `${times[0].slice(5, 16)} ~ ${times[times.length - 1].slice(11, 19)}` : "";
         const dates = new Set(g.items.map(x => x.date)).size;
-        const meta = [`${g.items.length} 张`, dates > 1 ? `跨${dates}个日期` : "", span].filter(Boolean).join(" · ");
+        // 订单组内把车牌与主车不符的可疑照片折叠成红色子组（未关联组无主牌，不判）
+        const susItems = g.order_id ? g.items.filter(x => x.plate_mismatch) : [];
+        const mainItems = g.order_id ? g.items.filter(x => !x.plate_mismatch) : g.items;
+        const mainPlate = g.order_id ? (g.items[0]?.order_main_plate || "") : "";
+        const meta = [`${g.items.length} 张`, dates > 1 ? `跨${dates}个日期` : "", span,
+        susItems.length ? `可疑${susItems.length}` : ""].filter(Boolean).join(" · ");
         const label = g.order_id ? `订单 ${esc(g.order_id)}` : `⚠ 未关联图片 · 抓拍 #${g.items[0].id}`;
         const groupClass = g.order_id ? "ord-group" : "ord-group no-order";
         const gotoBtn = g.order_id
@@ -797,7 +835,7 @@
         <span class="arrow">▶</span><span class="t">${label}</span><span class="s">${meta}</span>
         <span style="flex:1"></span>${gotoBtn}
       </div>
-      <div class="ord-body">${g.items.map(tlRow).join("")}</div>
+      <div class="ord-body">${mainItems.map(tlRow).join("")}${susItems.length ? suspectGroupHTML(susItems, mainPlate, "sg-" + i) : ""}</div>
     </div>`;
       }).join("");
     }
@@ -833,10 +871,14 @@
       try {
         const data = await api(`/api/order/${encodeURIComponent(oid)}${parkQ2()}`);
         const items = data.items || [];
+        const suspect = items.filter(x => x.plate_mismatch);
+        const normal = items.filter(x => !x.plate_mismatch);
         const parkLabel = data.park || items[0]?.park || "";
         mainHead(`订单 ${esc(oid)}`,
-          `${items.length} 张 · 车牌 ${esc(data.plate || "—")} · 发生时间 ${esc(data.order_time || "—")} · 跨 ${new Set(items.map(i => i.date)).size} 个日期文件夹${multiPark ? ` · ${esc(parkLabel || "未标注园区")}` : ""}`, data.attributes);
-        $("tl").innerHTML = items.length ? items.map(tlRow).join("") : '<div class="empty">没有抓拍</div>';
+          `${items.length} 张 · 车牌 ${esc(data.plate || "—")} · 发生时间 ${esc(data.order_time || "—")} · 跨 ${new Set(items.map(i => i.date)).size} 个日期文件夹${multiPark ? ` · ${esc(parkLabel || "未标注园区")}` : ""}${suspect.length ? ` · 可疑 ${suspect.length}` : ""}`, data.attributes);
+        let html = normal.length ? normal.map(tlRow).join("") : '<div class="empty">没有抓拍</div>';
+        if (suspect.length) html += suspectGroupHTML(suspect, data.plate, "suspect-order");
+        $("tl").innerHTML = html;
       } catch (e) {
         $("main").innerHTML = `<div class="empty">${esc(e.message)}</div>`;
         toast(e.message);

@@ -72,7 +72,9 @@ class AppTestCase(unittest.TestCase):
             """SELECT COUNT(*) FROM (
                  SELECT DISTINCT order_id, date FROM captures)""").fetchone()[0]
         self.assertEqual(unique_orders, 749)
-        self.assertEqual(total_dirs, 806)
+        # 2026-09-23 大门照片重归类（--assign-gate）后，若干 (订单,日期)
+        # 目录组合合并/消失，目录数由 806 变为 803
+        self.assertEqual(total_dirs, 803)
 
     # 4. 时间戳 OCR 与降级标记（实施文档 3.2）
     def test_ocr_timestamps(self):
@@ -268,6 +270,25 @@ class AppTestCase(unittest.TestCase):
         key, _ev, _reason = build_db._match_loose_capture(
             loose, orders, window_seconds=7200, sim_threshold=0.55, sim_margin=0.03)
         self.assertEqual(key, ("P", "A"), "外观明显领先时应选外观最优订单")
+
+    # 8.7 订单内可疑照片标记：车牌与主车车牌差>=2 的行 plate_mismatch=True
+    def test_order_plate_mismatch_flag(self):
+        def tail(a, b):
+            return 99 if not a or not b or len(a) != len(b) else \
+                sum(1 for x, y in zip(a[1:], b[1:]) if x != y)
+
+        detail = self.get_json("/api/order/68002608090040")
+        main = detail.get("plate") or ""
+        for item in detail["items"]:
+            self.assertIn("plate_mismatch", item)
+            self.assertIsInstance(item["plate_mismatch"], bool)
+            pf, osd = item.get("plate_final") or "", item.get("osd_plate") or ""
+            expect = (tail(pf, main) >= 2) if pf else (bool(osd) and tail(osd, main) >= 2)
+            self.assertEqual(item["plate_mismatch"], expect,
+                             f"抓拍#{item['id']} 可疑标记与车牌证据不一致")
+        track = self.get_json("/api/track?vid=1")
+        for item in track:
+            self.assertIn("plate_mismatch", item)
 
     # 9. 断点续跑：已处理记录不会被重复选择（实施文档 10 步）
     def test_resume_no_reprocessing(self):

@@ -634,12 +634,13 @@ def order_detail(order_id: str):
             (order_id, park if park else parks[0]),
         ).fetchone()
         summary = order_summary(db, order_id, park if park else parks[0])
+        items = annotate_order_plates([dict(row) for row in rows], db)
     if not rows:
         return jsonify({"error": "订单不存在", "items": []}), 404
     return jsonify({"order_id": order_id, "park": park if park else parks[0],
                     "order_time": summary["order_time"], "plate": summary["plate"],
                     "attributes": dict(attrs) if attrs else None,
-                    "items": [dict(row) for row in rows]})
+                    "items": items})
 
 
 @app.route("/api/search")
@@ -799,6 +800,35 @@ def vehicles():
     return jsonify(rows)
 
 
+def _plate_suspect(item: dict, main_plate: str) -> bool:
+    """可疑照片判定：照片车牌（plate_final 为空时退回 OSD 参考车牌）与
+    订单主车车牌去省份差 >=2（与 build_db 误读清洗同一判据）——多为排队
+    车辆或人工误放。主牌缺失时无从判定，一律不算可疑。"""
+    if not main_plate:
+        return False
+    if item.get("plate_final"):
+        return build_db._plate_edit_distance(item["plate_final"], main_plate) >= 2
+    osd = item.get("osd_plate") or ""
+    return bool(osd) and build_db._plate_edit_distance(osd, main_plate) >= 2
+
+
+def annotate_order_plates(items: list[dict], db: sqlite3.Connection) -> list[dict]:
+    """给抓拍行补订单主车车牌（order_main_plate）与可疑标记（plate_mismatch）。"""
+    cache: dict[tuple[str, str], str] = {}
+    for item in items:
+        oid = item.get("order_id") or ""
+        if not oid or oid == "未关联图片":
+            item["plate_mismatch"] = False
+            continue
+        key = (item.get("park") or "", oid)
+        if key not in cache:
+            cache[key] = order_summary(db, oid, key[0])["plate"]
+        main_plate = cache[key]
+        item["order_main_plate"] = main_plate
+        item["plate_mismatch"] = _plate_suspect(item, main_plate)
+    return items
+
+
 @app.route("/api/track")
 def track():
     vehicle_id = positive_int(request.args.get("vid", ""))
@@ -832,7 +862,8 @@ def track():
             ).fetchall()
         else:
             return jsonify([])
-    return jsonify([dict(row) for row in rows])
+        items = annotate_order_plates([dict(row) for row in rows], db)
+    return jsonify(items)
 
 
 @app.route("/api/track_by_img")
