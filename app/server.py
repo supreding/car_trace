@@ -497,12 +497,50 @@ def stages():
     return jsonify([dict(row) for row in rows])
 
 
+def order_summary(db: sqlite3.Connection, order_id: str, park: str) -> dict:
+    """订单级汇总：每个订单确定一个大致发生时间和一个车牌号。
+
+    - order_time：订单内最早的有效抓拍时间（OCR 时间），粗略代表订单发生时刻；
+    - plate：整单只取一个车牌——识别车牌 plate_final 多数票（票数→置信度→
+      字典序，保证结果唯一确定），整单没有识别车牌时回退摄像头 OSD 参考车牌
+      的多数票；"未关联图片"桶是伪订单（混装未归单抓拍），不产出车牌。
+    """
+    if order_id == "未关联图片":
+        row = db.execute(
+            """SELECT MIN(capture_time) AS order_time FROM captures
+               WHERE order_id=? AND coalesce(park,'')=? AND coalesce(capture_time,'')!=''""",
+            (order_id, park)).fetchone()
+        return {"order_time": row["order_time"] or "", "plate": ""}
+    row = db.execute(
+        """SELECT
+             (SELECT MIN(capture_time) FROM captures
+               WHERE order_id=? AND coalesce(park,'')=? AND coalesce(capture_time,'')!='')
+               AS order_time,
+             (SELECT plate_final FROM captures
+               WHERE order_id=? AND coalesce(park,'')=? AND coalesce(plate_final,'')!=''
+               GROUP BY plate_final
+               ORDER BY COUNT(*) DESC, MAX(coalesce(plate_confidence,0)) DESC, plate_final
+               LIMIT 1) AS plate_final,
+             (SELECT osd_plate FROM captures
+               WHERE order_id=? AND coalesce(park,'')=? AND coalesce(osd_plate,'')!=''
+               GROUP BY osd_plate
+               ORDER BY COUNT(*) DESC, osd_plate
+               LIMIT 1) AS osd_pick""",
+        (order_id, park, order_id, park, order_id, park),
+    ).fetchone()
+    plate = (row["plate_final"] or "") if row else ""
+    if not plate and row:
+        plate = normalize_plate(row["osd_pick"] or "")
+    return {"order_time": (row["order_time"] or "") if row else "", "plate": plate}
+
+
 @app.route("/api/orders")
 def orders():
     """订单列表：订单号在园区内是聚合唯一键（不同园区可能撞号），
     同一订单跨日期文件夹只出现一行。
 
-    rep_id 是该订单的一张已裁剪抓拍（优先），供列表缩略图使用。
+    rep_id 是该订单的一张已裁剪抓拍（优先），供列表缩略图使用；
+    order_time / plate 是订单级汇总（大致发生时间 + 唯一车牌号）。
     """
     date = request.args.get("date", "").strip()
     stage = request.args.get("stage", "").strip()
@@ -559,6 +597,7 @@ def orders():
                 row["vehicle_type"] = attrs["vehicle_type"] or row["vehicle_type"]
                 row["attr_conf"] = {"color": attrs["vehicle_color_conf"],
                                     "type": attrs["vehicle_type_conf"]}
+            row.update(order_summary(db, row["order_id"], row["park"] or ""))
     return jsonify(rows)
 
 
@@ -594,9 +633,11 @@ def order_detail(order_id: str):
             """SELECT * FROM order_attributes WHERE order_id=? AND coalesce(park,'')=?""",
             (order_id, park if park else parks[0]),
         ).fetchone()
+        summary = order_summary(db, order_id, park if park else parks[0])
     if not rows:
         return jsonify({"error": "订单不存在", "items": []}), 404
     return jsonify({"order_id": order_id, "park": park if park else parks[0],
+                    "order_time": summary["order_time"], "plate": summary["plate"],
                     "attributes": dict(attrs) if attrs else None,
                     "items": [dict(row) for row in rows]})
 
@@ -1621,6 +1662,7 @@ def open_orders():
                 item["vehicle_type"] = attrs["vehicle_type"] or item["vehicle_type"]
                 item["attr_conf"] = {"color": attrs["vehicle_color_conf"],
                                      "type": attrs["vehicle_type_conf"]}
+            item.update(order_summary(db, item["order_id"], item["park"]))
             items.append(item)
     return _open_ok({"total": total, "page": page, "page_size": page_size, "items": items})
 
@@ -1656,7 +1698,9 @@ def open_order_detail(order_id: str):
             """SELECT * FROM order_attributes WHERE order_id=? AND coalesce(park,'')=?""",
             (order_id, park if park else parks[0]),
         ).fetchone()
+        summary = order_summary(db, order_id, park if park else parks[0])
     return _open_ok({"data": {"order_id": order_id, "park": park if park else parks[0],
+                              "order_time": summary["order_time"], "plate": summary["plate"],
                               "attributes": dict(attrs) if attrs else None,
                               "items": [dict(row) for row in rows]}})
 

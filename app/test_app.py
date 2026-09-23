@@ -189,6 +189,40 @@ class AppTestCase(unittest.TestCase):
             sims = [item.get("similarity") for item in items if item.get("similarity") is not None]
             self.assertEqual(sims, sorted(sims, reverse=True), "相似度未降序排列")
 
+    # 8.5 订单级汇总：每个订单确定大致发生时间（order_time）与唯一车牌号（plate）
+    def test_order_summary_plate_and_time(self):
+        rows = self.get_json("/api/orders?limit=100")
+        self.assertTrue(rows)
+        for item in rows:
+            self.assertIn("plate", item)
+            self.assertIn("order_time", item)
+            if item["order_time"]:
+                self.assertRegex(item["order_time"], r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+        # 取一个有车牌且订单号未跨园区撞号的样本（详情接口免 park 参数）
+        sample = next((r for r in rows if r["plate"] and self.db.execute(
+            "SELECT COUNT(DISTINCT coalesce(park,'')) FROM captures WHERE order_id=?",
+            (r["order_id"],)).fetchone()[0] == 1), None)
+        if not sample:
+            self.fail("前 100 个订单里没有可校验的带车牌样本")
+        detail = self.get_json(f"/api/order/{sample['order_id']}")
+        self.assertEqual(detail["plate"], sample["plate"])
+        self.assertEqual(detail["order_time"], sample["order_time"])
+        # order_time = 订单内最早的有效抓拍时间
+        min_time = self.db.execute(
+            """SELECT MIN(capture_time) FROM captures
+               WHERE order_id=? AND coalesce(capture_time,'')!=''""",
+            (sample["order_id"],)).fetchone()[0]
+        self.assertEqual(sample["order_time"], min_time or "")
+        # plate 必须来自该订单的识别车牌/OSD 参考车牌候选集合（宽松归一后比对）
+        candidates = set()
+        for (plate,) in self.db.execute(
+                """SELECT plate_final FROM captures WHERE order_id=? AND coalesce(plate_final,'')!=''
+                   UNION SELECT osd_plate FROM captures WHERE order_id=? AND coalesce(osd_plate,'')!=''""",
+                (sample["order_id"], sample["order_id"])):
+            candidates.add(re.sub(r"[^0-9A-Z\u4e00-\u9fff挂学警港澳使领]", "", (plate or "").upper()))
+        self.assertIn(re.sub(r"[^0-9A-Z\u4e00-\u9fff挂学警港澳使领]", "",
+                             sample["plate"].upper()), candidates)
+
     # 9. 断点续跑：已处理记录不会被重复选择（实施文档 10 步）
     def test_resume_no_reprocessing(self):
         pending = self.db.execute(

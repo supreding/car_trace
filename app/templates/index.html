@@ -595,11 +595,12 @@
       <div class="s">${esc((it.first_seen || "").slice(5, 16))} ~ ${esc((it.last_seen || "").slice(11, 19))}</div></div></div>`;
       }
       const t = `订单 ${it.order_id}`;
-      const s = [`${it.count}张`, it.date_span > 1 ? `跨${it.date_span}天` : "",
+      const s = [it.plate ? `车牌 ${esc(it.plate)}` : "", `${it.count}张`, it.date_span > 1 ? `跨${it.date_span}天` : "",
       esc(COLOR_CN[it.vehicle_color] || it.vehicle_color || ""), esc(TYPE_CN[it.vehicle_type] || it.vehicle_type || "")]
         .filter(Boolean).join(" · ");
+      const start = esc((it.order_time || it.first_seen || "").slice(0, 16));
       return `<div class="side-item" data-key="o${esc(it.order_id)}">${img}<div style="min-width:0"><div class="t">${t} ${parkTag}</div><div class="s">${s}</div>
-    <div class="s">${esc((it.first_seen || "").slice(0, 16))}起</div></div></div>`;
+    <div class="s">${start}起</div></div></div>`;
     }
 
     async function loadSidebar() {
@@ -834,7 +835,7 @@
         const items = data.items || [];
         const parkLabel = data.park || items[0]?.park || "";
         mainHead(`订单 ${esc(oid)}`,
-          `${items.length} 张 · 跨 ${new Set(items.map(i => i.date)).size} 个日期文件夹${multiPark ? ` · ${esc(parkLabel || "未标注园区")}` : ""}`, data.attributes);
+          `${items.length} 张 · 车牌 ${esc(data.plate || "—")} · 发生时间 ${esc(data.order_time || "—")} · 跨 ${new Set(items.map(i => i.date)).size} 个日期文件夹${multiPark ? ` · ${esc(parkLabel || "未标注园区")}` : ""}`, data.attributes);
         $("tl").innerHTML = items.length ? items.map(tlRow).join("") : '<div class="empty">没有抓拍</div>';
       } catch (e) {
         $("main").innerHTML = `<div class="empty">${esc(e.message)}</div>`;

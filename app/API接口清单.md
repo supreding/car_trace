@@ -60,7 +60,7 @@
 
 ### 1.3 字段说明（items / data.items 内）
 
-订单字段：`order_id` 订单号、`capture_count` 抓拍数、`date_span` 跨越天数、`dates` 涉及日期、`first_seen` / `last_seen` 首末时间、`cropped` 有车辆裁剪的张数、`no_vehicle` 未检出车辆的张数、`vehicle_color` / `vehicle_type` 车辆颜色/车型（属性模型）、`rep_id` 可用于取图的抓拍 ID、`attr_conf` 属性置信度 `{color, type}`。
+订单字段：`order_id` 订单号、`capture_count` 抓拍数、`date_span` 跨越天数、`dates` 涉及日期、`first_seen` / `last_seen` 首末时间、`cropped` 有车辆裁剪的张数、`no_vehicle` 未检出车辆的张数、`vehicle_color` / `vehicle_type` 车辆颜色/车型（属性模型）、`rep_id` 可用于取图的抓拍 ID、`attr_conf` 属性置信度 `{color, type}`、`order_time` 订单大致发生时间（订单内最早的有效抓拍时间，可能为空）、`plate` 订单车牌号（整单唯一：识别车牌多数票，票数相同取置信度高者；整单无识别车牌时回退 OSD 参考车牌；"未关联图片"伪订单不产出车牌）。
 
 车辆字段：`vehicle_id` 车辆聚合编号、`rep_id` 代表抓拍、`capture_count` 出现次数、`order_ids` 关联订单号（逗号分隔）、`plate` 主识别车牌、`plate_confidence` 车牌置信度、`color` / `vehicle_type` 颜色/车型、`camera_count` 涉及摄像头数、`first_seen` / `last_seen`。
 
