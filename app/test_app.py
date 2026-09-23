@@ -271,7 +271,7 @@ class AppTestCase(unittest.TestCase):
             loose, orders, window_seconds=7200, sim_threshold=0.55, sim_margin=0.03)
         self.assertEqual(key, ("P", "A"), "外观明显领先时应选外观最优订单")
 
-    # 8.7 订单内可疑照片标记：车型/颜色与主车不符，或车牌完全不同（差>=5）
+    # 8.7 订单内可疑照片标记：车型与主车不符，或车牌完全不同（差>=5）
     def test_order_suspect_flag(self):
         def tail(a, b):
             return 99 if not a or not b or len(a) != len(b) else \
@@ -283,12 +283,9 @@ class AppTestCase(unittest.TestCase):
             self.assertIn("suspect", item)
             self.assertIsInstance(item["suspect"], bool)
             mt = item.get("order_main_type") or ""
-            mc = item.get("order_main_color") or ""
             vt = item.get("vehicle_type") or ""
-            vc = item.get("vehicle_color") or ""
             pf = item.get("plate_final") or ""
             expect = ((bool(mt) and bool(vt) and vt != mt)
-                      or (bool(mc) and bool(vc) and vc != mc)
                       or (bool(main) and bool(pf) and len(pf) == len(main)
                           and tail(pf, main) >= 5))
             self.assertEqual(item["suspect"], expect,
