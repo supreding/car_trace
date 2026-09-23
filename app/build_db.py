@@ -1784,10 +1784,11 @@ def assign_gate_orders(conn: sqlite3.Connection, apply_changes: bool = False,
       阈值（外观与所有候选都矛盾）保留现归属不硬分；
     - 评估某张照片时把它自己从现属订单的锚里剔除（否则它永远离自己
       0 分钟，永远不会被纠正）；
-    - 命中订单与当前归属不同才动：物理移动文件进目标订单文件夹、更新
-      order_id/date/filepath，写 loose_assignments 日志（from_order=原
-      订单，--undo-loose-assign 可撤销），随后建议重跑 associate_orders
-      重聚车辆；
+    - 命中订单与当前归属不同才动：原图在盘 -> 物理移动文件进目标订单
+      文件夹；原图不在盘（服务器清理过照片的园区）-> 仅库内改 order_id
+      （路径保持原样便于审计）。两种情况都写 loose_assignments 日志
+      （from_order=原订单，--undo-loose-assign 可撤销），随后建议重跑
+      associate_orders 重聚车辆；
     - apply 模式迭代到稳定（上限 max_rounds 轮，前一轮的移动会扩展订单
       时间窗影响下一轮裁决），且单次运行每张照片至多移动一次；
     - 收敛保证：已有 loose_assignments 日志的照片不再参评——每张大门
@@ -1966,15 +1967,10 @@ def assign_gate_orders(conn: sqlite3.Connection, apply_changes: bool = False,
         gate_rows = [r for r in gate_rows if r[1] == park_filter]
     if types:
         gate_rows = [r for r in gate_rows if r[7] in types or not r[7]]
-    # 原始照片已从盘上清理的园区（服务器只留库记录与裁剪图）：物理移动无从
-    # 做起，跳过而不是反复移动失败刷屏（与 assign_loose_orders 同一处理）。
-    on_disk = [r for r in gate_rows
-               if resolve_stored_path(r[8]).is_file() or project_file(r[8]).is_file()]
-    no_disk = len(gate_rows) - len(on_disk)
-    gate_rows = on_disk
 
     now = datetime.now().isoformat(timespec="seconds")
     moved = planned = failed = 0
+    db_only_moves = 0
     skip_counter: dict[str, int] = {}
     keep_count = 0
     touched_orders: set[tuple[str, str]] = set()
@@ -2034,17 +2030,26 @@ def assign_gate_orders(conn: sqlite3.Connection, apply_changes: bool = False,
                            f"时间差{minutes}分钟（原归属{cur_order}）")
             print(f"  归类 #{cid} {date} {row[4][11:19]} {cur_order} -> 订单{key[1]} "
                   f"({evidence['plate_note']}，时间差{minutes}分钟)")
-            try:
-                target_abs.parent.mkdir(parents=True, exist_ok=True)
-                source_abs = project_file(filepath)
-                if not source_abs.is_file():
-                    source_abs = resolve_stored_path(filepath)
-                if source_abs.resolve() != target_abs.resolve():
-                    shutil.move(str(source_abs), str(target_abs))
-            except OSError as exc:
-                failed += 1
-                print(f"  移动失败 #{cid}: {exc}")
-                continue
+            # 原图在盘 -> 物理移动；不在盘（服务器清理过的园区）-> 仅库内
+            # 改归属（order_id 是聚合唯一事实来源，路径保持原样便于审计）
+            source_abs = project_file(filepath)
+            if not source_abs.is_file():
+                source_abs = resolve_stored_path(filepath)
+            db_only = not source_abs.is_file()
+            if not db_only:
+                try:
+                    target_abs.parent.mkdir(parents=True, exist_ok=True)
+                    if source_abs.resolve() != target_abs.resolve():
+                        shutil.move(str(source_abs), str(target_abs))
+                except OSError as exc:
+                    failed += 1
+                    print(f"  移动失败 #{cid}: {exc}")
+                    continue
+                new_fp, new_fn, new_date = to_stored_path(target_abs), final_name, target_date
+            else:
+                db_only_moves += 1
+                new_fp, new_fn, new_date = filepath, filename, date
+                reason_text += "（原图不在盘，仅库内改归属）"
             vehicle_id = conn.execute(
                 """SELECT vehicle_id, COUNT(*) AS cnt FROM captures
                    WHERE coalesce(park,'')=? AND order_id=? AND vehicle_id IS NOT NULL
@@ -2054,7 +2059,7 @@ def assign_gate_orders(conn: sqlite3.Connection, apply_changes: bool = False,
             conn.execute(
                 """UPDATE captures SET order_id=?, date=?, filepath=?, filename=?,
                           plate_match_reason=?, vehicle_id=? WHERE id=?""",
-                (key[1], target_date, to_stored_path(target_abs), final_name,
+                (key[1], new_date, new_fp, new_fn,
                  reason_text, vehicle_id[0] if vehicle_id else None, cid),
             )
             conn.execute(
@@ -2063,8 +2068,8 @@ def assign_gate_orders(conn: sqlite3.Connection, apply_changes: bool = False,
                       filepath_old, filepath_new, filename_old, filename_new,
                       similarity, time_diff_seconds, plate_note, reason, moved_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (cid, key[0], cur_order, key[1], date, target_date,
-                 filepath, to_stored_path(target_abs), filename, final_name,
+                (cid, key[0], cur_order, key[1], date, new_date,
+                 filepath, new_fp, filename, new_fn,
                  evidence["similarity"], evidence["time_diff_seconds"],
                  evidence["plate_note"], reason_text, now),
             )
@@ -2074,15 +2079,18 @@ def assign_gate_orders(conn: sqlite3.Connection, apply_changes: bool = False,
             if member:
                 old_members.remove(member)
                 members.setdefault(key, []).append(member)
-            old_parent = str(Path(filepath).parent)
-            # dirs 收日期即可；nearest_anchor 必须存完整时间戳
-            # （_pick_order_dir 会 strptime），target_date 可能只有日期
-            dirs.setdefault(key, {}).setdefault(str(target_abs.parent), target_date)
-            nearest_anchor.setdefault(key, {}).setdefault(str(target_abs.parent), row[4])
-            dirs.get((park, cur_order), {}).pop(old_parent, None)
-            nearest_anchor.get((park, cur_order), {}).pop(old_parent, None)
-            st.update(order=key[1], date=target_date,
-                      filepath=to_stored_path(target_abs), filename=final_name)
+            if not db_only:
+                old_parent = str(Path(filepath).parent)
+                # dirs 收日期即可；nearest_anchor 必须存完整时间戳
+                # （_pick_order_dir 会 strptime），target_date 可能只有日期
+                dirs.setdefault(key, {}).setdefault(str(target_abs.parent), target_date)
+                nearest_anchor.setdefault(key, {}).setdefault(str(target_abs.parent), row[4])
+                dirs.get((park, cur_order), {}).pop(old_parent, None)
+                nearest_anchor.get((park, cur_order), {}).pop(old_parent, None)
+                st.update(order=key[1], date=target_date,
+                          filepath=to_stored_path(target_abs), filename=final_name)
+            else:
+                st.update(order=key[1])
             touched_orders.add(key)
             touched_orders.add((park, cur_order))
             moved_cids.add(cid)
@@ -2094,12 +2102,13 @@ def assign_gate_orders(conn: sqlite3.Connection, apply_changes: bool = False,
         conn.commit()
 
     result = {
-        "gate_captures": len(gate_rows) + no_disk, "reassigned": moved, "planned": planned,
+        "gate_captures": len(gate_rows), "reassigned": moved, "planned": planned,
         "failed": failed, "kept": keep_count, "skips": skip_counter,
-        "orders_touched": len(touched_orders), "no_disk_skipped": no_disk,
+        "orders_touched": len(touched_orders), "db_only": db_only_moves,
     }
     mode = "已重归类" if apply_changes else "试运行（加 --apply 落盘）"
-    move_stat = f"移动{moved}张" if apply_changes else f"计划移动{planned}张"
+    move_stat = (f"移动{moved}张（其中仅库内改归属{db_only_moves}张）" if apply_changes
+                 else f"计划移动{planned}张")
     print(f"大门照片重归属{mode}：入磅/出磅 {result['gate_captures']}张，"
           f"{move_stat}，失败{failed}张，保留现归属{keep_count}张")
     for reason_text, count in sorted(skip_counter.items(), key=lambda kv: -kv[1]):
