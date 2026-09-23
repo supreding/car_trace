@@ -223,6 +223,52 @@ class AppTestCase(unittest.TestCase):
         self.assertIn(re.sub(r"[^0-9A-Z\u4e00-\u9fff挂学警港澳使领]", "",
                              sample["plate"].upper()), candidates)
 
+    # 8.6 未关联抓拍匹配：外观难分时按时间差就近归属（2026-09 现场规则）
+    def test_match_loose_ambiguous_falls_back_to_time(self):
+        import build_db
+        from datetime import datetime as dt
+
+        def emb(cos_value):
+            # 二维单位向量，与 (1,0) 方向的余弦恰为 cos_value
+            v = np.array([cos_value, (1 - cos_value * cos_value) ** 0.5],
+                         dtype=np.float32)
+            return v / np.linalg.norm(v)
+
+        base = dt(2026, 8, 9, 10, 0, 0)
+        loose = {"park": "P", "plate": "", "dt": base,
+                 "emb": emb(1.0), "vehicle_type": "truck"}
+        # 订单 A：外观略优（0.72 vs 0.70，领先 0.02 < margin）但时间差 20 分钟；
+        # 订单 B：时间差 5 分钟 -> 外观难分，应归时间更近的 B
+        orders = {
+            ("P", "A"): {"park": "P", "times": [dt(2026, 8, 9, 9, 40, 0)],
+                         "embs": [emb(0.72)], "main_type": "truck",
+                         "consensus_plate": ""},
+            ("P", "B"): {"park": "P", "times": [dt(2026, 8, 9, 9, 55, 0)],
+                         "embs": [emb(0.70)], "main_type": "truck",
+                         "consensus_plate": ""},
+        }
+        key, _ev, reason = build_db._match_loose_capture(
+            loose, orders, window_seconds=7200, sim_threshold=0.55, sim_margin=0.03)
+        self.assertEqual(key, ("P", "B"),
+                         "外观难分时应归时间更近的订单B而不是外观略优的A")
+        self.assertEqual(reason, "")
+        # 两单时间差彼此 <300 秒仍是真歧义：不强行归类
+        orders[("P", "A")]["times"] = [dt(2026, 8, 9, 9, 57, 0)]
+        orders[("P", "B")]["times"] = [dt(2026, 8, 9, 9, 58, 0)]
+        loose["dt"] = dt(2026, 8, 9, 9, 59, 30)
+        key, _ev, reason = build_db._match_loose_capture(
+            loose, orders, window_seconds=7200, sim_threshold=0.55, sim_margin=0.03)
+        self.assertIsNone(key)
+        self.assertIn("时间差接近", reason)
+        # 外观决定性领先时仍由外观定胜负（时间只是并列时的裁决手段）
+        orders[("P", "A")]["times"] = [dt(2026, 8, 9, 9, 40, 0)]
+        orders[("P", "B")]["times"] = [dt(2026, 8, 9, 9, 55, 0)]
+        orders[("P", "A")]["embs"] = [emb(0.85)]
+        loose["dt"] = base
+        key, _ev, _reason = build_db._match_loose_capture(
+            loose, orders, window_seconds=7200, sim_threshold=0.55, sim_margin=0.03)
+        self.assertEqual(key, ("P", "A"), "外观明显领先时应选外观最优订单")
+
     # 9. 断点续跑：已处理记录不会被重复选择（实施文档 10 步）
     def test_resume_no_reprocessing(self):
         pending = self.db.execute(

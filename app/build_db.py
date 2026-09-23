@@ -1493,10 +1493,13 @@ def _match_loose_capture(loose: dict, orders: dict, window_seconds: int,
     - 车牌锚定（最强）：loose 读到车牌且订单共识车牌去省份差 <=1 -> 直接归入
       时间差最小者（同一辆车多次进场时，时间窗负责挑出"这一次"）；
     - 外观+时间（无车牌可用时）：与订单主车特征最大余弦 >= 阈值，且领先
-      次优订单 >= margin（园区同时在场货车常达 7-10 单，不设领先幅度会把
-      相邻车道的同型货车错挂）；车型与订单主体车型矛盾者先被否决。
+      次优订单 >= margin 时外观定胜负；领先不足（园区同时在场货车常达
+      7-10 单，同型同色货车外观本来就难分）按时间差就近归属——照片夹在
+      两个订单之间时选时间更近的一单；两单时间差彼此 <300 秒仍是真歧义，
+      保持待人工。车型与订单主体车型矛盾者先被否决。
     标定（granary.db 隐藏车牌模拟，86 个可评估样本）：阈值0.55+领先0.03
-    精度 92.9%、召回 75.6%；阈值提升对精度增益有限，主要靠 margin 拦误挂。
+    精度 92.9%、召回 75.6%；margin 原用于拦误挂搁置歧义样本，现歧义样本
+    交给时间裁决（2026-09 现场要求：宁可按时间就近归属，不留成未关联）。
     """
     evidence = {"similarity": 0.0, "time_diff_seconds": -1, "plate_note": ""}
     candidates = []
@@ -1538,19 +1541,30 @@ def _match_loose_capture(loose: dict, orders: dict, window_seconds: int,
                         plate_note=f"车牌去省份差{best['plate_distance']}")
         return best["key"], evidence, ""
 
-    # 无车牌锚定：外观相似度阈值 + 对次优的领先幅度
+    # 无车牌锚定：外观相似度阈值 + 对次优的领先幅度。外观分不出胜负时
+    # （领先不足——同型同色货车常态）按时间差就近裁决：照片夹在两个订单
+    # 之间时自动归时间更近的一单，不再搁置；两单时间差彼此 <300 秒仍是
+    # 真歧义（无法分辨是哪一次），保持待人工判断，避免硬币翻面。
     candidates.sort(key=lambda c: (-c["sim"], c["time_diff"]))
     best = candidates[0]
     second = candidates[1] if len(candidates) > 1 else None
     lead = best["sim"] - second["sim"] if second else 1.0
     if best["sim"] < sim_threshold:
         return None, evidence, "最高相似度低于阈值"
-    if lead < sim_margin:
-        return None, evidence, "领先幅度不足，存在歧义"
-    evidence.update(similarity=best["sim"],
-                    time_diff_seconds=int(best["time_diff"]),
-                    plate_note="无车牌，外观+时间匹配")
-    return best["key"], evidence, ""
+    if lead >= sim_margin:
+        evidence.update(similarity=best["sim"],
+                        time_diff_seconds=int(best["time_diff"]),
+                        plate_note="无车牌，外观+时间匹配")
+        return best["key"], evidence, ""
+    by_time = sorted(candidates, key=lambda c: (c["time_diff"], -c["sim"]))
+    nearest = by_time[0]
+    runner = by_time[1] if len(by_time) > 1 else None
+    if runner and runner["time_diff"] - nearest["time_diff"] < 300:
+        return None, evidence, "候选订单时间差接近，待人工判断"
+    evidence.update(similarity=nearest["sim"],
+                    time_diff_seconds=int(nearest["time_diff"]),
+                    plate_note="外观难分，按时间就近归属")
+    return nearest["key"], evidence, ""
 
 
 def assign_loose_orders(conn: sqlite3.Connection, apply_changes: bool = False,
@@ -1747,6 +1761,346 @@ def assign_loose_orders(conn: sqlite3.Connection, apply_changes: bool = False,
     return result
 
 
+def assign_gate_orders(conn: sqlite3.Connection, apply_changes: bool = False,
+                       types: tuple[str, ...] = (),
+                       window_seconds: int = 7200,
+                       sim_threshold: float = 0.55,
+                       sim_margin: float = 0.03,
+                       park_filter: str = "",
+                       max_rounds: int = 3) -> dict:
+    """大门抓拍（入磅/出磅）按时间重新归属订单（默认试运行，--apply 落盘）。
+
+    背景：大门照片人工分不到——上游 NVR 靠自身车牌识别把读得到牌的照片
+    归档进订单文件夹，两个订单时间靠近时容易放错订单。本步骤用与
+    assign_loose_orders 相同的证据链重新评估每张大门照片：
+
+    - 订单时间锚包含已归属的大门照片（入磅提前窗口、出磅推后窗口），而
+      不只看人工分好的抓拍/质检照片——"把进出大门的算上"；
+    - 车牌锚定最强（去省份差 <=1，时间差最小者胜，两单 <300 秒真歧义
+      保留现归属）；现属订单任一成员车牌与照片车牌一致时视为锚定在
+      现属订单，外观证据不能推翻（防同型货车外观误拉走按牌归档的照片）；
+      外观决定胜负需领先 >= margin；外观难分时按时间差
+      就近归属（照片夹在两个订单之间时选更近的一单）；最高相似度低于
+      阈值（外观与所有候选都矛盾）保留现归属不硬分；
+    - 评估某张照片时把它自己从现属订单的锚里剔除（否则它永远离自己
+      0 分钟，永远不会被纠正）；
+    - 命中订单与当前归属不同才动：物理移动文件进目标订单文件夹、更新
+      order_id/date/filepath，写 loose_assignments 日志（from_order=原
+      订单，--undo-loose-assign 可撤销），随后建议重跑 associate_orders
+      重聚车辆；
+    - apply 模式迭代到稳定（上限 max_rounds 轮，前一轮的移动会扩展订单
+      时间窗影响下一轮裁决），且单次运行每张照片至多移动一次；
+    - 收敛保证：已有 loose_assignments 日志的照片不再参评——每张大门
+      照片一生只自动重归类一次，日常流水线增量处理新照片，重复运行
+      不会来回翻动。需要重评某张时先 --undo-loose-assign 撤销其记录。
+    """
+    ensure_loose_assignments_schema(conn)
+
+    # ---- 订单索引：members 保留每张照片（时间/车牌/特征/车型），评估时
+    # 可剔除被评照片自身后重算时间锚与共识车牌 ----
+    members: dict[tuple[str, str], list[dict]] = {}
+    for cid, park, order_id, capture_time, plate, blob, vtype in conn.execute(
+        """SELECT id, coalesce(park,''), order_id, capture_time, plate_final,
+                  reid_embedding, vehicle_type
+           FROM captures
+           WHERE coalesce(order_id,'')!='' AND order_id!='未关联图片'
+             AND capture_time IS NOT NULL AND capture_time!=''
+             AND coalesce(capture_status,'vehicle')!='no_vehicle'"""
+    ).fetchall():
+        emb = None
+        if blob:
+            f = np.frombuffer(blob, np.float32)
+            norm = float(np.linalg.norm(f))
+            emb = f / norm if norm > 0 else None
+        members.setdefault((park, order_id), []).append(
+            {"cid": cid, "dt": datetime.strptime(capture_time, "%Y-%m-%d %H:%M:%S"),
+             "plate": plate or "", "emb": emb, "vtype": vtype or ""})
+    # 目标文件夹参照：订单已有照片所在目录 -> 日期（_pick_order_dir 用）
+    dirs: dict[tuple[str, str], dict[str, str]] = {}
+    nearest_anchor: dict[tuple[str, str], dict[str, str]] = {}
+    for park, order_id, filepath, capture_time in conn.execute(
+        """SELECT coalesce(park,''), order_id, filepath, coalesce(capture_time,'')
+           FROM captures
+           WHERE coalesce(order_id,'')!='' AND order_id!='未关联图片'
+             AND filepath IS NOT NULL AND filepath!=''"""
+    ):
+        parent = str(Path(filepath).parent)
+        dirs.setdefault((park, order_id), {}).setdefault(parent, (capture_time or "")[:10])
+        # 只收完整时间戳（部分老记录 capture_time 只有日期，strptime 会炸）
+        if capture_time and len(capture_time) == 19:
+            nearest_anchor.setdefault((park, order_id), {})[parent] = capture_time
+
+    def order_anchors(key: tuple[str, str], exclude_cid: int | None = None):
+        rows = members.get(key, [])
+        if exclude_cid is not None:
+            rows = [m for m in rows if m["cid"] != exclude_cid]
+        plates = Counter(m["plate"] for m in rows if m["plate"])
+        if plates:
+            top_plate, top_count = plates.most_common(1)[0]
+            consensus = top_plate if (top_count >= 2 or len(plates) == 1) else ""
+        else:
+            consensus = ""
+        types_counter = Counter(m["vtype"] for m in rows if m["vtype"])
+        main_type = types_counter.most_common(1)[0][0] if types_counter else ""
+        times = [m["dt"] for m in rows]
+        embs = [m["emb"] for m in rows if m["emb"] is not None][:12]
+        return times, embs, consensus, main_type
+
+    # 候选订单时间锚缓存：只有被评照片的现属订单需要剔除自身重算，其余订单
+    # 的锚在本轮内不变（apply 模式每轮移动后失效重建）。
+    anchor_cache: dict[tuple[str, str], tuple] = {}
+
+    def evaluate(row, cur_order: str):
+        """评估一张大门照片：返回 (命中订单key或None=保留现归属, 证据, 原因)"""
+        (cid, park, _cur, _date, capture_time, plate, blob,
+         vtype, _filepath, _filename) = row
+        f = np.frombuffer(blob, np.float32)
+        norm = float(np.linalg.norm(f))
+        if norm <= 0:
+            return None, {"similarity": 0.0, "time_diff_seconds": -1,
+                          "plate_note": ""}, "无效特征"
+        emb = f / norm
+        dt = datetime.strptime(capture_time, "%Y-%m-%d %H:%M:%S")
+        evidence = {"similarity": 0.0, "time_diff_seconds": -1, "plate_note": ""}
+        cur_key = (park, cur_order)
+        # 现属订单车牌保护：照片车牌与现属订单任一成员车牌去省份差 <=1，
+        # 即视为车牌锚定在现属订单（上游 NVR 正是按牌归档的）——外观证据
+        # 不能把照片拉走，除非另一订单也车牌锚定且时间明显更近。
+        cur_plate_anchored = bool(plate) and any(
+            m["plate"] and _plate_edit_distance(plate, m["plate"]) <= 1
+            for m in members.get(cur_key, []) if m["cid"] != cid)
+        candidates = []
+        for key in members:
+            if key[0] != park:
+                continue
+            if key == cur_key:
+                anchors = order_anchors(key, exclude_cid=cid)
+            else:
+                if key not in anchor_cache:
+                    anchor_cache[key] = order_anchors(key)
+                anchors = anchor_cache[key]
+            times, embs, consensus, main_type = anchors
+            if not times:
+                continue  # 现属订单剔自身后无锚：无从辩护，视为未防守
+            time_diff = min(abs((dt - t).total_seconds()) for t in times)
+            # 时间窗只用来发现新候选；现属订单始终参评（否则一张订单里
+            # 最晚的大门照片会因剔自身后被判超窗而被外观随手移走）。
+            if time_diff > window_seconds and key != cur_key:
+                continue
+            if vtype and main_type and vtype != main_type and key != cur_key:
+                continue  # 车型矛盾：不可能是该订单主车（现属订单不因此逐出）
+            plate_distance = -1
+            if plate and consensus:
+                plate_distance = _plate_edit_distance(plate, consensus)
+                if plate_distance >= 2 and key != cur_key:
+                    continue  # 车牌明显不同：否决（现属订单不否决，由车牌保护兜底）
+            sim = max((cosine(emb, e) for e in embs), default=-1.0)
+            candidates.append({"key": key, "sim": sim, "time_diff": time_diff,
+                               "plate_distance": plate_distance})
+        if not candidates:
+            return None, evidence, "时间窗内无兼容订单（保留现归属）"
+        if os.environ.get("GATE_DEBUG_ID") == str(cid):
+            for c in sorted(candidates, key=lambda c: c["time_diff"]):
+                print(f"    [debug #{cid}] cur={cur_key[1]} 候选{c['key'][1]} "
+                      f"sim={c['sim']:.3f} td={int(c['time_diff'])}s plate_d={c['plate_distance']}")
+
+        def keep(winner_or_none, note):
+            if winner_or_none is None or winner_or_none == cur_key:
+                return None, evidence, f"保留现归属（{note}）"  # 证据不足以移动
+            evidence["similarity"] = round(next(
+                c["sim"] for c in candidates if c["key"] == winner_or_none), 4)
+            evidence["time_diff_seconds"] = int(next(
+                c["time_diff"] for c in candidates if c["key"] == winner_or_none))
+            evidence["plate_note"] = note
+            return winner_or_none, evidence, ""
+
+        plate_matched = [c for c in candidates if c["plate_distance"] >= 0]
+        if cur_plate_anchored:
+            # 现属订单有车牌证据：只有另一订单也车牌锚定且时间明显更近才动
+            cur_td = next((c["time_diff"] for c in candidates if c["key"] == cur_key),
+                          None)
+            better = [c for c in plate_matched
+                      if cur_td is None or c["time_diff"] < cur_td]
+            if not better:
+                return None, evidence, "车牌锚定现归属（保留）"
+            better.sort(key=lambda c: (c["time_diff"], -c["sim"]))
+            best_other = better[0]
+            if cur_td is not None and best_other["time_diff"] - cur_td < 300:
+                return None, evidence, "两笔车牌一致订单时间接近，保留现归属"
+            return keep(best_other["key"],
+                        f"车牌去省份差{best_other['plate_distance']}（原订单同牌更远）")
+        if plate_matched:
+            plate_matched.sort(key=lambda c: (c["time_diff"], -c["sim"]))
+            best = plate_matched[0]
+            runner = plate_matched[1] if len(plate_matched) > 1 else None
+            if runner and runner["time_diff"] - best["time_diff"] < 300:
+                return None, evidence, "多笔车牌一致订单时间接近，保留现归属"
+            return keep(best["key"], f"车牌去省份差{best['plate_distance']}")
+        candidates.sort(key=lambda c: (-c["sim"], c["time_diff"]))
+        best = candidates[0]
+        second = candidates[1] if len(candidates) > 1 else None
+        lead = best["sim"] - second["sim"] if second else 1.0
+        if best["sim"] < sim_threshold:
+            return None, evidence, "最高相似度低于阈值（保留现归属）"
+        if lead >= sim_margin:
+            return keep(best["key"], "外观+时间匹配")
+        by_time = sorted(candidates, key=lambda c: (c["time_diff"], -c["sim"]))
+        nearest = by_time[0]
+        runner = by_time[1] if len(by_time) > 1 else None
+        if runner and runner["time_diff"] - nearest["time_diff"] < 300:
+            return None, evidence, "候选订单时间差接近，保留现归属"
+        return keep(nearest["key"], "外观难分，按时间就近归属")
+
+    gate_rows = conn.execute(
+        """SELECT id, coalesce(park,''), order_id, date, capture_time, plate_final,
+                  reid_embedding, vehicle_type, filepath, filename
+           FROM captures
+           WHERE stage IN ('入磅','出磅')
+             AND coalesce(capture_status,'vehicle')!='no_vehicle'
+             AND capture_time IS NOT NULL AND capture_time!=''
+             AND reid_embedding IS NOT NULL
+             AND coalesce(order_id,'')!='' AND order_id!='未关联图片'
+             AND id NOT IN (SELECT capture_id FROM loose_assignments)"""
+    ).fetchall()
+    if park_filter:
+        gate_rows = [r for r in gate_rows if r[1] == park_filter]
+    if types:
+        gate_rows = [r for r in gate_rows if r[7] in types or not r[7]]
+
+    now = datetime.now().isoformat(timespec="seconds")
+    moved = planned = failed = 0
+    skip_counter: dict[str, int] = {}
+    keep_count = 0
+    touched_orders: set[tuple[str, str]] = set()
+    moved_cids: set[int] = set()
+    # 现归属状态（apply 多轮迭代时 DB 行里的 order_id/filepath 会过期）
+    state = {row[0]: {"order": row[2], "date": row[3], "filepath": row[8],
+                      "filename": row[9]} for row in gate_rows}
+    for round_no in range(1, (max_rounds if apply_changes else 1) + 1):
+        plan = []
+        keep_count = 0
+        anchor_cache.clear()
+        for row in gate_rows:
+            if row[0] in moved_cids:
+                continue  # 单次运行每张照片至多移动一次：防止耦合交换的
+                # 照片因成员集变化在轮间反复横跳（不收敛）
+            winner_key, evidence, reason = evaluate(row, state[row[0]]["order"])
+            if winner_key is None:
+                keep_count += 1
+                if round_no == 1:
+                    skip_counter[reason] = skip_counter.get(reason, 0) + 1
+                continue
+            plan.append((row, winner_key, evidence))
+        if not plan:
+            break
+        if not apply_changes:
+            planned = len(plan)
+            for row, key, evidence in plan:
+                print(f"  试运行 #{row[0]} {state[row[0]]['date']} {row[4][11:19]} "
+                      f"-> 订单{key[1]}（{evidence['plate_note']}，"
+                      f"时间差{evidence['time_diff_seconds'] // 60}分钟，"
+                      f"现归属{state[row[0]]['order']}）")
+            break
+        # 应用本轮：移动文件 + 写库 + 日志；同步内存索引供下一轮评估
+        conn.isolation_level = None
+        for row, key, evidence in plan:
+            cid, park = row[0], row[1]
+            st = state[cid]
+            cur_order, date = st["order"], st["date"]
+            filepath, filename = st["filepath"], st["filename"]
+            order_ctx = {"dirs": dirs.get(key, {}),
+                         "nearest_anchor": nearest_anchor.get(key, {})}
+            loose_ctx = {"date": date, "dt": datetime.strptime(row[4], "%Y-%m-%d %H:%M:%S"),
+                         "filepath": filepath}
+            target_dir, target_date = _pick_order_dir(order_ctx, loose_ctx, key)
+            target_stored = f"{target_dir}/{filename}"
+            target_abs = project_file(target_stored)
+            final_name = filename
+            if target_abs.exists():
+                stem, suffix = target_abs.stem, target_abs.suffix
+                k = 1
+                while target_abs.with_name(f"{stem}_reid{k}{suffix}").exists():
+                    k += 1
+                final_name = f"{stem}_reid{k}{suffix}"
+                target_abs = target_abs.with_name(final_name)
+            minutes = evidence["time_diff_seconds"] // 60
+            reason_text = (f"大门照片重归类：{evidence['plate_note']}，"
+                           f"时间差{minutes}分钟（原归属{cur_order}）")
+            print(f"  归类 #{cid} {date} {row[4][11:19]} {cur_order} -> 订单{key[1]} "
+                  f"({evidence['plate_note']}，时间差{minutes}分钟)")
+            try:
+                target_abs.parent.mkdir(parents=True, exist_ok=True)
+                source_abs = project_file(filepath)
+                if not source_abs.is_file():
+                    source_abs = resolve_stored_path(filepath)
+                if source_abs.resolve() != target_abs.resolve():
+                    shutil.move(str(source_abs), str(target_abs))
+            except OSError as exc:
+                failed += 1
+                print(f"  移动失败 #{cid}: {exc}")
+                continue
+            vehicle_id = conn.execute(
+                """SELECT vehicle_id, COUNT(*) AS cnt FROM captures
+                   WHERE coalesce(park,'')=? AND order_id=? AND vehicle_id IS NOT NULL
+                   GROUP BY vehicle_id ORDER BY cnt DESC LIMIT 1""",
+                (key[0], key[1]),
+            ).fetchone()
+            conn.execute(
+                """UPDATE captures SET order_id=?, date=?, filepath=?, filename=?,
+                          plate_match_reason=?, vehicle_id=? WHERE id=?""",
+                (key[1], target_date, to_stored_path(target_abs), final_name,
+                 reason_text, vehicle_id[0] if vehicle_id else None, cid),
+            )
+            conn.execute(
+                """INSERT OR REPLACE INTO loose_assignments
+                     (capture_id, park, from_order, to_order, date_old, date_new,
+                      filepath_old, filepath_new, filename_old, filename_new,
+                      similarity, time_diff_seconds, plate_note, reason, moved_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (cid, key[0], cur_order, key[1], date, target_date,
+                 filepath, to_stored_path(target_abs), filename, final_name,
+                 evidence["similarity"], evidence["time_diff_seconds"],
+                 evidence["plate_note"], reason_text, now),
+            )
+            # 内存索引同步：照片从原订单挪到新订单（时间锚/文件夹参照随更新）
+            old_members = members.get((park, cur_order), [])
+            member = next((m for m in old_members if m["cid"] == cid), None)
+            if member:
+                old_members.remove(member)
+                members.setdefault(key, []).append(member)
+            old_parent = str(Path(filepath).parent)
+            # dirs 收日期即可；nearest_anchor 必须存完整时间戳
+            # （_pick_order_dir 会 strptime），target_date 可能只有日期
+            dirs.setdefault(key, {}).setdefault(str(target_abs.parent), target_date)
+            nearest_anchor.setdefault(key, {}).setdefault(str(target_abs.parent), row[4])
+            dirs.get((park, cur_order), {}).pop(old_parent, None)
+            nearest_anchor.get((park, cur_order), {}).pop(old_parent, None)
+            st.update(order=key[1], date=target_date,
+                      filepath=to_stored_path(target_abs), filename=final_name)
+            touched_orders.add(key)
+            touched_orders.add((park, cur_order))
+            moved_cids.add(cid)
+            moved += 1
+    if apply_changes:
+        if touched_orders:
+            # 来源/目标订单的颜色车型投票都随成员变化刷新
+            _refresh_order_attributes(conn, touched_orders)
+        conn.commit()
+
+    result = {
+        "gate_captures": len(gate_rows), "reassigned": moved, "planned": planned,
+        "failed": failed, "kept": keep_count, "skips": skip_counter,
+        "orders_touched": len(touched_orders),
+    }
+    mode = "已重归类" if apply_changes else "试运行（加 --apply 落盘）"
+    move_stat = f"移动{moved}张" if apply_changes else f"计划移动{planned}张"
+    print(f"大门照片重归属{mode}：入磅/出磅 {result['gate_captures']}张，"
+          f"{move_stat}，失败{failed}张，保留现归属{keep_count}张")
+    for reason_text, count in sorted(skip_counter.items(), key=lambda kv: -kv[1]):
+        print(f"  {count}张：{reason_text}")
+    return result
+
+
 def _pick_order_dir(order: dict, loose: dict, key: tuple[str, str]) -> tuple[str, str]:
     """选择归类目标文件夹：优先与抓拍同日期的订单文件夹，其次时间最近的
     订单抓拍所在文件夹；订单在该日期还没有文件夹时（跨天订单另一头）
@@ -1871,6 +2225,10 @@ def main() -> None:
     parser.add_argument("--associate-only", action="store_true", help="只重新聚合订单内车辆")
     parser.add_argument("--assign-loose", action="store_true",
                         help="未关联货车归类到订单（默认试运行，加 --apply 落盘）")
+    parser.add_argument("--assign-gate", action="store_true",
+                        help="入磅/出磅大门照片按时间重新归属订单（默认试运行，"
+                             "加 --apply 落盘；订单时间锚包含大门照片，夹在两个"
+                             "订单之间时归时间更近的一单）")
     parser.add_argument("--apply", action="store_true",
                         help="与 --assign-loose 联用：真正移动文件并写库")
     parser.add_argument("--undo-loose-assign", action="store_true",
@@ -1890,7 +2248,7 @@ def main() -> None:
 
     conn = sqlite3.connect(args.db)
     ensure_schema(conn)
-    standalone = args.assign_loose or args.undo_loose_assign
+    standalone = args.assign_loose or args.assign_gate or args.undo_loose_assign
     # 默认流程始终全盘同步：每日流水线靠它发现新园区/新照片（库非空也必须
     # 扫描，否则新数据永远进不了库——金冠库上线时踩过这个坑）。sync_files
     # 对已有文件只做路径刷新，不会重复入库。
@@ -1909,6 +2267,13 @@ def main() -> None:
         undo_loose_assign(conn, args.capture_id or None)
     elif args.assign_loose:
         assign_loose_orders(
+            conn, apply_changes=args.apply,
+            types=tuple(t.strip() for t in args.loose_types.split(",") if t.strip()),
+            window_seconds=args.loose_window_min * 60,
+            sim_threshold=args.loose_sim, sim_margin=args.loose_margin,
+            park_filter=args.park)
+    elif args.assign_gate:
+        assign_gate_orders(
             conn, apply_changes=args.apply,
             types=tuple(t.strip() for t in args.loose_types.split(",") if t.strip()),
             window_seconds=args.loose_window_min * 60,
