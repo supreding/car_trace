@@ -23,6 +23,7 @@ import os
 import re
 import sqlite3
 import sys
+from collections import Counter
 from contextlib import closing
 from datetime import datetime
 from functools import wraps
@@ -800,32 +801,62 @@ def vehicles():
     return jsonify(rows)
 
 
-def _plate_suspect(item: dict, main_plate: str) -> bool:
-    """可疑照片判定：照片车牌（plate_final 为空时退回 OSD 参考车牌）与
-    订单主车车牌去省份差 >=2（与 build_db 误读清洗同一判据）——多为排队
-    车辆或人工误放。主牌缺失时无从判定，一律不算可疑。"""
-    if not main_plate:
-        return False
-    if item.get("plate_final"):
-        return build_db._plate_edit_distance(item["plate_final"], main_plate) >= 2
-    osd = item.get("osd_plate") or ""
-    return bool(osd) and build_db._plate_edit_distance(osd, main_plate) >= 2
+def _order_identity(db: sqlite3.Connection, order_id: str, park: str) -> tuple[str, str, str]:
+    """订单主车三元组：主牌（多数票）、主车型/主颜色（order_attributes 优先，
+    缺失回退订单内抓拍多数票）。"""
+    plate = order_summary(db, order_id, park)["plate"]
+    attrs = db.execute(
+        """SELECT vehicle_type, vehicle_color FROM order_attributes
+           WHERE order_id=? AND coalesce(park,'')=?""", (order_id, park)).fetchone()
+    main_type = (attrs["vehicle_type"] or "") if attrs else ""
+    main_color = (attrs["vehicle_color"] or "") if attrs else ""
+    if not main_type or not main_color:
+        rows = db.execute(
+            """SELECT vehicle_type, vehicle_color FROM captures
+               WHERE order_id=? AND coalesce(park,'')=?
+                 AND coalesce(capture_status,'vehicle')!='no_vehicle'""",
+            (order_id, park)).fetchall()
+        if not main_type:
+            types = Counter(r[0] for r in rows if r[0])
+            main_type = types.most_common(1)[0][0] if types else ""
+        if not main_color:
+            colors = Counter(r[1] for r in rows if r[1])
+            main_color = colors.most_common(1)[0][0] if colors else ""
+    return plate, main_type, main_color
+
+
+def _photo_suspect(item: dict, main_plate: str, main_type: str, main_color: str) -> bool:
+    """可疑照片判定（2026-09 现场规则）：车型或颜色与订单主车不一致，
+    或系统识别车牌与主车车牌"完全不一样"——同长度去省份逐字符差 >=5
+    （差 1~4 位视为同牌 OCR 误差；按差 >=2 排除会误伤正确照片，现场反馈）。
+    OSD 参考车牌不参与判定：主车自己的大门照片 OSD 常读到后面排队的车。"""
+    vt, vc = item.get("vehicle_type") or "", item.get("vehicle_color") or ""
+    if main_type and vt and vt != main_type:
+        return True
+    if main_color and vc and vc != main_color:
+        return True
+    pf = item.get("plate_final") or ""
+    if main_plate and pf and len(pf) == len(main_plate):
+        return sum(1 for x, y in zip(pf[1:], main_plate[1:]) if x != y) >= 5
+    return False
 
 
 def annotate_order_plates(items: list[dict], db: sqlite3.Connection) -> list[dict]:
-    """给抓拍行补订单主车车牌（order_main_plate）与可疑标记（plate_mismatch）。"""
-    cache: dict[tuple[str, str], str] = {}
+    """给抓拍行补订单主车信息（order_main_plate/type/color）与可疑标记（suspect）。"""
+    cache: dict[tuple[str, str], tuple[str, str, str]] = {}
     for item in items:
         oid = item.get("order_id") or ""
         if not oid or oid == "未关联图片":
-            item["plate_mismatch"] = False
+            item["suspect"] = False
             continue
         key = (item.get("park") or "", oid)
         if key not in cache:
-            cache[key] = order_summary(db, oid, key[0])["plate"]
-        main_plate = cache[key]
+            cache[key] = _order_identity(db, oid, key[0])
+        main_plate, main_type, main_color = cache[key]
         item["order_main_plate"] = main_plate
-        item["plate_mismatch"] = _plate_suspect(item, main_plate)
+        item["order_main_type"] = main_type
+        item["order_main_color"] = main_color
+        item["suspect"] = _photo_suspect(item, main_plate, main_type, main_color)
     return items
 
 

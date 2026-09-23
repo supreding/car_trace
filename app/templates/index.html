@@ -793,12 +793,12 @@
        同一订单的抓拍折叠为一组；"未关联图片"（库内未归单占位 order_id）和
        空 order_id 的抓拍视为未归单，各自单独成组，用警示色置顶提醒补录；
        订单组保持轨迹时间顺序。 */
-    /* 可疑照片折叠组：车牌与订单主车不符（排队车辆/人工误放），红色警示 */
+    /* 可疑照片折叠组：车型/颜色与主车不符或车牌完全不同（排队车辆/人工误放），红色警示 */
     function suspectGroupHTML(rows, mainPlate, domId) {
       return `<div class="ord-group suspect" id="${domId}">
       <div class="ord-head" onclick="toggleGroup('${domId}')">
         <span class="arrow">▶</span><span class="t">⚠ 可疑照片 ${rows.length} 张</span>
-        <span class="s">车牌与订单主车（${esc(mainPlate || "?")}）不符，可能是排队车辆或人工误放</span>
+        <span class="s">车型/颜色与订单主车不符，或车牌与主车完全不同（排队车辆/人工误放）</span>
         <span style="flex:1"></span>
       </div>
       <div class="ord-body">${rows.map(tlRow).join("")}</div>
@@ -821,8 +821,8 @@
         const span = times.length ? `${times[0].slice(5, 16)} ~ ${times[times.length - 1].slice(11, 19)}` : "";
         const dates = new Set(g.items.map(x => x.date)).size;
         // 订单组内把车牌与主车不符的可疑照片折叠成红色子组（未关联组无主牌，不判）
-        const susItems = g.order_id ? g.items.filter(x => x.plate_mismatch) : [];
-        const mainItems = g.order_id ? g.items.filter(x => !x.plate_mismatch) : g.items;
+        const susItems = g.order_id ? g.items.filter(x => x.suspect) : [];
+        const mainItems = g.order_id ? g.items.filter(x => !x.suspect) : g.items;
         const mainPlate = g.order_id ? (g.items[0]?.order_main_plate || "") : "";
         const meta = [`${g.items.length} 张`, dates > 1 ? `跨${dates}个日期` : "", span,
         susItems.length ? `可疑${susItems.length}` : ""].filter(Boolean).join(" · ");
@@ -871,8 +871,8 @@
       try {
         const data = await api(`/api/order/${encodeURIComponent(oid)}${parkQ2()}`);
         const items = data.items || [];
-        const suspect = items.filter(x => x.plate_mismatch);
-        const normal = items.filter(x => !x.plate_mismatch);
+        const suspect = items.filter(x => x.suspect);
+        const normal = items.filter(x => !x.suspect);
         const parkLabel = data.park || items[0]?.park || "";
         mainHead(`订单 ${esc(oid)}`,
           `${items.length} 张 · 车牌 ${esc(data.plate || "—")} · 发生时间 ${esc(data.order_time || "—")} · 跨 ${new Set(items.map(i => i.date)).size} 个日期文件夹${multiPark ? ` · ${esc(parkLabel || "未标注园区")}` : ""}${suspect.length ? ` · 可疑 ${suspect.length}` : ""}`, data.attributes);
