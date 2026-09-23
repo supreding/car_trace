@@ -239,7 +239,9 @@
 
     .main-head .sub {
       color: var(--muted);
-      font-size: 13px
+      font-size: 13px;
+      min-width: 0;
+      word-break: break-all
     }
 
     .main-head .actions {
@@ -409,6 +411,58 @@
       color: var(--muted);
       padding: 60px 20px;
       text-align: center
+    }
+
+    /* 订单分组（车辆轨迹页）：同订单抓拍折叠为一组，未关联订单的抓拍单独成组 */
+    .ord-group {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      margin: 10px 0;
+      overflow: hidden
+    }
+
+    .ord-head {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 14px;
+      background: var(--panel);
+      cursor: pointer;
+      user-select: none
+    }
+
+    .ord-head:hover {
+      background: var(--blue-soft)
+    }
+
+    .ord-head .arrow {
+      color: var(--muted);
+      font-size: 11px;
+      flex: none;
+      transition: transform .15s
+    }
+
+    .ord-group.open .ord-head .arrow {
+      transform: rotate(90deg)
+    }
+
+    .ord-head .t {
+      font-weight: 600;
+      font-size: 14px
+    }
+
+    .ord-head .s {
+      color: var(--muted);
+      font-size: 12px
+    }
+
+    .ord-body {
+      display: none;
+      padding: 0 14px
+    }
+
+    .ord-group.open .ord-body {
+      display: block
     }
 
     #modal {
@@ -692,7 +746,39 @@
       panel.style.display = "block";
     }
 
-    function mainHead(title, sub, attrs) {
+    /* ---------------- 按订单分组（车辆轨迹页） ----------------
+       同一订单的抓拍折叠为一组，未关联订单的抓拍各自单独成组；
+       分组保持轨迹时间顺序（先出现的组在前），组内顺序不变。 */
+    function groupedTimelineHTML(rows) {
+      const groups = [];
+      const indexOf = new Map();
+      for (const x of rows) {
+        const key = x.order_id ? "o:" + x.order_id : "c:" + x.id;
+        if (!indexOf.has(key)) {indexOf.set(key, groups.length); groups.push({order_id: x.order_id || "", items: []})}
+        groups[indexOf.get(key)].items.push(x);
+      }
+      return groups.map((g, i) => {
+        const times = g.items.map(x => x.capture_time || "").filter(Boolean).sort();
+        const span = times.length ? `${times[0].slice(5, 16)} ~ ${times[times.length - 1].slice(11, 19)}` : "";
+        const dates = new Set(g.items.map(x => x.date)).size;
+        const meta = [`${g.items.length} 张`, dates > 1 ? `跨${dates}个日期` : "", span].filter(Boolean).join(" · ");
+        const label = g.order_id ? `订单 ${esc(g.order_id)}` : `未关联订单 · 抓拍 #${g.items[0].id}`;
+        const gotoBtn = g.order_id
+          ? `<button class="rowbtn" onclick="event.stopPropagation(); gotoOrder('${esc(g.order_id)}')">查看订单完整轨迹</button>` : "";
+        return `<div class="ord-group" id="og-${i}">
+      <div class="ord-head" onclick="toggleGroup('og-${i}')">
+        <span class="arrow">▶</span><span class="t">${label}</span><span class="s">${meta}</span>
+        <span style="flex:1"></span>${gotoBtn}
+      </div>
+      <div class="ord-body">${g.items.map(tlRow).join("")}</div>
+    </div>`;
+      }).join("");
+    }
+
+    function toggleGroup(id) {document.getElementById(id).classList.toggle("open")}
+    function setAllGroups(open) {document.querySelectorAll("#tl .ord-group").forEach(el => el.classList.toggle("open", open))}
+
+    function mainHead(title, sub, attrs, extraActions) {
       const attrTags = attrs ? (attrs.vehicle_color || attrs.vehicle_type ? `
     <div class="attr-tags">
       ${attrs.vehicle_color ? `<span class="badge blue">订单颜色 ${esc(COLOR_CN[attrs.vehicle_color] || attrs.vehicle_color)} ${Math.round((attrs.vehicle_color_conf || 0) * 100)}%</span>` : ""}
@@ -700,7 +786,7 @@
       <span class="badge">${attrs.sample_count || 0} 张投票</span>
     </div>`: "") : "";
       $("main").innerHTML = `<div class="main-head"><h2>${title}</h2><span class="sub">${sub || ""}</span>
-      <div class="actions"><button onclick="switchTab(state.tab,true)">刷新列表</button></div></div>${attrTags}<div class="tl" id="tl"></div>`;
+      <div class="actions">${extraActions || ""}<button onclick="switchTab(state.tab,true)">刷新列表</button></div></div>${attrTags}<div class="tl" id="tl"></div>`;
     }
 
     async function showVehicle(vid) {
@@ -709,8 +795,9 @@
         const rows = await api(`/api/track?vid=${vid}`);
         const it = state.active || {};
         mainHead(`车辆 #${vid}`,
-          `${rows.length} 张 · ${esc(it.plate || "无车牌")} · 订单 ${esc(it.order_ids || it.order_id || "—")}${multiPark ? ` · ${esc(rows[0]?.park || it.park || "未标注园区")}` : ""}`);
-        $("tl").innerHTML = rows.length ? rows.map(tlRow).join("") : '<div class="empty">没有抓拍</div>';
+          `${rows.length} 张 · ${esc(it.plate || "无车牌")} · 订单 ${esc(it.order_ids || it.order_id || "—")}${multiPark ? ` · ${esc(rows[0]?.park || it.park || "未标注园区")}` : ""}`,
+          null, `<button onclick="setAllGroups(true)">展开全部</button><button onclick="setAllGroups(false)">收起全部</button>`);
+        $("tl").innerHTML = rows.length ? groupedTimelineHTML(rows) : '<div class="empty">没有抓拍</div>';
       } catch (e) {toast(e.message)}
     }
 
