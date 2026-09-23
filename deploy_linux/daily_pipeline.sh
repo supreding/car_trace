@@ -81,11 +81,15 @@ fi
 # 特征入库之后执行。归类默认试运行阈值已在 build_db 内置（0.55/0.03），
 # 全部移动写 loose_assignments 日志，可 --undo-loose-assign 撤销。
 log "== 2.5/2 车辆重聚 + 未关联货车归类 =="
-if ! $PY app/build_db.py --db app/granary.db --associate-only; then
-    log "警告：车辆重聚失败（不阻断状态记录）"
-fi
 if ! $PY app/build_db.py --db app/granary.db --assign-loose --apply; then
     log "警告：未关联货车归类失败（不阻断状态记录）"
+fi
+if ! $PY app/build_db.py --db app/granary.db --assign-gate --apply; then
+    log "警告：大门照片重归类失败（不阻断状态记录）"
+fi
+# 车辆重聚放最后：让重聚类看到归类后的最新订单归属
+if ! $PY app/build_db.py --db app/granary.db --associate-only; then
+    log "警告：车辆重聚失败（不阻断状态记录）"
 fi
 
 echo "OK $(date '+%F %H:%M:%S')" > /data/pipeline_status.txt
