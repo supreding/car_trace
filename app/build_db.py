@@ -1966,6 +1966,12 @@ def assign_gate_orders(conn: sqlite3.Connection, apply_changes: bool = False,
         gate_rows = [r for r in gate_rows if r[1] == park_filter]
     if types:
         gate_rows = [r for r in gate_rows if r[7] in types or not r[7]]
+    # 原始照片已从盘上清理的园区（服务器只留库记录与裁剪图）：物理移动无从
+    # 做起，跳过而不是反复移动失败刷屏（与 assign_loose_orders 同一处理）。
+    on_disk = [r for r in gate_rows
+               if resolve_stored_path(r[8]).is_file() or project_file(r[8]).is_file()]
+    no_disk = len(gate_rows) - len(on_disk)
+    gate_rows = on_disk
 
     now = datetime.now().isoformat(timespec="seconds")
     moved = planned = failed = 0
@@ -2088,9 +2094,9 @@ def assign_gate_orders(conn: sqlite3.Connection, apply_changes: bool = False,
         conn.commit()
 
     result = {
-        "gate_captures": len(gate_rows), "reassigned": moved, "planned": planned,
+        "gate_captures": len(gate_rows) + no_disk, "reassigned": moved, "planned": planned,
         "failed": failed, "kept": keep_count, "skips": skip_counter,
-        "orders_touched": len(touched_orders),
+        "orders_touched": len(touched_orders), "no_disk_skipped": no_disk,
     }
     mode = "已重归类" if apply_changes else "试运行（加 --apply 落盘）"
     move_stat = f"移动{moved}张" if apply_changes else f"计划移动{planned}张"
