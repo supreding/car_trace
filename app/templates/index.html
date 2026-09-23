@@ -465,6 +465,27 @@
       display: block
     }
 
+    /* 未关联订单组：琥珀色警示并置顶显示 */
+    .ord-group.no-order {
+      border-color: #fde68a
+    }
+
+    .ord-group.no-order .ord-head {
+      background: #fffbeb
+    }
+
+    .ord-group.no-order .ord-head:hover {
+      background: #fef3c7
+    }
+
+    .ord-group.no-order .ord-head .t {
+      color: var(--amber)
+    }
+
+    .ord-group.no-order .ord-head .s {
+      color: #b45309
+    }
+
     #modal {
       position: fixed;
       inset: 0;
@@ -747,25 +768,30 @@
     }
 
     /* ---------------- 按订单分组（车辆轨迹页） ----------------
-       同一订单的抓拍折叠为一组，未关联订单的抓拍各自单独成组；
-       分组保持轨迹时间顺序（先出现的组在前），组内顺序不变。 */
+       同一订单的抓拍折叠为一组；"未关联图片"（库内未归单占位 order_id）和
+       空 order_id 的抓拍视为未归单，各自单独成组，用警示色置顶提醒补录；
+       订单组保持轨迹时间顺序。 */
     function groupedTimelineHTML(rows) {
+      const LOOSE = "未关联图片";
       const groups = [];
       const indexOf = new Map();
       for (const x of rows) {
-        const key = x.order_id ? "o:" + x.order_id : "c:" + x.id;
-        if (!indexOf.has(key)) {indexOf.set(key, groups.length); groups.push({order_id: x.order_id || "", items: []})}
+        const loose = !x.order_id || x.order_id === LOOSE;
+        const key = loose ? "c:" + x.id : "o:" + x.order_id;
+        if (!indexOf.has(key)) {indexOf.set(key, groups.length); groups.push({order_id: loose ? "" : x.order_id, items: []})}
         groups[indexOf.get(key)].items.push(x);
       }
-      return groups.map((g, i) => {
+      const ordered = [...groups.filter(g => !g.order_id), ...groups.filter(g => g.order_id)];
+      return ordered.map((g, i) => {
         const times = g.items.map(x => x.capture_time || "").filter(Boolean).sort();
         const span = times.length ? `${times[0].slice(5, 16)} ~ ${times[times.length - 1].slice(11, 19)}` : "";
         const dates = new Set(g.items.map(x => x.date)).size;
         const meta = [`${g.items.length} 张`, dates > 1 ? `跨${dates}个日期` : "", span].filter(Boolean).join(" · ");
-        const label = g.order_id ? `订单 ${esc(g.order_id)}` : `未关联订单 · 抓拍 #${g.items[0].id}`;
+        const label = g.order_id ? `订单 ${esc(g.order_id)}` : `⚠ 未关联图片 · 抓拍 #${g.items[0].id}`;
+        const groupClass = g.order_id ? "ord-group" : "ord-group no-order";
         const gotoBtn = g.order_id
           ? `<button class="rowbtn" onclick="event.stopPropagation(); gotoOrder('${esc(g.order_id)}')">查看订单完整轨迹</button>` : "";
-        return `<div class="ord-group" id="og-${i}">
+        return `<div class="${groupClass}" id="og-${i}">
       <div class="ord-head" onclick="toggleGroup('og-${i}')">
         <span class="arrow">▶</span><span class="t">${label}</span><span class="s">${meta}</span>
         <span style="flex:1"></span>${gotoBtn}
