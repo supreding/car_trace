@@ -348,10 +348,12 @@ def detect_pass(
     if force:
         db.execute("DELETE FROM vehicle_instances")
     # 断点续跑：有 instance 记录的图片视为已处理（每车一条记录）；
-    # 已被属性复核拆出/标记的帧也不再被检测重跑覆盖（复核结论优先）。
+    # 已被属性复核拆出/标记的帧也不再被检测重跑覆盖（复核结论优先）；
+    # 人工框选修正过的帧永不重检（manual_box_edits，force 重跑也不覆盖）。
     where = ("coalesce(capture_status,'vehicle')!='no_vehicle' "
              "AND (status_reason IS NULL OR status_reason NOT LIKE '%与订单主车不符%') "
-             "AND id NOT IN (SELECT DISTINCT capture_id FROM vehicle_instances)")
+             "AND id NOT IN (SELECT DISTINCT capture_id FROM vehicle_instances) "
+             "AND id NOT IN (SELECT capture_id FROM manual_box_edits)")
     if not force:
         # 已有裁剪图的帧是早期版本的检测产物，不可能再产生实例记录；
         # 不排除会永久挂起在待处理队列里（每轮 GPU 都被重选又跳过）。
@@ -785,6 +787,7 @@ def correct_pass(
            WHERE vehicle_crop_path IS NOT NULL
              AND coalesce(capture_status,'vehicle')!='no_vehicle'
              AND coalesce(order_id,'')!='' AND order_id!='未关联图片'
+             AND id NOT IN (SELECT capture_id FROM manual_box_edits)
            ORDER BY id"""
     ).fetchall():
         vid = order_group.get((row["park"], row["order_id"]))
@@ -862,6 +865,7 @@ def correct_pass(
                               vehicle_type=?, vehicle_type_conf=?,
                               lpr_plate=NULL, lpr_conf=NULL, plate_final=NULL,
                               plate_confidence=NULL, recognition_source='',
+                              lpr_attempted_at=NULL,
                               reid_embedding=NULL, reid_source=NULL,
                               vehicle_id=?,
                           status_reason=CASE WHEN status_reason LIKE '%订单主车%'

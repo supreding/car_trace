@@ -542,6 +542,141 @@
       z-index: 60;
       font-size: 13px
     }
+
+    /* 修正框选编辑器：原图叠加框层（百分比定位，随图缩放） */
+    .bx-wrap {
+      position: relative;
+      display: block;
+      user-select: none;
+      -webkit-user-select: none;
+      background: #f1f3f7;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden
+    }
+
+    .bx-wrap img {
+      width: 100%;
+      display: block
+    }
+
+    .bx-layer {
+      position: absolute;
+      inset: 0;
+      cursor: crosshair
+    }
+
+    .bx-box {
+      position: absolute;
+      box-sizing: border-box
+    }
+
+    .bx-box.cur {
+      border: 2px solid rgba(37, 99, 235, .85)
+    }
+
+    .bx-box.inst {
+      border: 2px dashed rgba(124, 58, 237, .9);
+      cursor: pointer
+    }
+
+    .bx-box.inst span {
+      position: absolute;
+      top: 0;
+      left: 0;
+      background: var(--purple);
+      color: #fff;
+      font-size: 11px;
+      line-height: 16px;
+      padding: 0 6px;
+      border-radius: 0 0 4px 0
+    }
+
+    .bx-box.inst.sel {
+      border-color: var(--green);
+      border-style: solid
+    }
+
+    .bx-box.inst.sel span {
+      background: var(--green)
+    }
+
+    .bx-box.draft {
+      border: 2px solid var(--green);
+      background: rgba(22, 163, 74, .12);
+      cursor: move
+    }
+
+    .bx-h {
+      position: absolute;
+      width: 12px;
+      height: 12px;
+      background: #fff;
+      border: 2px solid var(--green);
+      border-radius: 2px
+    }
+
+    .bx-h.nw {
+      left: -7px;
+      top: -7px;
+      cursor: nwse-resize
+    }
+
+    .bx-h.ne {
+      right: -7px;
+      top: -7px;
+      cursor: nesw-resize
+    }
+
+    .bx-h.sw {
+      left: -7px;
+      bottom: -7px;
+      cursor: nesw-resize
+    }
+
+    .bx-h.se {
+      right: -7px;
+      bottom: -7px;
+      cursor: nwse-resize
+    }
+
+    .bx-card {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 6px;
+      cursor: pointer
+    }
+
+    .bx-card img {
+      width: 86px;
+      height: 60px;
+      object-fit: cover;
+      border-radius: 6px;
+      flex: none;
+      background: #f1f3f7
+    }
+
+    .bx-card.cur {
+      border-color: var(--blue);
+      background: var(--blue-soft)
+    }
+
+    .bx-card.sel {
+      border-color: var(--green)
+    }
+
+    .bx-card .info {
+      flex: 1;
+      min-width: 0;
+      font-size: 12px
+    }
+
+    .bx-card .info .t {
+      font-weight: 600
+    }
   </style>
 </head>
 
@@ -674,6 +809,7 @@
       <button class="rowbtn accent" style="margin-top:6px" onclick="trackByImg(${x.id})">查询该车其他出现地点</button>
       <button class="rowbtn" style="margin-top:6px" onclick="toggleReview(${x.id})">人工复核</button>
       <button class="rowbtn" style="margin-top:6px" onclick="toggleMove(${x.id})">移动/拆出</button>
+      <button class="rowbtn" style="margin-top:6px" onclick="toggleBoxEdit(${x.id})">修正框选</button>
       ${x.extra_vehicles > 0 ? `<button class="rowbtn" style="margin-top:6px" onclick="toggleInstances(${x.id}, this)">同帧车辆 ${x.extra_vehicles}</button>` : ""}</div>
     <div class="tl-img">${imgTag(x)}</div>
     <div class="tl-body"><div class="row1">${badges}</div>
@@ -685,7 +821,7 @@
         <span>抓拍编号</span><b>#${x.id} · 画质 ${x.quality_score ?? "—"}</b>
         <span>状态</span><b>${esc(x.capture_status === "no_vehicle" ? "未检测到车辆" : (x.status_reason || "正常"))}</b>
       </div></div>
-  </div><div class="inst-panel" id="inst-${x.id}" style="display:none"></div><div id="rev-${x.id}" style="display:none"></div><div id="mv-${x.id}" style="display:none"></div></div>`;
+  </div><div class="inst-panel" id="inst-${x.id}" style="display:none"></div><div id="rev-${x.id}" style="display:none"></div><div id="mv-${x.id}" style="display:none"></div><div id="bx-${x.id}" style="display:none"></div></div>`;
     }
 
     /* 移动/拆出：把本帧车辆从当前聚合中分出去（新开或并入其他车辆） */
@@ -787,6 +923,218 @@
               ${v.lpr_plate ? "车牌 " + esc(v.lpr_plate) + "<br>" : ""}${esc(v.vehicle_color || "")} ${esc(v.vehicle_type || "")} · 置信度 ${Math.round((v.vehicle_det_score || 0) * 100)}%</div>
           </div></div>`).join("")}</div>` : '<div class="s" style="padding:6px 0">同帧车辆暂无更多数据</div>';
       panel.style.display = "block";
+    }
+
+    /* ---------------- 修正框选（手动改缩略图框 / 同帧多车切换主车） ----------------
+       原图上叠加框层：蓝实线=当前主车框，紫虚线=同帧检测实例（可点选切换），
+       绿实线=手绘草稿框（拖拽画框、拖动框体平移、四角手柄缩放）。
+       框坐标均为原图像素，渲染用百分比定位，图片缩放不需要换算。 */
+    const bxState = {}; // capture_id -> {W,H,cur,draft,active,data,drag,handlers}
+
+    function bxStyle(id, box) {
+      const s = bxState[id];
+      return `left:${box[0] / s.W * 100}%;top:${box[1] / s.H * 100}%;` +
+        `width:${(box[2] - box[0]) / s.W * 100}%;height:${(box[3] - box[1]) / s.H * 100}%`;
+    }
+
+    function bxRender(id) {
+      const s = bxState[id];
+      if (!s) return;
+      const layer = $("bxlayer-" + id);
+      let html = "";
+      if (s.cur && !s.draft) {
+        html += `<div class="bx-box cur" style="${bxStyle(id, s.cur)}" title="当前主车框"></div>`;
+      }
+      for (const v of s.data.instances) {
+        if (!v.box) continue;
+        html += `<div class="bx-box inst${s.active === v.id ? " sel" : ""}" data-inst="${v.id}" style="${bxStyle(id, v.box)}"><span>${v.instance_index === 0 ? "主车" : "车" + v.instance_index}</span></div>`;
+      }
+      if (s.draft) {
+        html += `<div class="bx-box draft" style="${bxStyle(id, s.draft)}">` +
+          ["nw", "ne", "sw", "se"].map(h => `<i class="bx-h ${h}" data-h="${h}"></i>`).join("") + `</div>`;
+      }
+      layer.innerHTML = html;
+      const saveBtn = $("bxsave-" + id);
+      if (saveBtn) saveBtn.disabled = !s.draft;
+    }
+
+    function bxSelect(id, instId) {
+      const s = bxState[id];
+      if (!s) return;
+      s.active = s.active === instId ? 0 : instId;
+      s.data.instances.forEach(v => {
+        const card = $("bxcard-" + id + "-" + v.id);
+        if (card) card.classList.toggle("sel", s.active === v.id);
+      });
+      bxRender(id);
+    }
+
+    async function toggleBoxEdit(id) {
+      const panel = $("bx-" + id);
+      if (panel.style.display === "block") {bxClose(id); return}
+      let data;
+      try {data = await api(`/api/boxedit/${id}`)} catch (e) {toast(e.message); return}
+      const x = data.capture;
+      bxState[id] = {W: data.image_size[0], H: data.image_size[1],
+                     cur: x.box, draft: null, active: 0, data, drag: null};
+      const cards = data.instances.map(v => {
+        const main = v.instance_index === 0;
+        return `<div class="bx-card${main ? " cur" : ""}" id="bxcard-${id}-${v.id}" onclick="bxSelect(${id},${v.id})">
+          <img src="${v.crop_url}" loading="lazy" onerror="this.style.visibility='hidden'" alt="">
+          <div class="info"><div class="t">${main ? "当前主车" : "同帧车辆"} · 置信度 ${Math.round((v.vehicle_det_score || 0) * 100)}%</div>
+          <div class="s">${v.lpr_plate ? "车牌 " + esc(v.lpr_plate) + "<br>" : ""}${esc(COLOR_CN[v.vehicle_color] || v.vehicle_color || "色未知")} ${esc(TYPE_CN[v.vehicle_type] || v.vehicle_type || "")}</div></div>
+          ${main ? "" : `<button class="rowbtn accent" onclick="event.stopPropagation();bxPromote(${id},${v.id})">设为主车</button>`}
+        </div>`;
+      }).join("");
+      panel.innerHTML = `<div class="tl-row" style="display:block">
+        <div style="font-size:12px;color:var(--muted);padding:4px 0">修正框选 · 抓拍 #${id}：
+          在原图上<b>拖拽画出车辆框</b>（拖动框体平移、四角手柄微调）；一图多车时可点选图中或右侧的车，再「设为主车」。
+          保存后车牌/外观特征等下轮流水线按新裁剪补算。</div>
+        <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-start">
+          <div style="flex:0 1 560px;min-width:300px">
+            <div class="bx-wrap"><img id="bximg-${id}" src="${data.image_url}" draggable="false" alt="">
+              <div class="bx-layer" id="bxlayer-${id}"></div></div>
+            <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
+              <button class="go" id="bxsave-${id}" onclick="bxSave(${id})" disabled>保存此框为车辆裁剪</button>
+              <button class="rowbtn" onclick="bxClear(${id})">清除重画</button>
+              ${data.manual_edit ? `<button class="rowbtn" onclick="bxReset(${id})">撤销人工修正标记</button>` : ""}
+              <button class="rowbtn" onclick="bxClose(${id})">收起</button>
+            </div>
+            <div id="bxmsg-${id}" style="font-size:12px;color:var(--muted);margin-top:4px">当前框：${x.box ? x.box.join(", ") : "无"}（来源：${esc(x.crop_source || "无")}）</div>
+          </div>
+          <div style="flex:1 1 240px;min-width:220px">
+            <div style="font-size:12px;color:var(--muted);padding-bottom:4px">同帧检测到的车（点选对照，切换主车）：</div>
+            <div style="display:flex;flex-direction:column;gap:6px">${cards || '<div style="font-size:12px;color:var(--muted)">无实例记录，请直接手动画框修正</div>'}</div>
+          </div>
+        </div></div>`;
+      panel.style.display = "block";
+      bxRender(id);
+      bxBind(id);
+    }
+
+    function bxClose(id) {
+      const s = bxState[id];
+      if (s && s.handlers) {
+        document.removeEventListener("mousemove", s.handlers.move);
+        document.removeEventListener("mouseup", s.handlers.up);
+      }
+      const panel = $("bx-" + id);
+      if (panel) panel.style.display = "none";
+      delete bxState[id];
+    }
+
+    function bxClear(id) {const s = bxState[id]; if (s) {s.draft = null; bxRender(id)}}
+
+    function bxBind(id) {
+      const s = bxState[id];
+      const layer = $("bxlayer-" + id);
+      const img = $("bximg-" + id);
+      const toImg = e => {
+        const rect = img.getBoundingClientRect();
+        if (!rect.width || !rect.height) return {x: 0, y: 0};
+        return {x: Math.max(0, Math.min(s.W, Math.round((e.clientX - rect.left) / rect.width * s.W))),
+                y: Math.max(0, Math.min(s.H, Math.round((e.clientY - rect.top) / rect.height * s.H)))};
+      };
+      const clamp = (box) => [Math.max(0, box[0]), Math.max(0, box[1]),
+                              Math.min(s.W, box[2]), Math.min(s.H, box[3])];
+      const apply = () => {
+        const el = layer.querySelector(".bx-box.draft");
+        if (el && s.draft) el.style.cssText = bxStyle(id, s.draft);
+      };
+      layer.onmousedown = e => {
+        if (e.button !== 0 || !bxState[id]) return;
+        e.preventDefault();
+        const p = toImg(e);
+        const t = e.target;
+        if (t.classList.contains("bx-h")) {
+          s.drag = {kind: "resize", handle: t.dataset.h, start: p, orig: s.draft.slice()};
+        } else if (t.closest(".bx-box.draft")) {
+          s.drag = {kind: "move", start: p, orig: s.draft.slice()};
+        } else {
+          const instEl = t.closest(".bx-box.inst");
+          s.drag = {kind: "click-or-draw", start: p, instId: instEl ? +instEl.dataset.inst : 0};
+        }
+      };
+      const onMove = e => {
+        if (!bxState[id] || !s.drag) return;
+        const p = toImg(e);
+        const d = s.drag;
+        if (d.kind === "click-or-draw") {
+          if (Math.abs(p.x - d.start.x) + Math.abs(p.y - d.start.y) < 4) return;
+          d.kind = "draw";
+          s.draft = [d.start.x, d.start.y, d.start.x, d.start.y];
+          bxRender(id);
+        }
+        if (d.kind === "draw") {
+          s.draft = [Math.min(d.start.x, p.x), Math.min(d.start.y, p.y),
+                     Math.max(d.start.x, p.x), Math.max(d.start.y, p.y)];
+        } else if (d.kind === "move") {
+          const dx = p.x - d.start.x, dy = p.y - d.start.y;
+          s.draft = clamp([d.orig[0] + dx, d.orig[1] + dy, d.orig[2] + dx, d.orig[3] + dy]);
+        } else if (d.kind === "resize") {
+          let [l, t2, r, b] = d.orig;
+          if (d.handle.includes("w")) l = p.x;
+          if (d.handle.includes("e")) r = p.x;
+          if (d.handle.includes("n")) t2 = p.y;
+          if (d.handle.includes("s")) b = p.y;
+          s.draft = clamp([Math.min(l, r), Math.min(t2, b), Math.max(l, r), Math.max(t2, b)]);
+        }
+        apply();
+      };
+      const onUp = () => {
+        if (!bxState[id] || !s.drag) return;
+        const d = s.drag;
+        s.drag = null;
+        if (d.kind === "click-or-draw") {
+          if (d.instId) bxSelect(id, d.instId);
+          return;
+        }
+        if (s.draft && (s.draft[2] - s.draft[0] < 6 || s.draft[3] - s.draft[1] < 6)) s.draft = null;
+        bxRender(id);
+      };
+      s.handlers = {move: onMove, up: onUp};
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+    }
+
+    async function bxSave(id) {
+      const s = bxState[id];
+      if (!s || !s.draft) return;
+      try {
+        const res = await api("/api/boxedit/save", {
+          method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({capture_id: id, box: s.draft})});
+        toast(res.message);
+        bxClose(id);
+        if (state.reload) await state.reload();
+      } catch (e) {toast(e.message)}
+    }
+
+    async function bxPromote(id, instId) {
+      if (!confirm("确认把选中的同帧车辆设为主车？该帧的车辆归属会立即重新聚类。")) return;
+      try {
+        const res = await api("/api/boxedit/promote", {
+          method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({capture_id: id, instance_id: instId})});
+        toast(res.message);
+        bxClose(id);
+        if (state.tab === "vehicle" && res.vehicle_id) {
+          await Promise.all([showVehicle(res.vehicle_id), loadSidebar()]);
+        }
+        else if (state.reload) await state.reload();
+      } catch (e) {toast(e.message)}
+    }
+
+    async function bxReset(id) {
+      if (!confirm("撤销人工框选标记？下次 force 重跑检测时该帧恢复自动选框（当前裁剪图不会被改动）。")) return;
+      try {
+        await api("/api/boxedit/reset", {
+          method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({capture_id: id})});
+        toast("已撤销人工框选标记");
+        bxClose(id);
+        if (state.reload) await state.reload();
+      } catch (e) {toast(e.message)}
     }
 
     /* ---------------- 按订单分组（车辆轨迹页） ----------------

@@ -196,6 +196,15 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
           target_vehicle_id INTEGER NOT NULL,
           created_at TEXT NOT NULL
         );
+        -- 人工框选修正：本表中的抓拍不再被检测/复核阶段自动改框（人工意志
+        -- 优先）。box 是人工确认的裁剪矩形 [l,t,r,b]（原图像素坐标）；
+        -- source 区分手动画框（manual_box）与同帧实例切换（manual_promote）。
+        CREATE TABLE IF NOT EXISTS manual_box_edits (
+          capture_id INTEGER PRIMARY KEY,
+          box TEXT NOT NULL,
+          source TEXT NOT NULL DEFAULT 'manual_box',
+          edited_at TEXT NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS idx_order ON captures(order_id);
         CREATE INDEX IF NOT EXISTS idx_date ON captures(date);
         CREATE INDEX IF NOT EXISTS idx_stage ON captures(stage);

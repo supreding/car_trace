@@ -19,8 +19,10 @@ from __future__ import annotations
 import io
 import csv
 import hmac
+import json
 import os
 import re
+import shutil
 import sqlite3
 import sys
 from collections import Counter
@@ -1003,6 +1005,284 @@ def vehicle_crop(capture_id: int):
     if not path.is_file():
         return jsonify({"error": "车辆裁剪文件不存在，请重新运行裁剪流水线"}), 404
     return send_file(path, conditional=True, max_age=3600)
+
+
+# ---------------------------------------------------------------------------
+# 人工框选修正（缩略图手动改框 / 同帧多车切换主车）
+#
+# 与流水线的约定：
+#   - 决定记入 manual_box_edits（build_db.ensure_schema 建表），
+#     detect_pass / correct_pass 跳过这些抓拍，重跑不再覆盖人工修正；
+#   - 裁剪矩形 [l,t,r,b] 与 detect_pass 同一坐标系（原图 EXIF 转正后像素）；
+#   - 框变更后车牌/特征按断点续跑规则清空（lpr_attempted_at、reid_embedding），
+#     下轮 plate/embed 阶段增量补算；本服务进程不加载 paddle/torch 模型，
+#     属性(颜色/车型)由 attr_pass/correct 阶段在流水线里刷新。
+# ---------------------------------------------------------------------------
+
+def _default_crop_relpath(capture_id: int) -> str:
+    """主车裁剪的规范相对路径（与 detect_pass 命名一致，相对库文件目录）。"""
+    return f"reid_crops/{capture_id:08d}.jpg"
+
+
+def _clamp_box(box, width: int, height: int) -> list[int]:
+    """把 [l,t,r,b] 收拢到图幅内并保证 l<r、t<b；非法数值抛 ValueError。"""
+    l, t, r, b = (int(round(float(v))) for v in box)
+    l, t = max(0, min(l, width - 1)), max(0, min(t, height - 1))
+    r, b = max(l + 1, min(r, width)), max(t + 1, min(b, height))
+    return [l, t, r, b]
+
+
+@app.route("/api/boxedit/<int:capture_id>")
+def boxedit_context(capture_id: int):
+    """框选编辑器上下文：原图尺寸、当前主车框、同帧检测实例（含主车）。
+
+    instances 含 instance_index=0（主车，镜像 captures 行）；老库没有实例
+    记录时为空数组，前端只提供手动画框（识别实例是切换的前提）。
+    """
+    with closing(get_db()) as db:
+        row = db.execute(
+            """SELECT id, filename, date, coalesce(park,'') AS park, order_id, stage,
+                      capture_time, filepath, capture_status, status_reason,
+                      vehicle_crop_path, vehicle_box, crop_source, detection_count,
+                      vehicle_det_score, vehicle_id, plate_final,
+                      vehicle_color, vehicle_type
+               FROM captures WHERE id=?""", (capture_id,)).fetchone()
+        if not row:
+            return jsonify({"error": "抓拍不存在"}), 404
+        capture = dict(row)
+        capture["box"] = json.loads(capture.pop("vehicle_box")) \
+            if capture["vehicle_box"] else None
+        edit = db.execute(
+            "SELECT box, source, edited_at FROM manual_box_edits WHERE capture_id=?",
+            (capture_id,)).fetchone()
+        instances = []
+        for inst in db.execute(
+                """SELECT id, instance_index, crop_path, vehicle_box, vehicle_det_score,
+                          vehicle_color, vehicle_color_conf, vehicle_type,
+                          vehicle_type_conf, lpr_plate, vehicle_id
+                   FROM vehicle_instances WHERE capture_id=? ORDER BY instance_index""",
+                (capture_id,)).fetchall():
+            item = dict(inst)
+            item["box"] = json.loads(item.pop("vehicle_box")) if item["vehicle_box"] else None
+            item["crop_url"] = (f"/api/crop/{capture_id}" if item["instance_index"] == 0
+                                else f"/api/instance_crop/{item['id']}")
+            instances.append(item)
+    source = resolve_capture_path(capture.pop("filepath"))
+    if not source.is_file():
+        return jsonify({"error": "原图文件不存在（可能已归档清理），无法框选编辑"}), 422
+    try:
+        with Image.open(source) as opened:
+            size = ImageOps.exif_transpose(opened).size
+    except (OSError, ValueError):
+        return jsonify({"error": "原图无法读取"}), 422
+    return jsonify({"capture": capture,
+                    "image_url": f"/api/image/{capture_id}",
+                    "image_size": list(size),
+                    "crop_url": f"/api/crop/{capture_id}"
+                                if capture["vehicle_crop_path"] else None,
+                    "manual_edit": dict(edit) if edit else None,
+                    "instances": instances})
+
+
+@app.route("/api/boxedit/save", methods=["POST"])
+def boxedit_save():
+    """保存人工框选：按手绘矩形从原图重新裁剪主车缩略图。
+
+    - box 为原图像素坐标 [l,t,r,b]，自动收拢到图幅内，最小 24×24；
+    - 裁剪覆盖主车文件（无裁剪的老数据/无车帧按规范路径新建，
+      capture_status 复位为 vehicle）；
+    - 车牌与外观特征清空，等下轮 plate/embed 阶段补算。
+    """
+    payload = request.get_json(silent=True) or {}
+    capture_id = positive_int(str(payload.get("capture_id", "")))
+    box_raw = payload.get("box")
+    if not capture_id:
+        return jsonify({"error": "缺少有效图片ID"}), 400
+    if not isinstance(box_raw, (list, tuple)) or len(box_raw) != 4:
+        return jsonify({"error": "box 应为 [l,t,r,b] 四个数字"}), 400
+    with closing(get_db()) as db:
+        row = db.execute(
+            "SELECT id, filepath, vehicle_crop_path FROM captures WHERE id=?",
+            (capture_id,)).fetchone()
+        if not row:
+            return jsonify({"error": "抓拍不存在"}), 404
+        source = resolve_capture_path(row["filepath"])
+        if not source.is_file():
+            return jsonify({"error": "原图文件不存在，无法重新裁剪"}), 422
+        try:
+            with Image.open(source) as opened:
+                image = ImageOps.exif_transpose(opened).convert("RGB")
+        except (OSError, ValueError):
+            return jsonify({"error": "原图无法读取"}), 422
+        try:
+            box = _clamp_box(box_raw, *image.size)
+        except (TypeError, ValueError):
+            return jsonify({"error": "box 应为 4 个数字"}), 400
+        if box[2] - box[0] < 24 or box[3] - box[1] < 24:
+            return jsonify({"error": "框太小（至少 24×24 像素），请重新框选"}), 400
+        crop_rel = row["vehicle_crop_path"] or _default_crop_relpath(capture_id)
+        crop_path = resolve_capture_path(crop_rel)
+        crop_path.parent.mkdir(parents=True, exist_ok=True)
+        image.crop(tuple(box)).save(crop_path, "JPEG", quality=94, optimize=True)
+        now = datetime.now().isoformat(timespec="seconds")
+        db.execute(
+            """UPDATE captures SET vehicle_crop_path=?, vehicle_box=?, crop_source='人工框选',
+                      vehicle_det_score=NULL, capture_status='vehicle',
+                      status_reason='人工框选修正',
+                      lpr_plate=NULL, lpr_conf=NULL, lpr_attempted_at=NULL,
+                      plate_final=NULL, plate_confidence=NULL, recognition_source='',
+                      reid_embedding=NULL, reid_source=NULL, processed_at=?
+               WHERE id=?""",
+            (crop_rel, json.dumps(box), now, capture_id))
+        # 同步实例表：instance_index=0 与 captures 行一致（老库无实例记录时补建）。
+        if db.execute("SELECT 1 FROM vehicle_instances WHERE capture_id=? AND instance_index=0",
+                      (capture_id,)).fetchone():
+            db.execute(
+                """UPDATE vehicle_instances SET crop_path=?, vehicle_box=?,
+                          vehicle_det_score=NULL, lpr_plate=NULL, lpr_conf=NULL,
+                          lpr_attempted_at=NULL, reid_embedding=NULL, reid_source=NULL
+                   WHERE capture_id=? AND instance_index=0""",
+                (crop_rel, json.dumps(box), capture_id))
+        else:
+            db.execute(
+                """INSERT INTO vehicle_instances
+                     (capture_id, instance_index, crop_path, vehicle_box)
+                   VALUES (?, 0, ?, ?)""", (capture_id, crop_rel, json.dumps(box)))
+        db.execute(
+            """INSERT INTO manual_box_edits (capture_id, box, source, edited_at)
+               VALUES (?, ?, 'manual_box', ?)
+               ON CONFLICT(capture_id) DO UPDATE SET box=excluded.box,
+                 source='manual_box', edited_at=excluded.edited_at""",
+            (capture_id, json.dumps(box), now))
+        db.commit()
+    return jsonify({"ok": True, "box": box, "crop_url": f"/api/crop/{capture_id}",
+                    "message": "已按新框重新裁剪；车牌/外观特征将在下轮流水线补算"})
+
+
+@app.route("/api/boxedit/promote", methods=["POST"])
+def boxedit_promote():
+    """同帧多车切换：把某个检测实例提升为主车（缩略图随其裁剪更换）。
+
+    实例内容与 instance_index=0 记录整体对调（0 号始终镜像 captures 行），
+    外观特征直接复用实例已提取的 embedding；captures 的车辆归属清空后
+    立即重聚类，由订单/车牌/外观证据重新归组（同 vehicle_move 的重放
+    语义：聚类重跑后按新裁剪重新落位）。
+    """
+    payload = request.get_json(silent=True) or {}
+    capture_id = positive_int(str(payload.get("capture_id", "")))
+    instance_id = positive_int(str(payload.get("instance_id", "")))
+    if not capture_id or not instance_id:
+        return jsonify({"error": "缺少有效图片ID或实例ID"}), 400
+    with closing(get_db()) as db:
+        row = db.execute(
+            "SELECT id, filepath, vehicle_crop_path FROM captures WHERE id=?",
+            (capture_id,)).fetchone()
+        if not row:
+            return jsonify({"error": "抓拍不存在"}), 404
+        inst = db.execute(
+            """SELECT id, instance_index, crop_path, vehicle_box, vehicle_det_score,
+                      vehicle_color, vehicle_color_conf, vehicle_type, vehicle_type_conf,
+                      attr_model_version, lpr_plate, lpr_conf, lpr_attempted_at,
+                      reid_embedding, reid_source, reid_model_version
+               FROM vehicle_instances WHERE id=? AND capture_id=?""",
+            (instance_id, capture_id)).fetchone()
+        if not inst or not inst["instance_index"]:
+            return jsonify({"error": "实例不存在或已是主车"}), 404
+        main = db.execute(
+            """SELECT id, crop_path, vehicle_box, vehicle_det_score, vehicle_color,
+                      vehicle_color_conf, vehicle_type, vehicle_type_conf,
+                      attr_model_version, lpr_plate, lpr_conf, lpr_attempted_at,
+                      reid_embedding, reid_source, reid_model_version
+               FROM vehicle_instances WHERE capture_id=? AND instance_index=0""",
+            (capture_id,)).fetchone()
+        if not main:
+            return jsonify({"error": "主车实例记录缺失，请先重跑检测阶段"}), 422
+        # 新主车像素来源：实例裁剪文件优先；缺失则按实例框从原图重裁。
+        crop_rel = row["vehicle_crop_path"] or _default_crop_relpath(capture_id)
+        crop_path = resolve_capture_path(crop_rel)
+        crop_path.parent.mkdir(parents=True, exist_ok=True)
+        inst_box = json.loads(inst["vehicle_box"]) if inst["vehicle_box"] else None
+        inst_file = resolve_capture_path(inst["crop_path"]) if inst["crop_path"] else None
+        if inst_file and inst_file.is_file():
+            shutil.copyfile(inst_file, crop_path)
+        elif inst_box:
+            source = resolve_capture_path(row["filepath"])
+            if not source.is_file():
+                return jsonify({"error": "实例裁剪文件缺失且原图不存在，无法切换"}), 422
+            try:
+                with Image.open(source) as opened:
+                    image = ImageOps.exif_transpose(opened).convert("RGB")
+            except (OSError, ValueError):
+                return jsonify({"error": "原图无法读取"}), 422
+            image.crop(tuple(_clamp_box(inst_box, *image.size))).save(
+                crop_path, "JPEG", quality=94, optimize=True)
+        else:
+            return jsonify({"error": "实例裁剪文件缺失且无可用框，无法切换"}), 422
+        # 行内容对调 + 车辆归属清空（下方 associate_orders 会重新归组）。
+        # 框串统一归一化为 json.dumps 格式，与 detect_pass 写入格式一致。
+        cols = ("crop_path", "vehicle_box", "vehicle_det_score", "vehicle_color",
+                "vehicle_color_conf", "vehicle_type", "vehicle_type_conf",
+                "attr_model_version", "lpr_plate", "lpr_conf", "lpr_attempted_at",
+                "reid_embedding", "reid_source", "reid_model_version")
+
+        def norm_row(row: sqlite3.Row) -> list:
+            vals = [row[name] for name in cols]
+            box_at = cols.index("vehicle_box")
+            try:
+                vals[box_at] = json.dumps(json.loads(vals[box_at]))
+            except (TypeError, ValueError):
+                pass
+            return vals
+
+        set_sql = ", ".join(f"{name}=?" for name in cols)
+        db.execute(f"UPDATE vehicle_instances SET {set_sql} WHERE id=?",
+                   norm_row(inst) + [main["id"]])
+        db.execute(f"UPDATE vehicle_instances SET {set_sql}, vehicle_id=NULL WHERE id=?",
+                   norm_row(main) + [inst["id"]])
+        now = datetime.now().isoformat(timespec="seconds")
+        box_json = json.dumps(inst_box) if inst_box else (inst["vehicle_box"] or "[]")
+        db.execute(
+            """UPDATE captures SET vehicle_crop_path=?, vehicle_box=?, crop_source='人工切换',
+                      vehicle_det_score=?, vehicle_color=?, vehicle_color_conf=?,
+                      vehicle_type=?, vehicle_type_conf=?, attr_model_version=?,
+                      lpr_plate=?, lpr_conf=?, lpr_attempted_at=NULL,
+                      plate_final=NULL, plate_confidence=NULL, recognition_source='',
+                      reid_embedding=?, reid_source=?, reid_model_version=?,
+                      vehicle_id=NULL, status_reason='人工切换主车', processed_at=?
+               WHERE id=?""",
+            [crop_rel, box_json, inst["vehicle_det_score"],
+             inst["vehicle_color"], inst["vehicle_color_conf"],
+             inst["vehicle_type"], inst["vehicle_type_conf"], inst["attr_model_version"],
+             inst["lpr_plate"], inst["lpr_conf"],
+             inst["reid_embedding"], inst["reid_source"], inst["reid_model_version"],
+             now, capture_id])
+        db.execute(
+            """INSERT INTO manual_box_edits (capture_id, box, source, edited_at)
+               VALUES (?, ?, 'manual_promote', ?)
+               ON CONFLICT(capture_id) DO UPDATE SET box=excluded.box,
+                 source='manual_promote', edited_at=excluded.edited_at""",
+            (capture_id, box_json, now))
+        db.commit()
+        build_db.associate_orders(db)
+        new_vid = db.execute("SELECT vehicle_id FROM captures WHERE id=?",
+                             (capture_id,)).fetchone()["vehicle_id"]
+    return jsonify({"ok": True, "vehicle_id": new_vid,
+                    "crop_url": f"/api/crop/{capture_id}",
+                    "message": "已切换主车并重新归组；车牌将在下轮流水线补算"})
+
+
+@app.route("/api/boxedit/reset", methods=["POST"])
+def boxedit_reset():
+    """撤销人工框选标记（不立即改图）：下次 detect --force 重跑时恢复自动检测。"""
+    payload = request.get_json(silent=True) or {}
+    capture_id = positive_int(str(payload.get("capture_id", "")))
+    if not capture_id:
+        return jsonify({"error": "缺少有效图片ID"}), 400
+    with closing(get_db()) as db:
+        removed = db.execute("DELETE FROM manual_box_edits WHERE capture_id=?",
+                             (capture_id,)).rowcount
+        db.commit()
+    return jsonify({"ok": True, "removed": removed})
 
 
 # ---------------------------------------------------------------------------

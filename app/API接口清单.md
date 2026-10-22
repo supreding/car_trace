@@ -162,12 +162,21 @@ if data["code"] == 0:
 | POST | `/api/vehicle_move` | `{capture_id, target_plate（null=拆出为独立车辆）, scope: "capture"|"order"}` 人工移动车辆归属 |
 | POST | `/api/vehicle_move_delete` | `{capture_id}` 撤销人工移动 |
 | POST | `/api/vehicle-merge` | `{vehicle_ids: [..], target_vehicle_id?}` 合并多个车辆编号 |
+| GET | `/api/boxedit/<capture_id>` | 框选编辑器上下文：原图尺寸、当前主车框、同帧实例列表（含主车）、人工修正标记 |
+| POST | `/api/boxedit/save` | `{capture_id, box: [l,t,r,b]}` 人工框选：按手绘框从原图重裁主车缩略图（框为原图像素坐标，自动收拢图幅，最小 24×24） |
+| POST | `/api/boxedit/promote` | `{capture_id, instance_id}` 同帧多车切换主车：实例内容与 0 号记录对调，特征复用实例 embedding，归属立即重聚类 |
+| POST | `/api/boxedit/reset` | `{capture_id}` 撤销人工框选标记（下次 detect --force 恢复自动检测） |
 | POST | `/api/annotations/capture` | `{capture_id, action, usability, identity_id?, corrected_plate?, notes?, annotator}` 单张标注 |
 | POST | `/api/annotations/pair` | `{capture_id, candidate_id, relation: "same"|"different"|"uncertain", notes?, annotator, confirm_merge?}` 成对判定 |
 | GET | `/api/annotations/stats` | 标注进度统计 |
 | GET | `/api/annotations/queue` | `date`、`stage`、`state`、`limit` 标注队列 |
 | GET | `/api/annotations/item/<capture_id>` | `limit` 单张标注详情及候选 |
 | GET | `/api/annotations/export.csv` | 导出人工真值 CSV（FastReID 微调用） |
+
+**人工框选修正语义**：框变更后车牌/外观特征按断点续跑规则清空（`lpr_attempted_at`、
+`reid_embedding`），由下轮流水线 plate/embed 阶段增量补算；决定记入 `manual_box_edits`
+表，`detect_pass`（含 `--force`）与 `correct_pass` 跳过这些抓拍，人工修正不会被自动
+覆盖。撤销标记请用 `/api/boxedit/reset`。
 
 ---
 
