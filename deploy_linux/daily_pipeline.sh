@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# 每日凌晨流水线：备份 -> 全园区同步(自动发现新园区)+OCR -> GPU 流水线（只处理新增/未处理）
-# 由 car-trace-pipeline.timer 每天 03:00 触发；也可手动：systemctl start car-trace-pipeline
+# 定时流水线：备份 -> 全园区同步(自动发现新园区)+OCR -> GPU 流水线（只处理新增/未处理）
+# 由 car-trace-pipeline.timer 每 30 分钟触发（2026-09-21 起由每日 03:00 改为每半小时）；
+# 也可手动：systemctl start car-trace-pipeline
 # 或直接: bash /opt/car-trace/deploy_linux/daily_pipeline.sh
 set -uo pipefail
 cd /opt/car-trace

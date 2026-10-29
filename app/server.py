@@ -27,7 +27,7 @@ import sqlite3
 import sys
 from collections import Counter
 from contextlib import closing
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import wraps
 from pathlib import Path
 
@@ -535,6 +535,110 @@ def order_summary(db: sqlite3.Connection, order_id: str, park: str) -> dict:
     if not plate and row:
         plate = normalize_plate(row["osd_pick"] or "")
     return {"order_time": (row["order_time"] or "") if row else "", "plate": plate}
+
+
+# ---------------------------------------------------------------------------
+# 订单进度状态（progress_status）：由订单事件流（有效抓拍的 stage+时间）推导，
+# 描述"这辆车走到哪一步了"。不改表结构，查询时计算。
+#
+# 机位语义（granary 库实测）：抓拍=场院全景 NVR，车在园全程会出片（入磅前中位
+# 2.1 分钟、出磅后中位 3.8 分钟，即大门进出时刻；入磅-出磅之间出片不回退状态）；
+# 质检=扦样点，紧贴地磅（出现在入磅前约 0.3 分钟）；入磅→出磅 中位 108 分钟，
+# 即卸货时段。现场没有卸货区/出磅队列的独立信号，故不区分"等待出磅"。
+#
+# 六个状态：
+#   大门进   只有入磅前的事件（抓拍/质检），最后事件距今 ≤ GATE_IN（刚过大门）
+#   等待入磅 同上但超过 GATE_IN（在场上排队/待检；大门照片缺失时也从此态起步）
+#   入磅中   最后事件为入磅，距今 ≤ WEIGH（称重进行中）
+#   卸货     已入磅未出磅（超过 WEIGH 后的整个在卸时段；出磅照片缺失会停在此态）
+#   出磅中   最后事件为出磅、其后无抓拍，距今 ≤ EXIT_ASSUME（称重完至确认离场）
+#   大门出   出磅后出现抓拍；或出磅超过 EXIT_ASSUME 仍无后续（推定已离场）
+#
+# 阈值可用环境变量覆盖：STATUS_GATE_IN_MIN / STATUS_WEIGH_MIN / STATUS_EXIT_ASSUME_MIN。
+# 照片经每 30 分钟的定时流水线入库，状态时效以此为准（约 30~60 分钟延迟）。
+# ---------------------------------------------------------------------------
+
+PROGRESS_GATE_IN = "大门进"
+PROGRESS_WAIT_WEIGH = "等待入磅"
+PROGRESS_WEIGHING = "入磅中"
+PROGRESS_UNLOADING = "卸货"
+PROGRESS_WEIGHOUT = "出磅中"
+PROGRESS_GATE_OUT = "大门出"
+
+PROGRESS_STATUSES = (PROGRESS_GATE_IN, PROGRESS_WAIT_WEIGH, PROGRESS_WEIGHING,
+                     PROGRESS_UNLOADING, PROGRESS_WEIGHOUT, PROGRESS_GATE_OUT)
+
+
+def _env_minutes(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+PROGRESS_GATE_IN_MIN = _env_minutes("STATUS_GATE_IN_MIN", 15)
+PROGRESS_WEIGH_MIN = _env_minutes("STATUS_WEIGH_MIN", 10)
+PROGRESS_EXIT_ASSUME_MIN = _env_minutes("STATUS_EXIT_ASSUME_MIN", 60)
+
+# 事件流取数条件：只认有 OCR 时间、检出车辆、归属真实订单的抓拍
+PROGRESS_EVENT_WHERE = ("capture_time!='' AND coalesce(capture_status,'vehicle')!='no_vehicle' "
+                        "AND order_id!='' AND order_id!='未关联图片'")
+
+
+def compute_progress_status(events, now=None):
+    """events: [(capture_time, stage)]（已按上面的条件过滤）；返回状态三字段。
+
+    无有效事件时 progress_status 为空串。now 参数供测试注入时钟。
+    """
+    parsed = []
+    for time_text, stage in events:
+        try:
+            parsed.append((datetime.strptime(time_text, "%Y-%m-%d %H:%M:%S"), stage))
+        except ValueError:
+            continue
+    if not parsed:
+        return {"progress_status": "", "last_stage": "", "last_event_time": ""}
+    now = now or datetime.now()
+    last_time, last_stage = max(parsed, key=lambda pair: pair[0])
+    weigh_times = [t for t, s in parsed if s == "入磅"]
+    out_times = [t for t, s in parsed if s == "出磅"]
+    snap_times = [t for t, s in parsed if s == "抓拍"]
+    if weigh_times and (not out_times or max(weigh_times) > max(out_times)):
+        # 最新一次过磅是入磅（出磅后的复检入磅也算回此分支）
+        t = max(weigh_times)
+        status = (PROGRESS_WEIGHING if now - t <= timedelta(minutes=PROGRESS_WEIGH_MIN)
+                  else PROGRESS_UNLOADING)
+    elif out_times:
+        t = max(out_times)
+        if snap_times and max(snap_times) > t:
+            last_time, last_stage = max(snap_times), "抓拍"
+            status = PROGRESS_GATE_OUT
+        else:
+            status = (PROGRESS_WEIGHOUT if now - t <= timedelta(minutes=PROGRESS_EXIT_ASSUME_MIN)
+                      else PROGRESS_GATE_OUT)
+    else:
+        status = (PROGRESS_GATE_IN if now - last_time <= timedelta(minutes=PROGRESS_GATE_IN_MIN)
+                  else PROGRESS_WAIT_WEIGH)
+    return {"progress_status": status, "last_stage": last_stage,
+            "last_event_time": last_time.strftime("%Y-%m-%d %H:%M:%S")}
+
+
+def fetch_progress_events(db, order_ids):
+    """按订单号批量取事件流，返回 {(park, order_id): [(capture_time, stage)]}。"""
+    events = {}
+    ids = sorted(set(order_ids))
+    if not ids:
+        return events
+    placeholders = ",".join("?" * len(ids))
+    rows = db.execute(
+        f"""SELECT coalesce(park,'') AS park, order_id, capture_time, stage
+            FROM captures WHERE {PROGRESS_EVENT_WHERE} AND order_id IN ({placeholders})""",
+        ids,
+    ).fetchall()
+    for row in rows:
+        events.setdefault((row["park"], row["order_id"]), []).append(
+            (row["capture_time"], row["stage"]))
+    return events
 
 
 @app.route("/api/orders")
@@ -1983,6 +2087,7 @@ def open_orders():
                 LIMIT ? OFFSET ?""",
             [*parameters, page_size, offset],
         ).fetchall()
+        progress_events = fetch_progress_events(db, [row["order_id"] for row in rows])
         items = []
         for row in rows:
             item = dict(row)
@@ -1997,6 +2102,8 @@ def open_orders():
                 item["attr_conf"] = {"color": attrs["vehicle_color_conf"],
                                      "type": attrs["vehicle_type_conf"]}
             item.update(order_summary(db, item["order_id"], item["park"]))
+            item.update(compute_progress_status(
+                progress_events.get((item["park"], item["order_id"]), [])))
             items.append(item)
     return _open_ok({"total": total, "page": page, "page_size": page_size, "items": items})
 
@@ -2033,10 +2140,14 @@ def open_order_detail(order_id: str):
             (order_id, park if park else parks[0]),
         ).fetchone()
         summary = order_summary(db, order_id, park if park else parks[0])
-    return _open_ok({"data": {"order_id": order_id, "park": park if park else parks[0],
-                              "order_time": summary["order_time"], "plate": summary["plate"],
-                              "attributes": dict(attrs) if attrs else None,
-                              "items": [dict(row) for row in rows]}})
+        events = [(row["capture_time"], row["stage"]) for row in rows
+                  if row["capture_time"] and (row["capture_status"] or "") != "no_vehicle"]
+    data = {"order_id": order_id, "park": park if park else parks[0],
+            "order_time": summary["order_time"], "plate": summary["plate"],
+            "attributes": dict(attrs) if attrs else None,
+            "items": [dict(row) for row in rows]}
+    data.update(compute_progress_status(events))
+    return _open_ok({"data": data})
 
 
 @app.route("/api/open/vehicles")
@@ -2101,6 +2212,52 @@ def open_vehicle_detail(vehicle_id: int):
         return _open_error(404, "车辆不存在")
     return _open_ok({"data": {"vehicle_id": vehicle_id,
                               "items": [dict(row) for row in rows]}})
+
+
+@app.route("/api/open/yard")
+@open_api
+def open_yard():
+    """在园车辆（对外）：近期有有效抓拍、且进度状态未到"大门出"的订单。
+
+    供在园状态看板轮询：先取 active_hours 小时内出现过有效抓拍的订单
+    （默认 24，可用参数调大以覆盖在园多日的车），再对这些订单取**完整**
+    事件流算状态——否则窗口外的出磅照片缺失会把在卸车误判成等待入磅。
+    照片经每 30 分钟定时流水线入库，状态时效以此为上限。
+    """
+    park_clause, park_params = open_park_filter()
+    active_hours = min(24 * 30, positive_int(request.args.get("active_hours", "24"), 24))
+    cutoff = (datetime.now() - timedelta(hours=active_hours)).strftime("%Y-%m-%d %H:%M:%S")
+    where = ["capture_time>=?", PROGRESS_EVENT_WHERE]
+    parameters = [cutoff]
+    if park_clause:
+        where.append(park_clause)
+        parameters.extend(park_params)
+    page, page_size, offset = open_pagination()
+    with closing(get_db()) as db:
+        recent_pairs = {(row["park"], row["order_id"]) for row in db.execute(
+            f"""SELECT DISTINCT coalesce(park,'') AS park, order_id
+                FROM captures WHERE {' AND '.join(where)}""",
+            parameters,
+        ).fetchall()}
+        progress_events = {key: events
+                           for key, events in fetch_progress_events(
+                               db, [order_id for _, order_id in recent_pairs]).items()
+                           if key in recent_pairs}
+        enriched = []
+        for (park, order_id), events in progress_events.items():
+            info = compute_progress_status(events)
+            if info["progress_status"] == PROGRESS_GATE_OUT:
+                continue  # 已离场不算在园
+            enriched.append((info["last_event_time"], park, order_id, events, info))
+        enriched.sort(key=lambda entry: entry[0], reverse=True)
+        total = len(enriched)
+        items = []
+        for _last_time, park, order_id, events, info in enriched[offset:offset + page_size]:
+            item = {"park": park, "order_id": order_id,
+                    "capture_count": len(events), **info}
+            item.update(order_summary(db, order_id, park))
+            items.append(item)
+    return _open_ok({"total": total, "page": page, "page_size": page_size, "items": items})
 
 
 @app.route("/api/open/captures")

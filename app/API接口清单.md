@@ -51,10 +51,11 @@
 | `GET /api/open/ping` | 连通性与 token 自检，接入前先调它验证 token | — |
 | `GET /api/open/parks` | 园区清单及各园区抓拍/订单/车辆数（park 为空串=未标注园区） | — |
 | `GET /api/open/dates` | 有数据的日期清单及每日抓拍数、订单数 | `park` |
-| `GET /api/open/orders` | 订单列表。订单号在园区内聚合（跨日期只出一行）；按 order_id 排序（翻页稳定）。items 含 `park` 字段 | `park`、`date` / `date_from` / `date_to`、`order_id`（模糊）、`stage`、`page`、`page_size` |
-| `GET /api/open/order/<order_id>` | 单个订单完整轨迹（跨日期聚合，按时间+阶段排序），含订单属性 `attributes`。订单号跨园区撞号时返回 400 + 可选园区列表 | `park` |
+| `GET /api/open/orders` | 订单列表。订单号在园区内聚合（跨日期只出一行）；按 order_id 排序（翻页稳定）。items 含 `park`、`progress_status` 进度状态 | `park`、`date` / `date_from` / `date_to`、`order_id`（模糊）、`stage`、`page`、`page_size` |
+| `GET /api/open/order/<order_id>` | 单个订单完整轨迹（跨日期聚合，按时间+阶段排序），含订单属性 `attributes` 与顶层 `progress_status` 进度状态。订单号跨园区撞号时返回 400 + 可选园区列表 | `park` |
 | `GET /api/open/vehicles` | 车辆聚合列表（vehicle_id 分组，按园区隔离），`rep_id` 是代表抓拍 ID，`plate` 为出现最多的识别车牌，items 含 `park` | `park`、`date` / `date_from` / `date_to`、`page`、`page_size` |
 | `GET /api/open/vehicle/<vehicle_id>` | 单车完整轨迹（车辆只属于一个园区） | — |
+| `GET /api/open/yard` | **在园车辆**：近期（默认 24 小时，`active_hours` 可调，上限 720）有有效抓拍、且进度状态未到"大门出"的订单，按最后事件时间倒序。供在园状态看板轮询（注意照片经 30 分钟定时流水线入库，状态时效以此为上限） | `park`、`active_hours`、`page`、`page_size` |
 | `GET /api/open/captures` | 抓拍明细，多条件任意组合（全部为 AND） | `park`、`date` / `date_from` / `date_to`、`order_id`（精确）、`plate`（片段，匹配识别车牌和 OSD 车牌）、`vehicle_type`、`start_hour` / `end_hour`（0-23）、`page`、`page_size` |
 | `GET /api/open/crop/<capture_id>` | 车辆裁剪图（JPEG 二进制），`capture_id` 取自 items 里的 `id` 或 `rep_id` | 支持 `?token=` |
 
@@ -65,6 +66,19 @@
 车辆字段：`vehicle_id` 车辆聚合编号、`rep_id` 代表抓拍、`capture_count` 出现次数、`order_ids` 关联订单号（逗号分隔）、`plate` 主识别车牌、`plate_confidence` 车牌置信度、`color` / `vehicle_type` 颜色/车型、`camera_count` 涉及摄像头数、`first_seen` / `last_seen`。
 
 抓拍明细字段（`/api/open/captures` 与订单轨迹的 items 相同）：`id` 抓拍 ID（用于取图）、`date` 日期、`order_id` 订单号、`stage` 环节（入磅/质检/出磅等）、`camera_key` 摄像头、`capture_time` OCR 识别时间（可能为空）、`hour` 小时、`plate_final` 最终车牌、`osd_plate` 屏幕 OSD 参考车牌、`plate_confidence` 车牌置信度、`vehicle_color` / `vehicle_type` 及对应 `_conf` 置信度、`vehicle_crop_path` 裁剪图相对路径、`vehicle_id` 聚合车辆编号、`quality_score` 质量分、`capture_status`（`no_vehicle` 表示该帧未检出车辆）。
+
+进度状态（`/api/open/orders`、`/api/open/order/<id>`、`/api/open/yard` 返回的 `progress_status` / `last_stage` / `last_event_time`）：由订单事件流（有效抓拍的环节+OCR 时间）查询时推导，**不改库表**。`progress_status` 取六个值——
+
+| 状态 | 判定 |
+|---|---|
+| `大门进` | 只有入磅前的事件（抓拍/质检），最后事件距今 ≤15 分钟（刚过大门） |
+| `等待入磅` | 同上但超过 15 分钟（在场上排队/待检；大门照片缺失时也从此态起步） |
+| `入磅中` | 最后事件为入磅，距今 ≤10 分钟 |
+| `卸货` | 已入磅未出磅（入磅超 10 分钟后的整个在卸时段；**出磅照片缺失会停在此态**） |
+| `出磅中` | 最后事件为出磅、其后无抓拍，距今 ≤60 分钟（称重完至确认离场之间） |
+| `大门出` | 出磅后出现抓拍；或出磅超 60 分钟仍无后续事件（**推定已离场**） |
+
+补充口径：入磅与出磅之间的场院"抓拍"不回退状态；阈值可用环境变量 `STATUS_GATE_IN_MIN` / `STATUS_WEIGH_MIN` / `STATUS_EXIT_ASSUME_MIN` 覆盖；历史订单的窗口全部过期后，状态退化为"走到的最远环节"（如停在 `卸货`/`大门出`）。现场没有卸货区/出磅队列的独立信号，故不区分"等待出磅"。
 
 ### 1.4 调用示例
 
@@ -83,6 +97,10 @@ curl -H "X-API-Token: 8cc5318daf2faaeb93dbf21c030dcc053deae8afc5f4c10d" "http://
 # 按车牌片段 + 时段查抓拍明细
 curl -H "X-API-Token: 8cc5318daf2faaeb93dbf21c030dcc053deae8afc5f4c10d" \
   "http://47.101.32.59/api/open/captures?date=2026-08-05&plate=CE1929&start_hour=8&end_hour=18"
+
+# 在园车辆看板轮询（默认看近 24 小时有活动的订单）
+curl -H "X-API-Token: 8cc5318daf2faaeb93dbf21c030dcc053deae8afc5f4c10d" \
+  "http://47.101.32.59/api/open/yard?active_hours=24"
 
 # 车辆裁剪图（查询参数方式鉴权，可直接嵌 <img src>）
 <img src="http://47.101.32.59/api/open/crop/3088?token=8cc5318daf2faaeb93dbf21c030dcc053deae8afc5f4c10d">
@@ -195,9 +213,11 @@ systemctl restart car-trace        # 重启（改代码/配置后执行）
 journalctl -u car-trace -f         # 服务日志
 ```
 
-**每日流水线**：systemd 定时器 `car-trace-pipeline.timer`，**每天 03:00（北京时间）自动执行**：
+**定时流水线**：systemd 定时器 `car-trace-pipeline.timer`，**每 30 分钟自动执行**
+（2026-09-21 应现场要求由每日 03:00 改为每半小时）：
 数据库备份（`/data/backups/`，gzip，保留 7 份）→ 全园区照片同步（**自动发现新园区**）+ OCR
 → GPU 流水线（**只处理新增/未处理**）。无新增图片时自动跳过 GPU（状态记为 SKIPPED）。
+照片从现场到可查询的延迟因此约为 30~60 分钟（拍照 → NVR 归档 → 下一次定时器）。
 
 ```bash
 systemctl list-timers car-trace-pipeline.timer   # 下次触发时间
@@ -207,7 +227,7 @@ journalctl -u car-trace-pipeline -f              # 运行日志
 ```
 
 **新园区接入**：照片放 `/data/car-trace/data/<园区名>/<月份照片根>/<日期>/<订单号>/`，
-等 03:00 自动处理或手动触发；页面园区下拉框自动出现新园区，无需改任何配置/代码。
+等定时器自动处理（每 30 分钟，或手动触发）；页面园区下拉框自动出现新园区，无需改任何配置/代码。
 
 **人工合并可靠性**：页面上的"合并车辆"决定按抓拍锚定持久化（`manual_vehicle_merge_pairs` 表），
 每日重聚类后自动重放，不受车辆编号重排影响；人工"移动/拆出"同样持久生效。

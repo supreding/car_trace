@@ -8,6 +8,7 @@ from __future__ import annotations
 import re
 import sqlite3
 import unittest
+from datetime import datetime
 
 import numpy as np
 
@@ -346,6 +347,87 @@ class AppTestCase(unittest.TestCase):
             "DELETE FROM annotation_audit WHERE capture_id IN (?, ?) AND annotator='测试'",
             (target["id"], other["id"]))
         self.db.commit()
+
+
+class ProgressStatusTests(unittest.TestCase):
+    """进度状态机纯函数测试（不依赖数据库），时钟由 now 参数注入。"""
+
+    def setUp(self):
+        self.now = datetime(2026, 10, 29, 12, 0, 0)
+
+    def status(self, events):
+        return server.compute_progress_status(events, now=self.now)["progress_status"]
+
+    def test_empty_events(self):
+        info = server.compute_progress_status([])
+        self.assertEqual(info["progress_status"], "")
+        self.assertEqual(info["last_stage"], "")
+
+    def test_gate_in_then_wait(self):
+        self.assertEqual(self.status([("2026-10-29 11:50:00", "抓拍")]), "大门进")
+        self.assertEqual(self.status([("2026-10-29 11:00:00", "抓拍")]), "等待入磅")
+        # 只有质检事件（扦样点紧贴地磅，属入磅前环节）同样从这两个状态起步
+        self.assertEqual(self.status([("2026-10-29 11:55:00", "质检")]), "大门进")
+
+    def test_weighing_then_unloading(self):
+        self.assertEqual(self.status([("2026-10-29 11:55:00", "入磅")]), "入磅中")
+        # 入磅超窗口后进入卸货；卸货中的场院抓拍不得回退状态
+        events = [("2026-10-29 10:00:00", "入磅"), ("2026-10-29 10:05:00", "抓拍")]
+        self.assertEqual(self.status(events), "卸货")
+
+    def test_weighout_and_gate_out(self):
+        self.assertEqual(self.status([("2026-10-29 11:20:00", "出磅")]), "出磅中")
+        self.assertEqual(self.status([("2026-10-29 10:00:00", "出磅")]), "大门出")
+        # 出磅后出现抓拍 = 确认离场，last_event 落在抓拍上
+        info = server.compute_progress_status(
+            [("2026-10-29 10:00:00", "出磅"), ("2026-10-29 10:03:00", "抓拍")], now=self.now)
+        self.assertEqual(info["progress_status"], "大门出")
+        self.assertEqual(info["last_event_time"], "2026-10-29 10:03:00")
+        self.assertEqual(info["last_stage"], "抓拍")
+
+    def test_full_flow(self):
+        events = [("2026-10-29 09:00:00", "抓拍"), ("2026-10-29 09:02:00", "质检"),
+                  ("2026-10-29 09:03:00", "入磅"), ("2026-10-29 09:04:00", "抓拍"),
+                  ("2026-10-29 10:50:00", "出磅"), ("2026-10-29 10:54:00", "抓拍")]
+        self.assertEqual(self.status(events), "大门出")
+
+
+class OpenApiProgressTests(unittest.TestCase):
+    """开放接口进度字段接线验证（临时注入 token，不动真实配置）。"""
+
+    @classmethod
+    def setUpClass(cls):
+        server.app.config.update(TESTING=True)
+        cls.client = server.app.test_client()
+        cls.token = "unit-test-token"
+        cls._old = server.OPEN_API_TOKEN
+        server.OPEN_API_TOKEN = cls.token
+
+    @classmethod
+    def tearDownClass(cls):
+        server.OPEN_API_TOKEN = cls._old
+
+    def get_open_json(self, url):
+        response = self.client.get(url, headers={"X-API-Token": self.token})
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        return response.get_json()
+
+    def test_orders_carry_progress_status(self):
+        data = self.get_open_json("/api/open/orders?date=2026-08-19&page_size=5")
+        items = data["items"]
+        self.assertTrue(items)
+        for item in items:
+            self.assertIn(item["progress_status"], server.PROGRESS_STATUSES)
+            self.assertIn("last_stage", item)
+            self.assertIn("last_event_time", item)
+
+    def test_yard_excludes_departed(self):
+        data = self.get_open_json("/api/open/yard")
+        self.assertEqual(data["code"], 0)
+        for item in data["items"]:
+            self.assertIn(item["progress_status"], server.PROGRESS_STATUSES)
+            self.assertNotEqual(item["progress_status"], server.PROGRESS_GATE_OUT)
+            self.assertIn("plate", item)
 
 
 if __name__ == "__main__":

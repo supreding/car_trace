@@ -1,5 +1,5 @@
 [Unit]
-Description=园区车辆轨迹 每日流水线（备份+全园区同步+OCR+GPU，只处理新增）
+Description=园区车辆轨迹 定时流水线（每30分钟：备份+全园区同步+OCR+GPU，只处理新增）
 After=network.target
 
 [Service]

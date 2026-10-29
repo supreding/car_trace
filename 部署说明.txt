@@ -13,7 +13,7 @@
     systemctl restart car-trace
     journalctl -u car-trace -f
 
-  每日流水线（systemd 定时器，每天 03:00 北京时间自动跑）：
+  定时流水线（systemd 定时器，每 30 分钟自动跑一次，2026-09-21 起由每日 03:00 改为每半小时）：
     备份数据库（/data/backups/，保留 7 份）
     → 全园区照片同步（自动发现 data/ 下新园区）+ OCR
     → GPU 流水线（只处理新增/未处理的抓拍）
@@ -23,7 +23,7 @@
     journalctl -u car-trace-pipeline -f     # 运行日志
 
   新园区接入：照片放 /data/car-trace/data/<园区名>/<月份照片根>/<日期>/<订单号>/，
-  等 03:00 自动处理（或手动触发）；页面园区下拉框自动出现，无需改配置。
+  等定时器自动处理（每 30 分钟，或手动触发）；页面园区下拉框自动出现，无需改配置。
 
 二、Windows 开发机（建库/流水线也可在此跑，需 NVIDIA GPU）
   查询服务    双击 启动查询服务.bat
