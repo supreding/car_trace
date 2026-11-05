@@ -98,9 +98,10 @@ def test_nongyixing_migration():
     print("回填后园区分布：", backfilled)
     assert len(backfilled) == 1 and backfilled[0][0] == "农易行临泉辉煌库", backfilled
 
-    # 重扫同一目录：key=(park, order_id, filename) 应全部命中更新，不重复插入
+    # 重扫同一园区：key=(park, order_id, filename) 应全部命中更新，不重复插入
+    # （只扫本库对应的园区：data/ 下可能还有其他园区的目录，不属于本库）
     data_root = Path("D:/WorkSpace/car_trace/data")
-    summary = build_db.sync_files(conn, data_root)
+    summary = build_db.sync_files(conn, data_root, only_park="农易行临泉辉煌库")
     print("重扫结果：", summary)
     after = conn.execute("SELECT COUNT(*) FROM captures").fetchone()[0]
     assert after == before, f"重扫后记录数变化：{before} -> {after}"

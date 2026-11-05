@@ -94,6 +94,14 @@ def park_where(value: str, column: str = "park") -> tuple[str, list]:
     return f"coalesce({column},'')=?", [value]
 
 
+# 共用大门去重的隔离园区（重复抓拍隔离-<原园区>）：判重落败的照片只进不出，
+# 不属于任何真实园区。园区清单、跨园区统计、订单归属判定一律排除（按 id
+# 取详情/裁剪图的查询不受影响，隔离照片仅不可见不失效）。
+QUARANTINE_PARK_LIKE = "重复抓拍隔离%"
+QUARANTINE_EXCLUDE = f"coalesce(park,'') NOT LIKE '{QUARANTINE_PARK_LIKE}'"
+QUARANTINE_EXCLUDE_C = f"coalesce(c.park,'') NOT LIKE '{QUARANTINE_PARK_LIKE}'"
+
+
 def blob_to_feature(blob: bytes) -> np.ndarray:
     feature = np.frombuffer(blob, dtype=np.float32)
     return feature / (np.linalg.norm(feature) + 1e-9)
@@ -169,7 +177,8 @@ def parks():
                            coalesce(park,'') || '|' || order_id END) AS orders,
                       COUNT(DISTINCT vehicle_id) AS vehicles,
                       MIN(date) AS first_date, MAX(date) AS last_date
-               FROM captures GROUP BY coalesce(park,'') ORDER BY park"""
+               FROM captures WHERE """ + QUARANTINE_EXCLUDE +
+            """ GROUP BY coalesce(park,'') ORDER BY park"""
         ).fetchall()
     return jsonify([dict(row) for row in rows])
 
@@ -181,7 +190,8 @@ def dates():
     with closing(get_db()) as db:
         rows = db.execute(
             f"""SELECT date, COUNT(*) AS count FROM captures
-                WHERE date!='' {'AND ' + where_sql if where_sql else ''}
+                WHERE date!='' AND {QUARANTINE_EXCLUDE}
+                {'AND ' + where_sql if where_sql else ''}
                 GROUP BY date ORDER BY date""",
             park_params,
         ).fetchall()
@@ -440,7 +450,9 @@ def instance_crop(instance_id: int):
 def stats():
     park = park_param()
     where_sql, park_params = park_where(park)
-    park_filter = f" WHERE {where_sql}" if where_sql else ""
+    # 隔离园区不计入任何统计（含指定真实园区时也无害：真实园区名不会命中）
+    base_filters = [QUARANTINE_EXCLUDE] + ([where_sql] if where_sql else [])
+    base_where = " AND ".join(base_filters)
     with closing(get_db()) as db:
         totals = db.execute(
             f"""SELECT COUNT(*) AS total,
@@ -457,23 +469,24 @@ def stats():
                       SUM(CASE WHEN detection_count>1 THEN 1 ELSE 0 END) AS multi_vehicle,
                       SUM(CASE WHEN coalesce(ocr_status,'')='fallback' THEN 1 ELSE 0 END) AS ocr_fallback,
                       SUM(CASE WHEN coalesce(ocr_status,'')='conflict' THEN 1 ELSE 0 END) AS ocr_conflict
-               FROM captures{park_filter}""",
+               FROM captures WHERE {base_where}""",
             park_params,
         ).fetchone()
         stage_rows = db.execute(
             f"""SELECT stage, COUNT(*) AS count FROM captures
-                WHERE coalesce(stage,'')!=''{(' AND ' + where_sql) if where_sql else ''}
+                WHERE coalesce(stage,'')!='' AND {base_where}
                 GROUP BY stage ORDER BY count DESC""",
             park_params,
         ).fetchall()
         camera_rows = db.execute(
             f"""SELECT camera_key, COUNT(*) AS count FROM captures
-                WHERE coalesce(camera_key,'')!=''{(' AND ' + where_sql) if where_sql else ''}
+                WHERE coalesce(camera_key,'')!='' AND {base_where}
                 GROUP BY camera_key ORDER BY camera_key""",
             park_params,
         ).fetchall()
         park_rows = db.execute(
-            """SELECT coalesce(park,'') AS park, COUNT(*) AS count FROM captures
+            f"""SELECT coalesce(park,'') AS park, COUNT(*) AS count FROM captures
+               WHERE {QUARANTINE_EXCLUDE}
                GROUP BY coalesce(park,'') ORDER BY park"""
         ).fetchall()
     result = dict(totals)
@@ -490,10 +503,11 @@ def stats():
 def stages():
     park = park_param()
     where_sql, park_params = park_where(park)
+    base_where = " AND ".join([QUARANTINE_EXCLUDE] + ([where_sql] if where_sql else []))
     with closing(get_db()) as db:
         rows = db.execute(
             f"""SELECT stage, COUNT(*) AS count FROM captures
-                WHERE coalesce(stage,'')!=''{(' AND ' + where_sql) if where_sql else ''}
+                WHERE coalesce(stage,'')!='' AND {base_where}
                 GROUP BY stage ORDER BY count DESC""",
             park_params,
         ).fetchall()
@@ -654,7 +668,7 @@ def orders():
     search = request.args.get("q", "").strip()
     park = park_param()
     limit = min(1000, positive_int(request.args.get("limit", "200"), 200))
-    where, parameters = ["1=1"], []
+    where, parameters = ["1=1", QUARANTINE_EXCLUDE_C], []
     if date:
         where.append("c.date=?")
         parameters.append(date)
@@ -718,7 +732,8 @@ def order_detail(order_id: str):
     park = park_param()
     with closing(get_db()) as db:
         park_rows = db.execute(
-            """SELECT DISTINCT coalesce(park,'') FROM captures WHERE order_id=?""",
+            """SELECT DISTINCT coalesce(park,'') FROM captures WHERE order_id=?
+               AND """ + QUARANTINE_EXCLUDE,
             (order_id,),
         ).fetchall()
         parks = [row[0] for row in park_rows]
@@ -761,7 +776,8 @@ def search():
     date = request.args.get("date", "").strip()
     park = park_param()
     limit = min(2000, positive_int(request.args.get("limit", "500"), 500))
-    where, parameters = [], []
+    # 隔离园区照片（共用大门去重落败副本）不参与检索
+    where, parameters = [QUARANTINE_EXCLUDE], []
     if plate:
         where.append("(replace(upper(plate_final),' ','') LIKE ? "
                      "OR replace(upper(osd_plate),' ','') LIKE ?)")
@@ -803,15 +819,16 @@ def facets():
     """轻量枚举值：车型、颜色（属性模型产出），供前端下拉框。"""
     park = park_param()
     where_sql, park_params = park_where(park)
-    park_filter = f" AND {where_sql}" if where_sql else ""
+    base_filters = [QUARANTINE_EXCLUDE] + ([where_sql] if where_sql else [])
+    and_filters = " AND ".join(base_filters)
     with closing(get_db()) as db:
         types = [row[0] for row in db.execute(
             f"""SELECT DISTINCT vehicle_type FROM captures
-               WHERE coalesce(vehicle_type,'')!=''{park_filter} ORDER BY vehicle_type""",
+               WHERE coalesce(vehicle_type,'')!='' AND {and_filters} ORDER BY vehicle_type""",
             park_params)]
         colors = [row[0] for row in db.execute(
             f"""SELECT DISTINCT vehicle_color FROM captures
-               WHERE coalesce(vehicle_color,'')!=''{park_filter} ORDER BY vehicle_color""",
+               WHERE coalesce(vehicle_color,'')!='' AND {and_filters} ORDER BY vehicle_color""",
             park_params)]
     return jsonify({"types": types, "colors": colors})
 
@@ -825,7 +842,7 @@ def captures():
     park = park_param()
     limit = min(500, positive_int(request.args.get("limit", "200"), 200))
     offset = positive_int(request.args.get("offset", "0"))
-    where, parameters = ["1=1"], []
+    where, parameters = ["1=1", QUARANTINE_EXCLUDE], []
     if date:
         where.append("date=?")
         parameters.append(date)
@@ -974,7 +991,8 @@ def track():
         elif plate:
             # 支持车牌片段；同时命中识别结果与摄像头OSD参考值。
             # 同牌车可能出现在多个园区（身份独立），可选 park 参数只看一个园区。
-            where = ["coalesce(capture_status,'vehicle')!='no_vehicle'",
+            where = [QUARANTINE_EXCLUDE,
+                     "coalesce(capture_status,'vehicle')!='no_vehicle'",
                      "(replace(upper(plate_final),' ','') LIKE ? "
                      "OR replace(upper(osd_plate),' ','') LIKE ?)"]
             parameters: list[object] = [f"%{plate}%", f"%{plate}%"]
@@ -1540,7 +1558,8 @@ def annotation_queue():
     state = request.args.get("state", "unlabeled").strip()
     park = park_param()
     limit = min(1000, positive_int(request.args.get("limit", "500"), 500))
-    where = ["coalesce(c.capture_status,'vehicle')!='no_vehicle'"]
+    where = ["coalesce(c.capture_status,'vehicle')!='no_vehicle'",
+             QUARANTINE_EXCLUDE_C]
     parameters: list[object] = []
     if date:
         where.append("c.date=?")
@@ -2018,7 +2037,8 @@ def open_parks():
                            coalesce(park,'') || '|' || order_id END) AS order_count,
                       COUNT(DISTINCT vehicle_id) AS vehicle_count,
                       MIN(date) AS first_date, MAX(date) AS last_date
-               FROM captures GROUP BY coalesce(park,'') ORDER BY park"""
+               FROM captures WHERE """ + QUARANTINE_EXCLUDE +
+            """ GROUP BY coalesce(park,'') ORDER BY park"""
         ).fetchall()
     return _open_ok({"items": [dict(row) for row in rows]})
 
@@ -2032,7 +2052,8 @@ def open_dates():
         rows = db.execute(
             f"""SELECT date, COUNT(*) AS capture_count,
                       COUNT(DISTINCT coalesce(park,'') || '|' || order_id) AS order_count
-               FROM captures WHERE date!=''{(' AND ' + park_clause) if park_clause else ''}
+               FROM captures WHERE date!='' AND {QUARANTINE_EXCLUDE}
+               {('AND ' + park_clause) if park_clause else ''}
                GROUP BY date ORDER BY date""",
             park_params,
         ).fetchall()
@@ -2047,6 +2068,7 @@ def open_orders():
     where, parameters, error = open_date_filters("c")
     if error:
         return _open_error(400, error)
+    where.append(QUARANTINE_EXCLUDE_C)
     park_clause, park_params = open_park_filter()
     if park_clause:
         where.append("coalesce(c.park,'')=?")
@@ -2119,7 +2141,8 @@ def open_order_detail(order_id: str):
     park = request.args.get("park", "").strip()
     with closing(get_db()) as db:
         parks = [row[0] for row in db.execute(
-            "SELECT DISTINCT coalesce(park,'') FROM captures WHERE order_id=?",
+            "SELECT DISTINCT coalesce(park,'') FROM captures WHERE order_id=?"
+            " AND " + QUARANTINE_EXCLUDE,
             (order_id,))]
         if not parks:
             return _open_error(404, "订单不存在")
@@ -2227,7 +2250,7 @@ def open_yard():
     park_clause, park_params = open_park_filter()
     active_hours = min(24 * 30, positive_int(request.args.get("active_hours", "24"), 24))
     cutoff = (datetime.now() - timedelta(hours=active_hours)).strftime("%Y-%m-%d %H:%M:%S")
-    where = ["capture_time>=?", PROGRESS_EVENT_WHERE]
+    where = ["capture_time>=?", PROGRESS_EVENT_WHERE, QUARANTINE_EXCLUDE]
     parameters = [cutoff]
     if park_clause:
         where.append(park_clause)
@@ -2267,6 +2290,7 @@ def open_captures():
     where, parameters, error = open_date_filters()
     if error:
         return _open_error(400, error)
+    where.append(QUARANTINE_EXCLUDE)
     order_id = request.args.get("order_id", "").strip()
     if order_id:
         where.append("order_id=?")

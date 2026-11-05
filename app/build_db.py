@@ -29,11 +29,15 @@
   python build_db.py --assign-loose         # 试运行：未关联货车归类到订单
   python build_db.py --assign-loose --apply # 真正移动文件并写库（可 --undo-loose-assign 撤销）
   python build_db.py --undo-loose-assign    # 撤销全部归类；--capture-id 123 只撤销单张
+  python build_db.py --dedup-gate           # 试运行：共用大门跨园区重复照片判重
+  python build_db.py --dedup-gate --apply   # 落败副本移入隔离园区（可 --undo-dedup 撤销）
+  python build_db.py --undo-dedup           # 撤销全部去重；--capture-id 123 只撤销单张
   python build_db.py --root data --park 农易行临泉辉煌库   # 只处理指定园区
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import re
 import shutil
@@ -66,6 +70,25 @@ TIME_RE = re.compile(r"(2[0-3]|[01]?\d)[:：]([0-5]\d)[:：]([0-5]\d)")
 # 订单内的通行顺序：入磅 -> 质检 -> 出磅；抓拍没有固定位置（-1），按时间插入；
 # 人脸抓拍（司机身份）不是车辆图片，排最前并直接标记非车辆。
 STAGE_RANK = {"入磅": 0, "质检": 1, "抓拍": -1, "人脸": -2, "出磅": 2}
+
+# ---- 共用大门跨园区去重 ----
+# 多个园区共用同一大门时，上游 NVR 会把同一张抓拍照片写进每个园区的目录树
+# （文件名一致，新版命名末尾带唯一 id，如 出磅2026年11月5日08：15：59_2346200）。
+# sync_files 的行键 (park, order_id, filename) 含园区，重复照片在每个园区各成
+# 一行。dedup_gate_captures 判重后把落败副本移入"重复抓拍隔离-<原园区>"园区
+# （每个原园区一个隔离园区，保证重扫键唯一、可在文件共享里按园区浏览）。
+# 所有归类/聚类/统计/开放接口环节都必须排除该前缀的园区。
+QUARANTINE_PARK_PREFIX = "重复抓拍隔离"
+QUARANTINE_PARK_LIKE = QUARANTINE_PARK_PREFIX + "%"
+# 本系统移动文件时的防覆盖改名后缀（assign 阶段产生，如 出磅..._reid1.jpg）：
+# 比对文件名身份前先剥离，两个园区的拷贝才能对上。
+_REID_SUFFIX_RE = re.compile(r"_reid\d+$")
+# 新版NVR命名：时间片段之后的末尾唯一id（出磅2026年11月5日08：15：59_2346200 -> 2346200）
+_FILENAME_UID_RE = re.compile(r"_([0-9]+)$")
+# 老命名 <阶段>_<截断uuid>（如 入磅_467f1888-f8a）：无拍摄时间，uuid 作候选键
+# （截断uuid可能撞号，判重必须内容确认）
+_GATE_TOKEN_RE = re.compile(r"^(?:入磅|出磅|抓拍|质检|人脸)[_]?(.+)$")
+_UUID_TOKEN_RE = re.compile(r"[0-9a-fA-F-]{6,}")
 
 
 def to_stored_path(path: Path) -> str:
@@ -998,7 +1021,9 @@ def associate_orders(conn: sqlite3.Connection) -> dict[str, int]:
         """SELECT park, order_id FROM captures
            WHERE coalesce(order_id,'')!='' AND order_id!='未关联图片'
              AND coalesce(capture_status,'vehicle')!='no_vehicle'
-           GROUP BY park, order_id ORDER BY MIN(date), order_id"""
+             AND coalesce(park,'') NOT LIKE ?
+           GROUP BY park, order_id ORDER BY MIN(date), order_id""",
+        (QUARANTINE_PARK_LIKE,),
     ).fetchall()
     for park, order_id in orders:
         next_gid += 1
@@ -1014,7 +1039,9 @@ def associate_orders(conn: sqlite3.Connection) -> dict[str, int]:
     loose = conn.execute(
         """SELECT id, coalesce(park,'') FROM captures WHERE order_id='未关联图片'
            AND reid_embedding IS NOT NULL
-           AND coalesce(capture_status,'vehicle')!='no_vehicle'"""
+           AND coalesce(capture_status,'vehicle')!='no_vehicle'
+           AND coalesce(park,'') NOT LIKE ?""",
+        (QUARANTINE_PARK_LIKE,),
     ).fetchall()
     for cid, park in loose:
         next_gid += 1
@@ -1025,7 +1052,9 @@ def associate_orders(conn: sqlite3.Connection) -> dict[str, int]:
         """SELECT vi.id, vi.lpr_plate, vi.lpr_conf, c.date, c.park,
                   vi.vehicle_color, vi.vehicle_type, vi.reid_embedding
            FROM vehicle_instances vi JOIN captures c ON c.id=vi.capture_id
-           WHERE vi.reid_embedding IS NOT NULL AND coalesce(vi.lpr_plate,'')!=''"""
+           WHERE vi.reid_embedding IS NOT NULL AND coalesce(vi.lpr_plate,'')!=''
+             AND coalesce(c.park,'') NOT LIKE ?""",
+        (QUARANTINE_PARK_LIKE,),
     ).fetchall()
     for iid, lpr_plate, lpr_conf, date, park, color, vtype, blob in inst_rows:
         next_gid += 1
@@ -1448,6 +1477,35 @@ def ensure_loose_assignments_schema(conn: sqlite3.Connection) -> None:
     )
 
 
+def ensure_gate_dedup_log_schema(conn: sqlite3.Connection) -> None:
+    """共用大门去重日志：每行是一次"重复照片 -> 隔离园区"的落败决定。
+
+    多园区共用同一大门时，上游会把同一张抓拍照片写进多个园区目录；判重
+    后赢家留在正确订单、落败副本移入 重复抓拍隔离-<原园区> 园区。记录
+    完整现场支持 --undo-dedup 逐张或全部撤销；capture_id 为主键（同一张
+    图只判一次落败，撤销后可再次参与判重）。
+    """
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS gate_dedup_log (
+             capture_id INTEGER PRIMARY KEY,
+             dup_key TEXT NOT NULL DEFAULT '',
+             confirm TEXT NOT NULL DEFAULT '',
+             from_park TEXT NOT NULL DEFAULT '',
+             from_order TEXT NOT NULL DEFAULT '',
+             from_path TEXT NOT NULL DEFAULT '',
+             filename_old TEXT NOT NULL DEFAULT '',
+             to_park TEXT NOT NULL DEFAULT '',
+             to_path TEXT NOT NULL DEFAULT '',
+             filename_new TEXT NOT NULL DEFAULT '',
+             winner_id INTEGER,
+             winner_park TEXT NOT NULL DEFAULT '',
+             winner_order TEXT NOT NULL DEFAULT '',
+             reason TEXT NOT NULL DEFAULT '',
+             deduped_at TEXT NOT NULL
+           )"""
+    )
+
+
 def _refresh_order_attributes(conn: sqlite3.Connection,
                               keys: set[tuple[str, str]]) -> None:
     """局部刷新订单属性多数投票（与 reid_pipeline.aggregate_order_attributes
@@ -1606,7 +1664,9 @@ def assign_loose_orders(conn: sqlite3.Connection, apply_changes: bool = False,
            WHERE order_id='未关联图片' AND reid_embedding IS NOT NULL
              AND capture_time IS NOT NULL AND capture_time!=''
              AND coalesce(capture_status,'vehicle')!='no_vehicle'
-             AND vehicle_type IS NOT NULL"""
+             AND vehicle_type IS NOT NULL
+             AND coalesce(park,'') NOT LIKE ?""",
+        (QUARANTINE_PARK_LIKE,),
     ).fetchall()
     # --park 过滤：多库共用一个 data 目录时，原始照片可能只保留了部分园区
     # （其余园区只有库记录与裁剪图）——物理移动要求文件存在，只处理照片
@@ -1970,7 +2030,9 @@ def assign_gate_orders(conn: sqlite3.Connection, apply_changes: bool = False,
              AND capture_time IS NOT NULL AND capture_time!=''
              AND reid_embedding IS NOT NULL
              AND coalesce(order_id,'')!='' AND order_id!='未关联图片'
-             AND id NOT IN (SELECT capture_id FROM loose_assignments)"""
+             AND coalesce(park,'') NOT LIKE ?
+             AND id NOT IN (SELECT capture_id FROM loose_assignments)""",
+        (QUARANTINE_PARK_LIKE,),
     ).fetchall()
     if park_filter:
         gate_rows = [r for r in gate_rows if r[1] == park_filter]
@@ -2202,6 +2264,465 @@ def undo_loose_assign(conn: sqlite3.Connection, capture_id: int | None = None) -
     return restored
 
 
+# ---------------------------------------------------------------------------
+# 共用大门跨园区去重：同一张抓拍照片被上游写进多个园区目录后，sync_files 按
+# (park, order_id, filename) 各插一行、互不相识，车辆被多个园区重复计入。
+# 本步骤把大门照片（入磅/出磅）按文件名身份分组判重：
+# - 新版命名（末尾唯一id，如 ...08：15：59_2346200）：id 全等直接判同一事件
+#   （上游保证跨园区文件名一致，不做内容校验——拷贝若被转码，内容校验反而漏真重复）；
+#   id 不同即不同事件（同秒不同车），绝不合并——这正是唯一id的价值；
+# - 旧命名（无id，存量绝大多数）：同 (阶段, 拍摄秒) 或同 uuid 只是"疑似"，
+#   必须文件字节一致（size+MD5）才判同一事件——不同车不可能字节相同，
+#   保证旧数据重跑零误杀；任一文件不在盘上无法确认时跳过不合并。
+# 确认重复的组内按证据仲裁唯一赢家（真实订单 > 车牌锚定 > 行程时间线 >
+# 外观 > 时间就近 > 编号），落败副本移入 重复抓拍隔离-<原园区> 园区，
+# 全部落 gate_dedup_log 日志，--undo-dedup 可撤销。
+# ---------------------------------------------------------------------------
+
+def _file_md5(path: Path) -> str | None:
+    """文件内容 MD5（流式读取）；IO 失败返回 None（按无法确认处理）。"""
+    try:
+        digest = hashlib.md5()
+        with open(path, "rb") as fin:
+            for chunk in iter(lambda: fin.read(1 << 20), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _parse_capture_time(value: str | None) -> datetime | None:
+    """完整时间戳解析；date-only/空/异常一律 None（证据降级，不抛错）。"""
+    if not value or len(value) < 19:
+        return None
+    try:
+        return datetime.strptime(value[:19], "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+
+
+def _normalized_emb(blob) -> np.ndarray | None:
+    if not blob:
+        return None
+    feature = np.frombuffer(blob, np.float32)
+    norm = float(np.linalg.norm(feature))
+    return feature / norm if norm > 0 else None
+
+
+def _dedup_identity(stage: str, filename: str) -> tuple[str, str | None] | None:
+    """解析大门照片文件名的去重身份：返回 (候选组键, 事件id或None)。
+
+    候选组键把"可能是同一事件"的照片聚到一起；事件id 非 None 表示新版
+    NVR 命名末尾带唯一 id（上游保证同一事件跨园区文件名一致），可直接
+    判同一事件。文件名识别不了（无时间片段也非 <阶段>_<uuid> 形态）时
+    返回 None，该照片跳过判重（保守，宁可漏判不可误判）。
+    """
+    stem = _REID_SUFFIX_RE.sub("", Path(filename).stem)
+    time_match = FILENAME_TIME_RE.search(stem)
+    if time_match:
+        # 全角/半角冒号统一，两个园区写法差异不影响分组
+        time_key = time_match.group(0).replace("：", ":")
+        uid_match = _FILENAME_UID_RE.match(stem[time_match.end():])
+        uid = uid_match.group(1) if uid_match else ""
+        candidate = f"{stage}|T|{time_key}"
+        return candidate, (f"{candidate}|{uid}" if uid else None)
+    token_match = _GATE_TOKEN_RE.match(stem)
+    if token_match and _UUID_TOKEN_RE.fullmatch(token_match.group(1)):
+        return f"{stage}|U|{token_match.group(1).lower()}", None
+    return None
+
+
+def _dedup_evidence(item: dict, members_index: dict,
+                    seq_max_seconds: float) -> dict:
+    """候选副本对本订单的"主张强度"证据（口径对齐 assign_gate 的评估）。
+
+    - real_order：归属真实订单（非未关联图片）；
+    - plate_anchor：照片车牌与本订单任一其他成员车牌去省份差 <=1（上游
+      NVR 正是按牌归档的）；
+    - seq_rank：行程时间线，2=顺/1=无从判断/0=逆——出磅照片的订单内应有
+      更早的入磅/质检成员（0~seq_max小时内）；入磅照片的订单内出现更早的
+      出磅成员即为逆（这张入磅必属于下一次进场）。同牌车在两个园区都有
+      合法订单时，这是分辨"这一次过磅属于哪园"的关键证据；
+    - sim / time_diff：对订单其余成员的最大外观相似度与最小时间差。
+    """
+    real_order = bool(item["order_id"]) and item["order_id"] != "未关联图片"
+    ev = {"real_order": real_order, "plate_anchor": False,
+          "seq_rank": 1, "sim": -1.0, "time_diff": None}
+    others = []
+    if real_order:
+        others = [m for m in members_index.get((item["park"], item["order_id"]), [])
+                  if m["cid"] != item["cid"]]
+    if item["plate"] and others:
+        ev["plate_anchor"] = any(
+            m["plate"] and _plate_edit_distance(item["plate"], m["plate"]) <= 1
+            for m in others)
+    dt = item["dt"]
+    if others:
+        dts = [m["dt"] for m in others if m["dt"]]
+        if dts and dt:
+            ev["time_diff"] = min(abs((dt - t).total_seconds()) for t in dts)
+        if item["emb"] is not None:
+            sims = [cosine(item["emb"], m["emb"]) for m in others
+                    if m["emb"] is not None]
+            if sims:
+                ev["sim"] = max(sims)
+    if dt and others:
+        if item["stage"] == "出磅":
+            ok = any(m["dt"] and m["stage"] in ("入磅", "质检")
+                     and 0 <= (dt - m["dt"]).total_seconds() <= seq_max_seconds
+                     for m in others)
+            ev["seq_rank"] = 2 if ok else 0
+        elif item["stage"] == "入磅":
+            bad = any(m["dt"] and m["stage"] == "出磅" and m["dt"] < dt
+                      for m in others)
+            ev["seq_rank"] = 0 if bad else 2
+    return ev
+
+
+def _evidence_note(ev: dict) -> str:
+    notes = []
+    if ev["plate_anchor"]:
+        notes.append("车牌锚定")
+    if ev["seq_rank"] == 2:
+        notes.append("行程顺")
+    elif ev["seq_rank"] == 0:
+        notes.append("行程逆")
+    if ev["sim"] > 0:
+        notes.append(f"外观{ev['sim']:.2f}")
+    if ev["time_diff"] is not None:
+        notes.append(f"时间差{int(ev['time_diff']) // 60}分钟")
+    return "/".join(notes) or "证据持平"
+
+
+def _dedup_better(a: tuple, b: tuple, sim_margin: float,
+                  time_margin: float) -> bool:
+    """仲裁比较：候选 a 是否比 b 更可能是"正确订单"的那一份。
+
+    证据阶梯逐级裁决；外观/时间差距在噪声带内（margin）不作为决胜依据，
+    最终回退到确定性键（证据值+编号），保证强制选边且结果可复现。
+    """
+    ea, eb = a[1], b[1]
+    if ea["real_order"] != eb["real_order"]:
+        return ea["real_order"]
+    if ea["plate_anchor"] != eb["plate_anchor"]:
+        return ea["plate_anchor"]
+    if ea["seq_rank"] != eb["seq_rank"]:
+        return ea["seq_rank"] > eb["seq_rank"]
+    if abs(ea["sim"] - eb["sim"]) >= sim_margin:
+        return ea["sim"] > eb["sim"]
+    ta, tb = ea["time_diff"], eb["time_diff"]
+    if ta is not None and tb is not None and abs(ta - tb) >= time_margin:
+        return ta < tb
+    ka = (0 if ea["real_order"] else 1, 0 if ea["plate_anchor"] else 1,
+          -ea["seq_rank"], -ea["sim"],
+          ta if ta is not None else float("inf"), a[0]["cid"])
+    kb = (0 if eb["real_order"] else 1, 0 if eb["plate_anchor"] else 1,
+          -eb["seq_rank"], -eb["sim"],
+          tb if tb is not None else float("inf"), b[0]["cid"])
+    return ka < kb
+
+
+def _quarantine_dir(root: Path, park: str, order_id: str, date_str: str) -> Path:
+    """落败副本的隔离目录（绝对路径）：
+    <照片根>/重复抓拍隔离-<原园区>/<月份根>/<M月D日>/<订单号>。
+
+    必须与 sync_files 的扫描结构一致（园区 -> 月份根 -> 日期 -> 订单，
+    月份根名内嵌年份供 parse_folder_date 取年），全盘重扫才能按
+    (隔离园区, order_id, filename) 命中已改归属的行，幂等不复活。目录
+    建在扫描根下（与 --root 一致，默认项目 data/），每个原园区一个隔离
+    园区，隔离区内订单号不撞号、原归属一目了然。
+    """
+    park_dir = root / f"{QUARANTINE_PARK_PREFIX}-{park}"
+    if date_str and len(date_str) >= 10:
+        try:
+            y, m, d = (int(part) for part in date_str[:10].split("-"))
+        except ValueError:
+            y = m = d = 0
+        if y and m and d:
+            return park_dir / f"{y}年{m}月份抓拍照片" / f"{m}月{d}日" / \
+                (order_id or "未关联图片")
+    return park_dir / "未标日期" / (order_id or "未关联图片")
+
+
+def dedup_gate_captures(conn: sqlite3.Connection, apply_changes: bool = False,
+                        sim_margin: float = 0.03,
+                        time_margin: float = 300.0,
+                        seq_max_hours: float = 12.0,
+                        root: Path = DEFAULT_ROOT) -> dict:
+    """共用大门照片跨园区去重（默认试运行，--apply 落盘）。
+
+    每个确认重复的组仲裁出唯一赢家留在其现属订单，落败副本移入扫描根下
+    的 重复抓拍隔离-<原园区> 园区（文件不在盘上的仅库内改 park）。整组都
+    挂在"未关联图片"时没有"正确订单"可归属，保留两边并计入待人工组数
+    （唯一不强制选边的情形）。阈值可环境变量覆盖：GATE_DEDUP_SIM_MARGIN、
+    GATE_DEDUP_TIME_MARGIN、GATE_DEDUP_SEQ_MAX_HOURS。
+    """
+    ensure_gate_dedup_log_schema(conn)
+    sim_margin = float(os.environ.get("GATE_DEDUP_SIM_MARGIN", sim_margin))
+    time_margin = float(os.environ.get("GATE_DEDUP_TIME_MARGIN", time_margin))
+    seq_max_seconds = float(os.environ.get(
+        "GATE_DEDUP_SEQ_MAX_HOURS", seq_max_hours)) * 3600
+
+    rows = conn.execute(
+        """SELECT id, coalesce(park,''), order_id, date, capture_time, plate_final,
+                  reid_embedding, vehicle_type, filepath, filename, stage
+           FROM captures
+           WHERE stage IN ('入磅','出磅')
+             AND coalesce(capture_status,'vehicle')!='no_vehicle'
+             AND coalesce(park,'') NOT LIKE ?
+             AND filename IS NOT NULL AND filename!=''
+             AND id NOT IN (SELECT capture_id FROM gate_dedup_log)""",
+        (QUARANTINE_PARK_LIKE,),
+    ).fetchall()
+
+    # 证据索引：订单成员（含阶段，供行程时间线判定）；隔离区订单不参与，
+    # 落败副本也不该成为任何一方的证据。
+    members_index: dict[tuple[str, str], list[dict]] = {}
+    for mid, mpark, morder, mtime, mplate, mblob, mvtype, mstage in conn.execute(
+        """SELECT id, coalesce(park,''), order_id, capture_time, plate_final,
+                  reid_embedding, vehicle_type, stage
+           FROM captures
+           WHERE coalesce(order_id,'')!='' AND order_id!='未关联图片'
+             AND coalesce(capture_status,'vehicle')!='no_vehicle'
+             AND coalesce(park,'') NOT LIKE ?""",
+        (QUARANTINE_PARK_LIKE,),
+    ):
+        members_index.setdefault((mpark, morder), []).append(
+            {"cid": mid, "dt": _parse_capture_time(mtime), "plate": mplate or "",
+             "emb": _normalized_emb(mblob), "vtype": mvtype or "",
+             "stage": mstage or ""})
+
+    # ---- 按候选组键分组 ----
+    candidates: dict[str, list[dict]] = defaultdict(list)
+    unparseable = 0
+    for row in rows:
+        identity = _dedup_identity(row[10], row[8])
+        if identity is None:
+            unparseable += 1
+            continue
+        candidate_key, event_id = identity
+        candidates[candidate_key].append(
+            {"cid": row[0], "park": row[1], "order_id": row[2], "date": row[3],
+             "capture_time": row[4], "plate": row[5] or "", "blob": row[6],
+             "vtype": row[7], "filepath": row[8], "filename": row[9],
+             "stage": row[10], "event_id": event_id, "md5": None, "dt": None,
+             "emb": None})
+
+    def _ensure_md5(item: dict) -> None:
+        if item["md5"] is not None:
+            return
+        source = project_file(item["filepath"])
+        if not source.is_file():
+            source = resolve_stored_path(item["filepath"])
+        item["md5"] = _file_md5(source) if source.is_file() else None
+
+    def _cluster(items: list[dict]) -> list[list[dict]]:
+        """候选组内切事件簇：唯一id一致直接并；否则字节一致才并；
+        双方都有唯一id但不一致时绝不并（id 优先于内容）。"""
+        n = len(items)
+        parent = list(range(n))
+
+        def find(i: int) -> int:
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                ui, uj = items[i]["event_id"], items[j]["event_id"]
+                if ui and uj:
+                    same = ui == uj
+                else:
+                    _ensure_md5(items[i])
+                    _ensure_md5(items[j])
+                    mi, mj = items[i]["md5"], items[j]["md5"]
+                    same = bool(mi and mj and mi == mj)
+                if same:
+                    ri, rj = find(i), find(j)
+                    if ri != rj:
+                        parent[max(ri, rj)] = min(ri, rj)
+        clusters: dict[int, list[dict]] = defaultdict(list)
+        for i in range(n):
+            clusters[find(i)].append(items[i])
+        return [c for c in clusters.values() if len(c) >= 2]
+
+    dup_groups = needs_review = skip_md5_mismatch = skip_no_file = 0
+    plan: list[tuple[dict, dict, str, str, str]] = []  # (落败副本, 赢家, confirm, 理由, 组键)
+    for candidate_key in sorted(candidates):
+        items = candidates[candidate_key]
+        if len(items) < 2:
+            continue
+        clusters = _cluster(items)
+        if not clusters:
+            if any(not it["event_id"] for it in items):
+                if any(it["md5"] is None for it in items):
+                    skip_no_file += 1
+                else:
+                    skip_md5_mismatch += 1
+            continue
+        for cluster in clusters:
+            dup_groups += 1
+            scored = []
+            for item in cluster:
+                item["dt"] = _parse_capture_time(item["capture_time"])
+                item["emb"] = _normalized_emb(item["blob"])
+                scored.append((item, _dedup_evidence(item, members_index,
+                                                     seq_max_seconds)))
+            if not any(ev["real_order"] for _, ev in scored):
+                needs_review += 1  # 全是未关联图片：无"正确订单"可归属，保留两边
+                continue
+            scored.sort(key=lambda pair: pair[0]["cid"])
+            winner = scored[0]
+            for pair in scored[1:]:
+                if _dedup_better(pair, winner, sim_margin, time_margin):
+                    winner = pair
+            for loser, _ev in scored:
+                if loser is winner[0]:
+                    continue
+                if loser["event_id"] and loser["event_id"] == winner[0]["event_id"]:
+                    confirm = "filename_id"
+                else:
+                    confirm = "content_md5"
+                reason = (f"共用大门重复照片：与 #{winner[0]['cid']}"
+                          f"（{winner[0]['park']}/订单{winner[0]['order_id'] or '未关联'}）"
+                          f"为同一事件（{'文件名唯一id一致' if confirm == 'filename_id' else '文件内容MD5一致'}），"
+                          f"本单证据[{_evidence_note(_ev)}]弱于对方[{_evidence_note(winner[1])}]")
+                plan.append((loser, winner[0], confirm, reason, candidate_key))
+
+    moved = failed = db_only_moves = 0
+    touched_orders: set[tuple[str, str]] = set()
+    now = datetime.now().isoformat(timespec="seconds")
+    if apply_changes:
+        conn.isolation_level = None
+        for loser, winner_item, confirm, reason, dup_key in plan:
+            to_park = f"{QUARANTINE_PARK_PREFIX}-{loser['park']}"
+            target_dir_abs = _quarantine_dir(root, loser["park"], loser["order_id"],
+                                             loser["date"])
+            source_abs = project_file(loser["filepath"])
+            if not source_abs.is_file():
+                source_abs = resolve_stored_path(loser["filepath"])
+            db_only = not source_abs.is_file()
+            new_fp, new_fn = loser["filepath"], loser["filename"]
+            if not db_only:
+                target_abs = target_dir_abs / loser["filename"]
+                final_name = loser["filename"]
+                try:
+                    target_dir_abs.mkdir(parents=True, exist_ok=True)
+                    if target_abs.exists():  # 理论不可达（同键早被 sync 合并），兜底防覆盖
+                        stem, suffix = target_abs.stem, target_abs.suffix
+                        k = 1
+                        while target_abs.with_name(f"{stem}_dedup{k}{suffix}").exists():
+                            k += 1
+                        final_name = f"{stem}_dedup{k}{suffix}"
+                        target_abs = target_abs.with_name(final_name)
+                    if source_abs.resolve() != target_abs.resolve():
+                        shutil.move(str(source_abs), str(target_abs))
+                    new_fp, new_fn = to_stored_path(target_abs), final_name
+                except OSError as exc:
+                    failed += 1
+                    print(f"  隔离失败 #{loser['cid']}: {exc}")
+                    continue
+            else:
+                db_only_moves += 1
+                reason += "（原图不在盘，仅库内改园区）"
+            conn.execute(
+                """UPDATE captures SET park=?, filepath=?, filename=?, vehicle_id=NULL
+                   WHERE id=?""",
+                (to_park, new_fp, new_fn, loser["cid"]),
+            )
+            conn.execute(
+                """INSERT OR REPLACE INTO gate_dedup_log
+                     (capture_id, dup_key, confirm, from_park, from_order,
+                      from_path, filename_old, to_park, to_path, filename_new,
+                      winner_id, winner_park, winner_order, reason, deduped_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (loser["cid"], dup_key, confirm, loser["park"], loser["order_id"],
+                 loser["filepath"], loser["filename"], to_park, new_fp, new_fn,
+                 winner_item["cid"], winner_item["park"], winner_item["order_id"],
+                 reason, now),
+            )
+            if loser["order_id"] and loser["order_id"] != "未关联图片":
+                touched_orders.add((loser["park"], loser["order_id"]))
+            moved += 1
+            print(f"  隔离 #{loser['cid']} {loser['park']}/订单{loser['order_id'] or '未关联'} "
+                  f"-> {to_park}（赢家 #{winner_item['cid']}）")
+        if touched_orders:
+            _refresh_order_attributes(conn, touched_orders)
+        conn.commit()
+    else:
+        for loser, winner_item, confirm, reason, _key in plan[:50]:
+            print(f"  试运行 #{loser['cid']} {loser['park']}/订单{loser['order_id'] or '未关联'} "
+                  f"-> 隔离（赢家 #{winner_item['cid']} "
+                  f"{winner_item['park']}，{confirm}）")
+        if len(plan) > 50:
+            print(f"  …（其余 {len(plan) - 50} 条略）")
+
+    result = {
+        "gate_captures": len(rows), "duplicates": len(plan),
+        "dup_groups": dup_groups, "moved": moved, "db_only": db_only_moves,
+        "failed": failed, "needs_review_groups": needs_review,
+        "skipped_md5_mismatch": skip_md5_mismatch,
+        "skipped_no_file": skip_no_file, "unparseable": unparseable,
+    }
+    mode = "已隔离" if apply_changes else "试运行（加 --apply 落盘）"
+    stat = (f"隔离{moved}张（其中仅库内改园区{db_only_moves}张），失败{failed}张"
+            if apply_changes else f"计划隔离{len(plan)}张")
+    print(f"共用大门照片去重{mode}：入磅/出磅 {len(rows)}张，确认重复组{dup_groups}个，"
+          f"{stat}；全未关联待人工{needs_review}组，内容不一致跳过{skip_md5_mismatch}组，"
+          f"文件不在盘跳过{skip_no_file}组，文件名不可解析{unparseable}张")
+    return result
+
+
+def undo_gate_dedup(conn: sqlite3.Connection, capture_id: int | None = None) -> int:
+    """撤销共用大门去重：按 gate_dedup_log 把文件移回原园区并还原字段。
+
+    capture_id=None 撤销全部。恢复后建议重跑 associate_orders 重聚车辆。
+    """
+    ensure_gate_dedup_log_schema(conn)
+    rows = conn.execute(
+        """SELECT capture_id, from_park, from_path, filename_old,
+                  to_path, filename_new
+           FROM gate_dedup_log""" + (" WHERE capture_id=?" if capture_id else ""),
+        (capture_id,) if capture_id else (),
+    ).fetchall()
+    conn.isolation_level = None
+    restored = failed = 0
+    for row in rows:
+        cid, from_park, from_path, filename_old, to_path, filename_new = row
+        current = conn.execute(
+            "SELECT filepath, filename FROM captures WHERE id=?", (cid,)).fetchone()
+        if not current:
+            continue
+        source = None
+        for stored in (current[0], to_path):
+            candidate = project_file(stored)
+            if candidate.is_file():
+                source = candidate
+                break
+        old_dir = project_file(Path(from_path).parent)
+        target_old = old_dir / (filename_old or current[1])
+        try:
+            old_dir.mkdir(parents=True, exist_ok=True)
+            if source and source.resolve() != target_old.resolve():
+                shutil.move(str(source), str(target_old))
+        except OSError as exc:
+            failed += 1
+            print(f"  撤销失败 #{cid}: {exc}")
+            continue
+        conn.execute(
+            """UPDATE captures SET park=?, filepath=?, filename=?, vehicle_id=NULL
+               WHERE id=?""",
+            (from_park, from_path, filename_old or current[1], cid),
+        )
+        conn.execute("DELETE FROM gate_dedup_log WHERE capture_id=?", (cid,))
+        restored += 1
+    conn.commit()
+    print(f"撤销大门去重：恢复{restored}张，失败{failed}张"
+          + ("，建议重跑 associate_orders 重聚车辆" if restored else ""))
+    return restored
+
+
 def print_stats(conn: sqlite3.Connection) -> None:
     total = conn.execute("SELECT COUNT(*) FROM captures").fetchone()[0]
     orders = conn.execute(
@@ -2254,9 +2775,15 @@ def main() -> None:
                              "加 --apply 落盘；订单时间锚包含大门照片，夹在两个"
                              "订单之间时归时间更近的一单）")
     parser.add_argument("--apply", action="store_true",
-                        help="与 --assign-loose 联用：真正移动文件并写库")
+                        help="与 --assign-loose / --assign-gate / --dedup-gate 联用："
+                             "真正移动文件并写库")
     parser.add_argument("--undo-loose-assign", action="store_true",
                         help="撤销未关联归类（全部，或配合 --capture-id 撤销单张）")
+    parser.add_argument("--dedup-gate", action="store_true",
+                        help="共用大门跨园区重复照片判重（默认试运行，加 --apply 落盘；"
+                             "落败副本移入 重复抓拍隔离-<原园区> 园区）")
+    parser.add_argument("--undo-dedup", action="store_true",
+                        help="撤销大门照片去重（全部，或配合 --capture-id 撤销单张）")
     parser.add_argument("--capture-id", type=int, default=0,
                         help="--undo-loose-assign 的单张撤销目标")
     parser.add_argument("--loose-types", default="truck",
@@ -2272,7 +2799,8 @@ def main() -> None:
 
     conn = sqlite3.connect(args.db)
     ensure_schema(conn)
-    standalone = args.assign_loose or args.assign_gate or args.undo_loose_assign
+    standalone = (args.assign_loose or args.assign_gate or args.undo_loose_assign
+                  or args.dedup_gate or args.undo_dedup)
     # 默认流程始终全盘同步：每日流水线靠它发现新园区/新照片（库非空也必须
     # 扫描，否则新数据永远进不了库——金冠库上线时踩过这个坑）。sync_files
     # 对已有文件只做路径刷新，不会重复入库。
@@ -2303,6 +2831,10 @@ def main() -> None:
             window_seconds=args.loose_window_min * 60,
             sim_threshold=args.loose_sim, sim_margin=args.loose_margin,
             park_filter=args.park)
+    elif args.dedup_gate:
+        dedup_gate_captures(conn, apply_changes=args.apply, root=args.root)
+    elif args.undo_dedup:
+        undo_gate_dedup(conn, args.capture_id or None)
     elif not args.sync_only:
         print(f"订单内车辆聚合：{associate_orders(conn)}")
     if not standalone:

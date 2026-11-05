@@ -285,7 +285,9 @@ def aggregate_order_attributes(db: sqlite3.Connection) -> int:
                   vehicle_type, vehicle_type_conf
            FROM captures
            WHERE coalesce(order_id,'')!='' AND coalesce(capture_status,'vehicle')!='no_vehicle'
-             AND (coalesce(vehicle_color,'')!='' OR coalesce(vehicle_type,'')!='')"""
+             AND (coalesce(vehicle_color,'')!='' OR coalesce(vehicle_type,'')!='')
+             AND coalesce(park,'') NOT LIKE ?""",
+        (build_db.QUARANTINE_PARK_LIKE,),
     ).fetchall()
     by_order: dict[tuple[str, str], list[tuple]] = {}
     for row in rows:
@@ -350,17 +352,19 @@ def detect_pass(
     # 断点续跑：有 instance 记录的图片视为已处理（每车一条记录）；
     # 已被属性复核拆出/标记的帧也不再被检测重跑覆盖（复核结论优先）；
     # 人工框选修正过的帧永不重检（manual_box_edits，force 重跑也不覆盖）。
+    # 隔离园区（共用大门去重落败副本）不再消耗 GPU。
     where = ("coalesce(capture_status,'vehicle')!='no_vehicle' "
              "AND (status_reason IS NULL OR status_reason NOT LIKE '%与订单主车不符%') "
              "AND id NOT IN (SELECT DISTINCT capture_id FROM vehicle_instances) "
-             "AND id NOT IN (SELECT capture_id FROM manual_box_edits)")
+             "AND id NOT IN (SELECT capture_id FROM manual_box_edits) "
+             "AND coalesce(park,'') NOT LIKE ?")
     if not force:
         # 已有裁剪图的帧是早期版本的检测产物，不可能再产生实例记录；
         # 不排除会永久挂起在待处理队列里（每轮 GPU 都被重选又跳过）。
         where += " AND vehicle_crop_path IS NULL"
     sql = (f"SELECT id, filepath FROM captures WHERE {where} "
            "ORDER BY date, order_id, stage_rank, filename")
-    params: tuple[Any, ...] = ()
+    params: tuple[Any, ...] = (build_db.QUARANTINE_PARK_LIKE,)
     if limit:
         sql += " LIMIT ?"
         params = (limit,)
@@ -511,14 +515,15 @@ def attr_pass(
     db = sqlite3.connect(db_path, timeout=60)
     db.isolation_level = None
     db.row_factory = sqlite3.Row
-    where = "vehicle_crop_path IS NOT NULL"
+    where = ("vehicle_crop_path IS NOT NULL "
+             "AND coalesce(park,'') NOT LIKE :qpark")
     if not force:
         where += " AND attr_model_version IS NULL"
     sql = f"SELECT id, vehicle_crop_path FROM captures WHERE {where} ORDER BY id"
-    params: tuple[Any, ...] = ()
+    params: dict[str, Any] = {"qpark": build_db.QUARANTINE_PARK_LIKE}
     if limit:
-        sql += " LIMIT ?"
-        params = (limit,)
+        sql += " LIMIT :limit"
+        params["limit"] = limit
     rows = db.execute(sql, params).fetchall()
     processed = skipped = 0
     print(f"[attr] 开始处理 {len(rows)} 张裁剪：车辆属性（颜色/车型+置信度）。", flush=True)
@@ -649,12 +654,13 @@ def plate_pass(
         # 标记，否则这些行永远满足 lpr_plate IS NULL，GPU 流水线每轮重复
         # 识别上万张无牌图（服务器实测每 30 分钟空转一轮的根源）。
         where += " AND lpr_attempted_at IS NULL"
+    where += " AND coalesce(park,'') NOT LIKE :qpark"
     sql = (f"SELECT id, vehicle_crop_path, coalesce(osd_plate,'') AS osd "
            f"FROM captures WHERE {where} ORDER BY id")
-    params: tuple[Any, ...] = ()
+    params: dict[str, Any] = {"qpark": build_db.QUARANTINE_PARK_LIKE}
     if limit:
-        sql += " LIMIT ?"
-        params = (limit,)
+        sql += " LIMIT :limit"
+        params["limit"] = limit
     rows = db.execute(sql, params).fetchall()
     processed = skipped = 0
     print(f"[plate] 开始处理 {len(rows)} 张裁剪：PP-OCR 车牌检测+识别。", flush=True)
@@ -776,7 +782,9 @@ def correct_pass(
     order_group: dict[tuple[str, str], int] = {}
     for park, oid, vid in db.execute(
         """SELECT DISTINCT coalesce(park,'') AS park, order_id, vehicle_id FROM captures
-           WHERE vehicle_id IS NOT NULL AND coalesce(order_id,'')!=''"""
+           WHERE vehicle_id IS NOT NULL AND coalesce(order_id,'')!=''
+             AND coalesce(park,'') NOT LIKE ?""",
+        (build_db.QUARANTINE_PARK_LIKE,),
     ):
         order_group.setdefault((park, oid), vid)
     suspicious = []
@@ -787,8 +795,10 @@ def correct_pass(
            WHERE vehicle_crop_path IS NOT NULL
              AND coalesce(capture_status,'vehicle')!='no_vehicle'
              AND coalesce(order_id,'')!='' AND order_id!='未关联图片'
+             AND coalesce(park,'') NOT LIKE ?
              AND id NOT IN (SELECT capture_id FROM manual_box_edits)
-           ORDER BY id"""
+           ORDER BY id""",
+        (build_db.QUARANTINE_PARK_LIKE,),
     ).fetchall():
         vid = order_group.get((row["park"], row["order_id"]))
         consensus = consensuses.get(vid) if vid else None
@@ -974,10 +984,11 @@ def embed_pass(
     db.isolation_level = None
     db.row_factory = sqlite3.Row
     where = ("coalesce(capture_status,'vehicle')!='no_vehicle' "
-             "AND vehicle_crop_path IS NOT NULL")
+             "AND vehicle_crop_path IS NOT NULL "
+             "AND coalesce(park,'') NOT LIKE ?")
     where += " AND reid_embedding IS NULL" if not force else ""
     sql = f"SELECT id, vehicle_crop_path FROM captures WHERE {where} ORDER BY id"
-    params: tuple[Any, ...] = ()
+    params: tuple[Any, ...] = (build_db.QUARANTINE_PARK_LIKE,)
     if limit:
         sql += " LIMIT ?"
         params = (limit,)
@@ -1012,7 +1023,11 @@ def embed_pass(
     # ---- 同帧其他车辆实例的特征（每车一条记录）----
     inst_rows = db.execute(
         """SELECT id, crop_path FROM vehicle_instances
-           WHERE reid_embedding IS NULL ORDER BY id"""
+           WHERE reid_embedding IS NULL
+             AND capture_id NOT IN (SELECT id FROM captures
+                                    WHERE coalesce(park,'') LIKE ?)
+           ORDER BY id""",
+        (build_db.QUARANTINE_PARK_LIKE,),
     ).fetchall()
     inst_processed = 0
     if inst_rows:

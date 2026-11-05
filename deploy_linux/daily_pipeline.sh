@@ -88,6 +88,14 @@ fi
 if ! $PY app/build_db.py --db app/granary.db --assign-gate --apply; then
     log "警告：大门照片重归类失败（不阻断状态记录）"
 fi
+# 共用大门跨园区去重：多园区共用同一大门时，上游会把同一张抓拍照片写进
+# 每个园区目录（文件名一致），车辆被重复计入。判重后落败副本移入
+# 重复抓拍隔离-<原园区> 园区，全部写 gate_dedup_log 日志，可 --undo-dedup
+# 撤销。放在重归类之后（仲裁要看最终订单归属）、车辆重聚之前（重聚看到
+# 干净数据）。
+if ! $PY app/build_db.py --db app/granary.db --dedup-gate --apply; then
+    log "警告：共用大门照片去重失败（不阻断状态记录）"
+fi
 # 车辆重聚放最后：让重聚类看到归类后的最新订单归属
 if ! $PY app/build_db.py --db app/granary.db --associate-only; then
     log "警告：车辆重聚失败（不阻断状态记录）"
