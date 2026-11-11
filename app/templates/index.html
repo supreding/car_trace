@@ -798,6 +798,8 @@
     /* ---------------- 主区时间线 ---------------- */
     function tlRow(x) {
       const badges = [
+        // 拍摄时刻的车辆进度状态（按本单截至该张照片的事件推导），排最前
+        x.progress_status ? `<span class="badge ${statusColor[x.progress_status] || ""}" title="拍摄这张照片时车辆所处的进度状态">${esc(x.progress_status)}</span>` : "",
         x.stage ? `<span class="badge ${stageColor[x.stage] || ""}">${esc(x.stage)}</span>` : "",
         x.capture_status === "no_vehicle" ? '<span class="badge red">未检测到车辆</span>' : "",
         x.detection_count > 1 ? `<span class="badge amber">多目标 ${x.detection_count}</span>` : "",
@@ -1230,8 +1232,7 @@
         const suspect = items.filter(x => x.suspect);
         const normal = items.filter(x => !x.suspect);
         const parkLabel = data.park || items[0]?.park || "";
-        const stBadge = statusBadge(data.progress_status, data.last_event_time, data.last_stage);
-        mainHead(`订单 ${esc(oid)} ${stBadge}`,
+        mainHead(`订单 ${esc(oid)}`,
           `${items.length} 张 · 车牌 ${esc(data.plate || "—")} · 发生时间 ${esc(data.order_time || "—")} · 跨 ${new Set(items.map(i => i.date)).size} 个日期文件夹${data.progress_status ? ` · 最后事件 ${esc(data.last_event_time || "—")}（${esc(data.last_stage || "—")}）` : ""}${multiPark ? ` · ${esc(parkLabel || "未标注园区")}` : ""}${suspect.length ? ` · 可疑 ${suspect.length}` : ""}`, data.attributes);
         let html = normal.length ? normal.map(tlRow).join("") : '<div class="empty">没有抓拍</div>';
         if (suspect.length) html += suspectGroupHTML(suspect, data.plate, "suspect-order");

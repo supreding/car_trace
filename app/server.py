@@ -561,8 +561,9 @@ def order_summary(db: sqlite3.Connection, order_id: str, park: str) -> dict:
 # 即卸货时段。现场没有卸货区/出磅队列的独立信号，故不区分"等待出磅"。
 #
 # 六个状态：
-#   大门进   只有入磅前的事件（抓拍/质检），最后事件距今 ≤ GATE_IN（刚过大门）
-#   等待入磅 同上但超过 GATE_IN（在场上排队/待检；大门照片缺失时也从此态起步）
+#   大门进   只有入磅前的事件（抓拍/质检），首个事件距今 ≤ GATE_IN（刚过大门）
+#   等待入磅 同上但超过 GATE_IN（在场上排队/待检；进园锚点取首个事件，中途的
+#            场院抓拍不重置，避免排队一动就变回"大门进"）
 #   入磅中   最后事件为入磅，距今 ≤ WEIGH（称重进行中）
 #   卸货     已入磅未出磅（超过 WEIGH 后的整个在卸时段；出磅照片缺失会停在此态）
 #   出磅中   最后事件为出磅、其后无抓拍，距今 ≤ EXIT_ASSUME（称重完至确认离场）
@@ -599,6 +600,28 @@ PROGRESS_EVENT_WHERE = ("capture_time!='' AND coalesce(capture_status,'vehicle')
                         "AND order_id!='' AND order_id!='未关联图片'")
 
 
+def _progress_state_at(weigh_t, out_t, snap_t, gate_t, now):
+    """按已发生的累计事件时间，判定时刻 now 车辆所处的进度状态。
+
+    weigh_t/out_t/snap_t 是至今最新的入磅/出磅/抓拍时间，gate_t 是首个有效
+    事件（进园锚点，大门进/等待入磅从它起算，后续场院抓拍不重置）；全部应
+    <= now。无任何事件返回空串（无徽章）。
+    """
+    if weigh_t and (not out_t or weigh_t > out_t):
+        # 最新一次过磅是入磅（出磅后复检入磅也算回此分支）
+        return (PROGRESS_WEIGHING if now - weigh_t <= timedelta(minutes=PROGRESS_WEIGH_MIN)
+                else PROGRESS_UNLOADING)
+    if out_t:
+        if snap_t and snap_t > out_t:
+            return PROGRESS_GATE_OUT
+        return (PROGRESS_WEIGHOUT if now - out_t <= timedelta(minutes=PROGRESS_EXIT_ASSUME_MIN)
+                else PROGRESS_GATE_OUT)
+    if gate_t:
+        return (PROGRESS_GATE_IN if now - gate_t <= timedelta(minutes=PROGRESS_GATE_IN_MIN)
+                else PROGRESS_WAIT_WEIGH)
+    return ""
+
+
 def compute_progress_status(events, now=None):
     """events: [(capture_time, stage)]（已按上面的条件过滤）；返回状态三字段。
 
@@ -613,28 +636,64 @@ def compute_progress_status(events, now=None):
     if not parsed:
         return {"progress_status": "", "last_stage": "", "last_event_time": ""}
     now = now or datetime.now()
+    weigh_t = max((t for t, s in parsed if s == "入磅"), default=None)
+    out_t = max((t for t, s in parsed if s == "出磅"), default=None)
+    snap_t = max((t for t, s in parsed if s == "抓拍"), default=None)
+    gate_t = min(parsed)[0]
     last_time, last_stage = max(parsed, key=lambda pair: pair[0])
-    weigh_times = [t for t, s in parsed if s == "入磅"]
-    out_times = [t for t, s in parsed if s == "出磅"]
-    snap_times = [t for t, s in parsed if s == "抓拍"]
-    if weigh_times and (not out_times or max(weigh_times) > max(out_times)):
-        # 最新一次过磅是入磅（出磅后的复检入磅也算回此分支）
-        t = max(weigh_times)
-        status = (PROGRESS_WEIGHING if now - t <= timedelta(minutes=PROGRESS_WEIGH_MIN)
-                  else PROGRESS_UNLOADING)
-    elif out_times:
-        t = max(out_times)
-        if snap_times and max(snap_times) > t:
-            last_time, last_stage = max(snap_times), "抓拍"
-            status = PROGRESS_GATE_OUT
-        else:
-            status = (PROGRESS_WEIGHOUT if now - t <= timedelta(minutes=PROGRESS_EXIT_ASSUME_MIN)
-                      else PROGRESS_GATE_OUT)
-    else:
-        status = (PROGRESS_GATE_IN if now - last_time <= timedelta(minutes=PROGRESS_GATE_IN_MIN)
-                  else PROGRESS_WAIT_WEIGH)
-    return {"progress_status": status, "last_stage": last_stage,
+    if out_t and snap_t and snap_t > out_t:
+        last_time, last_stage = snap_t, "抓拍"
+    return {"progress_status": _progress_state_at(weigh_t, out_t, snap_t, gate_t, now),
+            "last_stage": last_stage,
             "last_event_time": last_time.strftime("%Y-%m-%d %H:%M:%S")}
+
+
+def compute_capture_statuses(captures):
+    """给同一订单的一组抓拍逐张标注拍摄时刻的进度状态。
+
+    推导规则与 compute_progress_status 同口径，只是判定时刻换成"该张照片的
+    拍摄时间"：入磅照片本身标"入磅中"，出磅照片标"出磅中"，出磅后的抓拍标
+    "大门出"；入磅前的抓拍/质检只记位置不刷新进园锚点（否则排队每动一下都
+    变回"大门进"）。no_vehicle、无时间、时间无法解析的照片不产生事件，但仍
+    按此前事件标状态（此前无事件则标空串）。返回与 captures 等长的状态列表。
+    """
+    states = [""] * len(captures)
+    order = sorted(
+        range(len(captures)),
+        key=lambda i: ((captures[i].get("capture_time") or ""),
+                       captures[i].get("id") or 0))
+    weigh_t = out_t = snap_t = gate_t = None
+    for i in order:
+        capture = captures[i]
+        try:
+            t = datetime.strptime(capture.get("capture_time") or "", "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+        stage = capture.get("stage") or ""
+        if (capture.get("capture_status") or "") != "no_vehicle":
+            if stage == "入磅":
+                weigh_t = t          # 先入账再判定：本张即"上磅"时刻
+            elif stage == "出磅":
+                out_t = t
+            elif stage == "抓拍":
+                snap_t = t
+            if gate_t is None:
+                gate_t = t           # 首个有效事件 = 进园锚点
+        states[i] = _progress_state_at(weigh_t, out_t, snap_t, gate_t, t)
+    return states
+
+
+def attach_capture_statuses(items):
+    """按 (park, order_id) 分组为每组抓拍附上 progress_status 字段（就地修改）。"""
+    groups = {}
+    for item in items:
+        key = (item.get("park") or "", item.get("order_id") or "")
+        if key[1]:
+            groups.setdefault(key, []).append(item)
+    for group in groups.values():
+        for item, state in zip(group, compute_capture_statuses(group)):
+            item["progress_status"] = state
+    return items
 
 
 def fetch_progress_events(db, order_ids):
@@ -760,6 +819,7 @@ def order_detail(order_id: str):
         ).fetchone()
         summary = order_summary(db, order_id, park if park else parks[0])
         items = annotate_order_plates([dict(row) for row in rows], db)
+        attach_capture_statuses(items)
         events = [(row["capture_time"], row["stage"]) for row in rows
                   if row["capture_time"] and (row["capture_status"] or "") != "no_vehicle"]
     if not rows:
@@ -1017,6 +1077,7 @@ def track():
         else:
             return jsonify([])
         items = annotate_order_plates([dict(row) for row in rows], db)
+        attach_capture_statuses(items)
     return jsonify(items)
 
 
@@ -2175,7 +2236,7 @@ def open_order_detail(order_id: str):
     data = {"order_id": order_id, "park": park if park else parks[0],
             "order_time": summary["order_time"], "plate": summary["plate"],
             "attributes": dict(attrs) if attrs else None,
-            "items": [dict(row) for row in rows]}
+            "items": attach_capture_statuses([dict(row) for row in rows])}
     data.update(compute_progress_status(events))
     return _open_ok({"data": data})
 

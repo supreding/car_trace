@@ -205,6 +205,9 @@ class AppTestCase(unittest.TestCase):
         self.assertIn(detail["progress_status"], server.PROGRESS_STATUSES)
         self.assertEqual(detail["progress_status"], orders[0]["progress_status"],
                          "同一订单的列表与详情状态应一致")
+        for item in detail["items"]:
+            self.assertIn("progress_status", item,
+                          f"抓拍 #{item['id']} 缺少逐张进度状态")
 
     # 8.5 订单级汇总：每个订单确定大致发生时间（order_time）与唯一车牌号（plate）
     def test_order_summary_plate_and_time(self):
@@ -380,6 +383,10 @@ class ProgressStatusTests(unittest.TestCase):
     def test_gate_in_then_wait(self):
         self.assertEqual(self.status([("2026-10-29 11:50:00", "抓拍")]), "大门进")
         self.assertEqual(self.status([("2026-10-29 11:00:00", "抓拍")]), "等待入磅")
+        # 进园锚点取首个事件：排队中的后续抓拍不重置窗口
+        self.assertEqual(
+            self.status([("2026-10-29 11:00:00", "抓拍"), ("2026-10-29 11:05:00", "抓拍")]),
+            "等待入磅")
         # 只有质检事件（扦样点紧贴地磅，属入磅前环节）同样从这两个状态起步
         self.assertEqual(self.status([("2026-10-29 11:55:00", "质检")]), "大门进")
 
@@ -404,6 +411,23 @@ class ProgressStatusTests(unittest.TestCase):
                   ("2026-10-29 09:03:00", "入磅"), ("2026-10-29 09:04:00", "抓拍"),
                   ("2026-10-29 10:50:00", "出磅"), ("2026-10-29 10:54:00", "抓拍")]
         self.assertEqual(self.status(events), "大门出")
+
+    def test_capture_status_timeline(self):
+        """逐张状态：按拍摄时刻推导——入磅照片本身=入磅中，出磅后抓拍=大门出，
+        no_vehicle 照片不产生事件但仍按此前事件标状态。"""
+        caps = [
+            {"id": 1, "capture_time": "2026-10-29 09:00:00", "stage": "抓拍", "capture_status": "vehicle"},
+            {"id": 2, "capture_time": "2026-10-29 09:20:00", "stage": "抓拍", "capture_status": "vehicle"},
+            {"id": 3, "capture_time": "2026-10-29 09:30:00", "stage": "质检", "capture_status": "vehicle"},
+            {"id": 4, "capture_time": "2026-10-29 09:31:00", "stage": "入磅", "capture_status": "vehicle"},
+            {"id": 5, "capture_time": "2026-10-29 09:45:00", "stage": "抓拍", "capture_status": "vehicle"},
+            {"id": 6, "capture_time": "2026-10-29 11:00:00", "stage": "出磅", "capture_status": "vehicle"},
+            {"id": 7, "capture_time": "2026-10-29 11:05:00", "stage": "抓拍", "capture_status": "vehicle"},
+            {"id": 8, "capture_time": "2026-10-29 11:06:00", "stage": "抓拍", "capture_status": "no_vehicle"},
+        ]
+        self.assertEqual(server.compute_capture_statuses(caps),
+                         ["大门进", "等待入磅", "等待入磅", "入磅中",
+                          "卸货", "出磅中", "大门出", "大门出"])
 
 
 class OpenApiProgressTests(unittest.TestCase):

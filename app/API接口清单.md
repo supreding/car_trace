@@ -56,7 +56,7 @@
 | `GET /api/open/parks` | 园区清单及各园区抓拍/订单/车辆数（park 为空串=未标注园区） | — |
 | `GET /api/open/dates` | 有数据的日期清单及每日抓拍数、订单数 | `park` |
 | `GET /api/open/orders` | 订单列表。订单号在园区内聚合（跨日期只出一行）；按 order_id 排序（翻页稳定）。items 含 `park`、`progress_status` 进度状态 | `park`、`date` / `date_from` / `date_to`、`order_id`（模糊）、`stage`、`page`、`page_size` |
-| `GET /api/open/order/<order_id>` | 单个订单完整轨迹（跨日期聚合，按时间+阶段排序），含订单属性 `attributes` 与顶层 `progress_status` 进度状态。订单号跨园区撞号时返回 400 + 可选园区列表 | `park` |
+| `GET /api/open/order/<order_id>` | 单个订单完整轨迹（跨日期聚合，按时间+阶段排序），含订单属性 `attributes`、顶层 `progress_status` 进度状态与 items 每张抓拍的逐张 `progress_status`（口径见 1.3 节）。订单号跨园区撞号时返回 400 + 可选园区列表 | `park` |
 | `GET /api/open/vehicles` | 车辆聚合列表（vehicle_id 分组，按园区隔离），`rep_id` 是代表抓拍 ID，`plate` 为出现最多的识别车牌，items 含 `park` | `park`、`date` / `date_from` / `date_to`、`page`、`page_size` |
 | `GET /api/open/vehicle/<vehicle_id>` | 单车完整轨迹（车辆只属于一个园区） | — |
 | `GET /api/open/yard` | **在园车辆**：近期（默认 24 小时，`active_hours` 可调，上限 720）有有效抓拍、且进度状态未到"大门出"的订单，按最后事件时间倒序。供在园状态看板轮询（注意照片经 30 分钟定时流水线入库，状态时效以此为上限） | `park`、`active_hours`、`page`、`page_size` |
@@ -75,14 +75,16 @@
 
 | 状态 | 判定 |
 |---|---|
-| `大门进` | 只有入磅前的事件（抓拍/质检），最后事件距今 ≤15 分钟（刚过大门） |
-| `等待入磅` | 同上但超过 15 分钟（在场上排队/待检；大门照片缺失时也从此态起步） |
+| `大门进` | 只有入磅前的事件（抓拍/质检），**首个事件**距今 ≤15 分钟（刚过大门） |
+| `等待入磅` | 同上但超过 15 分钟（在场上排队/待检；进园锚点取首个事件，中途的场院抓拍不重置窗口；大门照片缺失时也从此态起步） |
 | `入磅中` | 最后事件为入磅，距今 ≤10 分钟 |
 | `卸货` | 已入磅未出磅（入磅超 10 分钟后的整个在卸时段；**出磅照片缺失会停在此态**） |
 | `出磅中` | 最后事件为出磅、其后无抓拍，距今 ≤60 分钟（称重完至确认离场之间） |
 | `大门出` | 出磅后出现抓拍；或出磅超 60 分钟仍无后续事件（**推定已离场**） |
 
 补充口径：入磅与出磅之间的场院"抓拍"不回退状态；阈值可用环境变量 `STATUS_GATE_IN_MIN` / `STATUS_WEIGH_MIN` / `STATUS_EXIT_ASSUME_MIN` 覆盖；历史订单的窗口全部过期后，状态退化为"走到的最远环节"（如停在 `卸货`/`大门出`）。现场没有卸货区/出磅队列的独立信号，故不区分"等待出磅"。
+
+**逐张状态**：`/api/open/order/<id>` 与内部 `/api/order/<id>`、`/api/track` 的 items 每张抓拍另带 `progress_status`，表示**拍摄那张照片的时刻**车辆所处的状态（与订单级同一套规则，判定时刻换成照片拍摄时间；入磅照片本身即"入磅中"，出磅照片即"出磅中"，出磅后的抓拍即"大门出"，无事件时为空串）。订单级字段表达"这辆车现在到哪了"（在园看板/对接用），逐张字段表达"拍这张时在干嘛"（时间线展示用）。
 
 ### 1.4 调用示例
 
@@ -159,11 +161,11 @@ if data["code"] == 0:
 | 方法 | 路径 | 参数 | 说明 |
 |---|---|---|---|
 | GET | `/api/orders` | `date`、`stage`、`q`（订单号模糊）、`park`、`limit`（≤1000，默认 200） | 订单聚合列表（按 park+order_id 分组），按可读性排序（无效抓拍沉底）。每行含 `progress_status` / `last_stage` / `last_event_time` 进度状态（口径见 1.3 节），前端订单列表徽章用 |
-| GET | `/api/order/<order_id>` | `park` | 订单完整轨迹 + 属性 + 顶层 `progress_status` / `last_stage` / `last_event_time`（口径同 1.3 节），不存在返回 404；订单号跨园区撞号且未带 park 时返回 400 + parks |
+| GET | `/api/order/<order_id>` | `park` | 订单完整轨迹 + 属性 + 顶层 `progress_status` / `last_stage` / `last_event_time`（口径同 1.3 节）+ items 每张抓拍的逐张 `progress_status`，不存在返回 404；订单号跨园区撞号且未带 park 时返回 400 + parks |
 | GET | `/api/vehicles` | `date`、`stage`、`park` | 车辆聚合列表（vehicle_id 分组，园区隔离） |
 | GET | `/api/captures` | `date`、`stage`、`order_id`、`park`、`limit`（≤500）、`offset` | 抓拍明细，offset 分页 |
 | GET | `/api/search` | `plate`（片段）、`vehicle_type`、`start_hour`、`end_hour`、`order_id`（模糊）、`date`、`park`、`limit`（≤2000） | 组合查询，至少一个条件否则 400 |
-| GET | `/api/track` | `vid`（车辆编号）或 `plate`（片段）+`date`+`park` | 按车辆/车牌查轨迹；同牌车跨园区时返回各园区独立轨迹段 |
+| GET | `/api/track` | `vid`（车辆编号）或 `plate`（片段）+`date`+`park` | 按车辆/车牌查轨迹，items 每张抓拍带逐张 `progress_status`（按所属订单推导，口径同 1.3 节）；同牌车跨园区时返回各园区独立轨迹段 |
 | GET | `/api/track_by_img` | `id`（抓拍 ID） | 以图搜车：FastReID 余弦检索 + 属性重排，**候选只在同园区内** |
 | GET | `/api/instances/<capture_id>` | — | 同帧检测到的其他车辆实例 |
 
