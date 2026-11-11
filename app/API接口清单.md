@@ -158,8 +158,8 @@ if data["code"] == 0:
 
 | 方法 | 路径 | 参数 | 说明 |
 |---|---|---|---|
-| GET | `/api/orders` | `date`、`stage`、`q`（订单号模糊）、`park`、`limit`（≤1000，默认 200） | 订单聚合列表（按 park+order_id 分组），按可读性排序（无效抓拍沉底） |
-| GET | `/api/order/<order_id>` | `park` | 订单完整轨迹 + 属性，不存在返回 404；订单号跨园区撞号且未带 park 时返回 400 + parks |
+| GET | `/api/orders` | `date`、`stage`、`q`（订单号模糊）、`park`、`limit`（≤1000，默认 200） | 订单聚合列表（按 park+order_id 分组），按可读性排序（无效抓拍沉底）。每行含 `progress_status` / `last_stage` / `last_event_time` 进度状态（口径见 1.3 节），前端订单列表徽章用 |
+| GET | `/api/order/<order_id>` | `park` | 订单完整轨迹 + 属性 + 顶层 `progress_status` / `last_stage` / `last_event_time`（口径同 1.3 节），不存在返回 404；订单号跨园区撞号且未带 park 时返回 400 + parks |
 | GET | `/api/vehicles` | `date`、`stage`、`park` | 车辆聚合列表（vehicle_id 分组，园区隔离） |
 | GET | `/api/captures` | `date`、`stage`、`order_id`、`park`、`limit`（≤500）、`offset` | 抓拍明细，offset 分页 |
 | GET | `/api/search` | `plate`（片段）、`vehicle_type`、`start_hour`、`end_hour`、`order_id`（模糊）、`date`、`park`、`limit`（≤2000） | 组合查询，至少一个条件否则 400 |

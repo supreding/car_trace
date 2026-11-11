@@ -722,6 +722,13 @@
     function hmsOf(v) {const m = String(v || "").match(/(\d{2}:\d{2}:\d{2})$/); return m ? m[1] : ""}
     function dateOf(v) {return String(v || "").slice(0, 10)}
     const stageColor = {"入磅": "blue", "出磅": "green", "抓拍": "purple", "质检": "amber"};
+    // 订单进度状态徽章配色：入磅/出磅称重作业用绿（进行中），等待用琥珀，
+    // 大门进出用蓝，卸货紫，大门出为终态用默认灰弱化
+    const statusColor = {"大门进": "blue", "等待入磅": "amber", "入磅中": "green",
+                         "卸货": "purple", "出磅中": "green", "大门出": ""};
+    function statusBadge(st, lastTime, lastStage) {
+      return st ? `<span class="badge ${statusColor[st] || ""}" title="最后事件 ${esc(lastTime || "—")}（${esc(lastStage || "—")}）">${esc(st)}</span>` : "";
+    }
     const COLOR_CN = {yellow: "黄色", orange: "橙色", green: "绿色", gray: "灰色", red: "红色", blue: "蓝色", white: "白色", golden: "金色", brown: "棕色", black: "黑色"};
     const TYPE_CN = {sedan: "轿车", suv: "SUV", van: "厢式车", hatchback: "两厢车", mpv: "MPV", pickup: "皮卡", bus: "客车", truck: "货车", estate: "旅行车"};
 
@@ -751,11 +758,12 @@
       <div class="s">${esc((it.first_seen || "").slice(5, 16))} ~ ${esc((it.last_seen || "").slice(11, 19))}</div></div></div>`;
       }
       const t = `订单 ${it.order_id}`;
+      const stBadge = statusBadge(it.progress_status, it.last_event_time, it.last_stage);
       const s = [it.plate ? `车牌 ${esc(it.plate)}` : "", `${it.count}张`, it.date_span > 1 ? `跨${it.date_span}天` : "",
       esc(COLOR_CN[it.vehicle_color] || it.vehicle_color || ""), esc(TYPE_CN[it.vehicle_type] || it.vehicle_type || "")]
         .filter(Boolean).join(" · ");
       const start = esc((it.order_time || it.first_seen || "").slice(0, 16));
-      return `<div class="side-item" data-key="o${esc(it.order_id)}">${img}<div style="min-width:0"><div class="t">${t} ${parkTag}</div><div class="s">${s}</div>
+      return `<div class="side-item" data-key="o${esc(it.order_id)}">${img}<div style="min-width:0"><div class="t">${t} ${parkTag} ${stBadge}</div><div class="s">${s}</div>
     <div class="s">${start}起</div></div></div>`;
     }
 
@@ -1222,8 +1230,9 @@
         const suspect = items.filter(x => x.suspect);
         const normal = items.filter(x => !x.suspect);
         const parkLabel = data.park || items[0]?.park || "";
-        mainHead(`订单 ${esc(oid)}`,
-          `${items.length} 张 · 车牌 ${esc(data.plate || "—")} · 发生时间 ${esc(data.order_time || "—")} · 跨 ${new Set(items.map(i => i.date)).size} 个日期文件夹${multiPark ? ` · ${esc(parkLabel || "未标注园区")}` : ""}${suspect.length ? ` · 可疑 ${suspect.length}` : ""}`, data.attributes);
+        const stBadge = statusBadge(data.progress_status, data.last_event_time, data.last_stage);
+        mainHead(`订单 ${esc(oid)} ${stBadge}`,
+          `${items.length} 张 · 车牌 ${esc(data.plate || "—")} · 发生时间 ${esc(data.order_time || "—")} · 跨 ${new Set(items.map(i => i.date)).size} 个日期文件夹${data.progress_status ? ` · 最后事件 ${esc(data.last_event_time || "—")}（${esc(data.last_stage || "—")}）` : ""}${multiPark ? ` · ${esc(parkLabel || "未标注园区")}` : ""}${suspect.length ? ` · 可疑 ${suspect.length}` : ""}`, data.attributes);
         let html = normal.length ? normal.map(tlRow).join("") : '<div class="empty">没有抓拍</div>';
         if (suspect.length) html += suspectGroupHTML(suspect, data.plate, "suspect-order");
         $("tl").innerHTML = html;

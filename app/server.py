@@ -707,6 +707,7 @@ def orders():
     parameters.append(limit)
     with closing(get_db()) as db:
         rows = [dict(row) for row in db.execute(sql, parameters).fetchall()]
+        progress_events = fetch_progress_events(db, [row["order_id"] for row in rows])
         for row in rows:
             attrs = db.execute(
                 """SELECT vehicle_color, vehicle_color_conf, vehicle_type, vehicle_type_conf
@@ -719,6 +720,8 @@ def orders():
                 row["attr_conf"] = {"color": attrs["vehicle_color_conf"],
                                     "type": attrs["vehicle_type_conf"]}
             row.update(order_summary(db, row["order_id"], row["park"] or ""))
+            row.update(compute_progress_status(
+                progress_events.get((row["park"] or "", row["order_id"]), [])))
     return jsonify(rows)
 
 
@@ -757,12 +760,16 @@ def order_detail(order_id: str):
         ).fetchone()
         summary = order_summary(db, order_id, park if park else parks[0])
         items = annotate_order_plates([dict(row) for row in rows], db)
+        events = [(row["capture_time"], row["stage"]) for row in rows
+                  if row["capture_time"] and (row["capture_status"] or "") != "no_vehicle"]
     if not rows:
         return jsonify({"error": "订单不存在", "items": []}), 404
-    return jsonify({"order_id": order_id, "park": park if park else parks[0],
-                    "order_time": summary["order_time"], "plate": summary["plate"],
-                    "attributes": dict(attrs) if attrs else None,
-                    "items": items})
+    response = {"order_id": order_id, "park": park if park else parks[0],
+                "order_time": summary["order_time"], "plate": summary["plate"],
+                "attributes": dict(attrs) if attrs else None,
+                "items": items}
+    response.update(compute_progress_status(events))
+    return jsonify(response)
 
 
 @app.route("/api/search")

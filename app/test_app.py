@@ -192,6 +192,20 @@ class AppTestCase(unittest.TestCase):
             sims = [item.get("similarity") for item in items if item.get("similarity") is not None]
             self.assertEqual(sims, sorted(sims, reverse=True), "相似度未降序排列")
 
+    # 8.4 内部接口进度状态：订单列表每行 + 订单详情顶层都带 progress_status 三字段
+    def test_internal_progress_status(self):
+        orders = self.get_json("/api/orders?limit=10")
+        self.assertTrue(orders)
+        for item in orders:
+            self.assertIn(item["progress_status"], server.PROGRESS_STATUSES,
+                          f"订单 {item['order_id']} 状态非法：{item['progress_status']!r}")
+            self.assertIn("last_stage", item)
+            self.assertIn("last_event_time", item)
+        detail = self.get_json(f"/api/order/{orders[0]['order_id']}")
+        self.assertIn(detail["progress_status"], server.PROGRESS_STATUSES)
+        self.assertEqual(detail["progress_status"], orders[0]["progress_status"],
+                         "同一订单的列表与详情状态应一致")
+
     # 8.5 订单级汇总：每个订单确定大致发生时间（order_time）与唯一车牌号（plate）
     def test_order_summary_plate_and_time(self):
         rows = self.get_json("/api/orders?limit=100")
