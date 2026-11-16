@@ -73,7 +73,7 @@
 <body>
 <header>
   <h1>标注工作台</h1>
-  <span class="kbd">←/→ 切换订单 · 1-6 状态 · S 保存 · R 标记复核 · B 框选 · Esc 取消</span>
+  <span class="kbd">←/→ 切换订单 · 1-6 状态 · S 保存标注 · B 开始框选 · 回车 应用框选 · R 标记复核</span>
   <div class="spacer"></div>
   <label class="kbd">标注人</label>
   <input id="annotator" style="width:110px" placeholder="必填">
@@ -102,8 +102,10 @@
     <div id="stageArea" class="stagebox"><div class="empty">选择一张照片</div></div>
     <div id="stageMeta" class="stage-meta"></div>
     <div style="padding:6px 10px">
-      <button onclick="saveBox()" id="boxBtn">B 框选车辆（两次点击：左上角→右下角）</button>
-      <span id="boxHint" class="kbd"></span>
+      <button onclick="startBox()" id="boxStartBtn">① 开始框选（点击此按钮，或按下键盘 B 键）</button>
+      <button class="primary" onclick="saveBox()" id="boxApplyBtn" disabled>② 应用框选（点击此按钮，或按下键盘 回车键）</button>
+      <button onclick="cancelBox()">取消（按下键盘 Esc 键）</button>
+      <div><span id="boxHint" class="kbd"></span></div>
     </div>
   </div>
 
@@ -371,14 +373,31 @@ function initCanvas() {
   c.onclick = canvasClick;
   drawBox();
 }
+function startBox() {
+  state.boxMode = true; state.boxPts = [];
+  $("boxApplyBtn").disabled = true;
+  $("boxHint").textContent = "框选模式已开启：在大图上点击车辆左上角，再点击车辆右下角；按键盘 Esc 键取消";
+}
+function cancelBox() {
+  state.boxMode = false; state.boxPts = [];
+  $("boxApplyBtn").disabled = true;
+  $("boxHint").textContent = "已取消框选";
+  drawBox();
+}
 function canvasClick(ev) {
   if (!state.boxMode) return;
   const img = $("bigimg"), c = $("boxCanvas"), r = c.getBoundingClientRect();
   const x = (ev.clientX - r.left) * state.imgW / c.width;
   const y = (ev.clientY - r.top) * state.imgH / c.height;
   state.boxPts.push([x, y]);
-  if (state.boxPts.length === 2) { drawBox(); state.boxMode = false; $("boxHint").textContent = "矩形就绪，点【应用框选】保存"; }
-  else drawBox(true);
+  if (state.boxPts.length === 2) {
+    state.boxMode = false;
+    $("boxApplyBtn").disabled = false;
+    $("boxHint").textContent = "矩形已就绪：按下键盘 回车键 或点击【② 应用框选】保存；按 Esc 键重新开始";
+  } else {
+    $("boxHint").textContent = "已记录左上角，再点击车辆右下角";
+  }
+  drawBox();
 }
 function drawBox(temp) {
   const c = $("boxCanvas"); if (!c) return;
@@ -401,12 +420,15 @@ function getBox() {
 }
 async function saveBox() {
   const box = getBox();
-  if (!box || state.boxPts.length !== 2) { toast("先按 B 进入框选，点击左上角与右下角"); return; }
+  if (!box || state.boxPts.length !== 2) { toast("请先开始框选：点击【① 开始框选】按钮或按下键盘 B 键"); return; }
   const it = state.order.items[state.ci];
   await api("/api/boxedit/save", { method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ capture_id: it.id, box }) });
   toast("框选已保存：裁剪图已更新，车牌/特征下轮补算");
-  state.boxPts = []; await selectCapture(state.ci, true);
+  state.boxPts = []; state.boxMode = false;
+  $("boxApplyBtn").disabled = true;
+  $("boxHint").textContent = "框选已应用";
+  await selectCapture(state.ci, true);
 }
 
 /* ---------------- 快捷键与初始化 ---------------- */
@@ -414,10 +436,11 @@ function nextOrder() { if (state.qi + 1 < state.queue.length) selectOrder(state.
 function prevOrder() { if (state.qi > 0) selectOrder(state.qi - 1); }
 document.addEventListener("keydown", ev => {
   if (["INPUT", "TEXTAREA", "SELECT"].includes(ev.target.tagName)) return;
-  if (ev.key === "Escape") { state.boxMode = false; state.boxPts = []; drawBox(); $("boxHint").textContent = ""; return; }
+  if (ev.key === "Escape") { cancelBox(); return; }
+  if (ev.key === "Enter") { if (getBox()) saveBox(); else toast("框未画完：先按键盘 B 键开始框选"); return; }
+  if (ev.key === "b" || ev.key === "B") { startBox(); return; }
   if (ev.key === "ArrowLeft" || ev.key === "j") { prevOrder(); return; }
   if (ev.key === "ArrowRight" || ev.key === "k") { nextOrder(); return; }
-  if (ev.key === "b" || ev.key === "B") { state.boxMode = true; state.boxPts = []; $("boxHint").textContent = "框选模式：点左上角→右下角"; return; }
   if (ev.key === "s" || ev.key === "S") { savePanel(); return; }
   if (ev.key === "r" || ev.key === "R") { markReviewed(); return; }
   if (/^[1-6]$/.test(ev.key)) setStatus(STATUS[+ev.key - 1]);
