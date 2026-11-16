@@ -2375,7 +2375,9 @@ def label_capture_save():
         return "" if value is None else str(value).strip()
 
     status = field("corrected_status")
+    stage_sent = "corrected_stage" in fields
     stage = field("corrected_stage")
+    direction_sent = "corrected_direction" in fields
     direction = field("corrected_direction")
     color = field("corrected_color")
     vtype = field("corrected_type")
@@ -2412,6 +2414,8 @@ def label_capture_save():
         existing = db.execute(
             "SELECT * FROM capture_annotations WHERE capture_id=?", (capture_id,)
         ).fetchone()
+        existing_stage = (existing["corrected_stage"] or "") if existing else ""
+        existing_direction = (existing["corrected_direction"] or "") if existing else ""
         now = datetime.now().isoformat(timespec="seconds")
 
         # 1) 人工字段留档（派生字段 corrected_status 也在本行）
@@ -2436,9 +2440,8 @@ def label_capture_save():
                             ELSE capture_annotations.notes END,
                  annotator=excluded.annotator, updated_at=excluded.updated_at""",
             (capture_id, usability, plate, color, vtype, status,
-             (existing["corrected_stage"] or "") if stage_keep_existing and existing
-             else ("" if stage_keep_existing else stage),
-             direction, time_only,
+             (existing_stage if stage_keep_existing or not stage_sent else stage),
+             (existing_direction if not direction_sent else direction), time_only,
              0 if no_vehicle_manual is None else no_vehicle_manual,
              str(payload.get("notes") or "").strip()[:500], annotator, now),
         )
