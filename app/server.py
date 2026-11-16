@@ -1581,9 +1581,21 @@ def boxedit_save():
                ON CONFLICT(capture_id) DO UPDATE SET box=excluded.box,
                  source='manual_box', edited_at=excluded.edited_at""",
             (capture_id, json.dumps(box), now))
+        # 框选清空了 plate_final：若该帧有人工已标车牌，立即回填（人工牌
+        # 不等 LPR，LPR 阶段对有人工牌的帧本来就会跳过）。
+        manual_plate = db.execute(
+            """SELECT corrected_plate FROM capture_annotations
+               WHERE capture_id=? AND coalesce(corrected_plate,'')!=''""",
+            (capture_id,)).fetchone()
+        if manual_plate:
+            db.execute(
+                """UPDATE captures SET plate_final=?, plate_confidence=NULL,
+                          recognition_source='人工标注' WHERE id=?""",
+                (manual_plate["corrected_plate"], capture_id))
         db.commit()
     return jsonify({"ok": True, "box": box, "crop_url": f"/api/crop/{capture_id}",
-                    "message": "已按新框重新裁剪；车牌/外观特征将在下轮流水线补算"})
+                    "message": "已按新框重新裁剪；车牌/外观特征将在下轮流水线补算"
+                               + ("（人工牌已回填）" if manual_plate else "")})
 
 
 @app.route("/api/boxedit/promote", methods=["POST"])
@@ -2661,6 +2673,110 @@ def label_order_detail():
             "flow_thresholds": {k: round(v, 1) for k, v in th.items()}}
     data.update(compute_progress_status(events, th=th))
     return jsonify(data)
+
+
+@app.route("/api/label/records")
+def label_records():
+    """全部人工标注记录（照片修正/订单锚点/框选/机位字典，最新在前）。"""
+    annotator = request.args.get("annotator", "").strip()
+    limit = min(1000, positive_int(request.args.get("limit", "300"), 300))
+    offset = positive_int(request.args.get("offset", "0"), 0)
+    with closing(get_db()) as db:
+        ensure_label_tables(db)
+        cond, params = [], []
+        if annotator:
+            cond.append("annotator=?")
+            params.append(annotator)
+        where = (" WHERE " + " AND ".join(cond)) if cond else ""
+        cap_rows = db.execute(
+            f"""SELECT ca.capture_id, ca.usability, ca.corrected_plate,
+                       ca.corrected_color, ca.corrected_type, ca.corrected_status,
+                       ca.corrected_stage, ca.corrected_direction, ca.corrected_time,
+                       ca.no_vehicle_manual, ca.notes, ca.annotator, ca.updated_at,
+                       c.order_id, coalesce(c.park,'') AS park,
+                       c.capture_time AS auto_time, c.stage AS auto_stage
+                FROM capture_annotations ca
+                LEFT JOIN captures c ON c.id=ca.capture_id
+                {where} ORDER BY ca.updated_at DESC LIMIT ? OFFSET ?""",
+            [*params, limit, offset],
+        ).fetchall()
+        cap_total = db.execute(
+            f"SELECT COUNT(*) FROM capture_annotations ca {where}", params).fetchone()[0]
+        anchor_rows = db.execute(
+            f"""SELECT id, park, order_id, kind, anchor_time, annotator, note, created_at
+                FROM manual_order_anchors {where}
+                ORDER BY created_at DESC LIMIT {max(limit, 200)}""", params).fetchall()
+        box_rows = db.execute(
+            f"""SELECT b.capture_id, b.box, b.source, b.edited_at,
+                       c.order_id, coalesce(c.park,'') AS park
+                FROM manual_box_edits b
+                LEFT JOIN captures c ON c.id=b.capture_id
+                ORDER BY b.edited_at DESC LIMIT {max(limit, 200)}""",
+        ).fetchall()
+        device_rows = db.execute(
+            f"""SELECT park, device, location, direction, annotator, created_at
+                FROM manual_device_registry {where}
+                ORDER BY created_at DESC LIMIT {max(limit, 200)}""", params).fetchall()
+    return jsonify({
+        "capture_records": [dict(r) for r in cap_rows], "capture_total": cap_total,
+        "anchors": [dict(r) for r in anchor_rows],
+        "box_edits": [dict(r) for r in box_rows],
+        "devices": [dict(r) for r in device_rows],
+    })
+
+
+@app.route("/api/label/records.csv")
+def label_records_csv():
+    """人工标注记录导出（CSV，四类合并，kind 列区分）。"""
+    annotator = request.args.get("annotator", "").strip()
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["类型", "对象", "园区", "订单号", "内容", "标注人", "时间"])
+    with closing(get_db()) as db:
+        ensure_label_tables(db)
+        cond = " WHERE annotator=?" if annotator else ""
+        cparams = [annotator] if annotator else []
+        for r in db.execute(
+            f"""SELECT ca.*, c.order_id, coalesce(c.park,'') AS park
+                FROM capture_annotations ca
+                LEFT JOIN captures c ON c.id=ca.capture_id
+                {cond} ORDER BY ca.updated_at DESC""", cparams).fetchall():
+            content = {}
+            for key in ("usability", "corrected_plate", "corrected_color", "corrected_type",
+                        "corrected_status", "corrected_stage", "corrected_direction",
+                        "corrected_time"):
+                if r[key]:
+                    content[key] = r[key]
+            if r["no_vehicle_manual"]:
+                content["no_vehicle_manual"] = "误检"
+            if r["notes"]:
+                content["notes"] = r["notes"]
+            writer.writerow(["照片标注", f"#{r['capture_id']}", r["park"], r["order_id"] or "",
+                             json.dumps(content, ensure_ascii=False), r["annotator"], r["updated_at"]])
+        for r in db.execute(
+            f"""SELECT park, order_id, kind, anchor_time, note, annotator, created_at
+                FROM manual_order_anchors {cond} ORDER BY created_at DESC""", cparams).fetchall():
+            writer.writerow(["订单锚点", r["kind"], r["park"], r["order_id"],
+                             r["anchor_time"] + (f"（{r['note']}）" if r["note"] else ""),
+                             r["annotator"], r["created_at"]])
+        for r in db.execute(
+            f"""SELECT b.capture_id, b.box, b.edited_at, c.order_id,
+                       coalesce(c.park,'') AS park
+                FROM manual_box_edits b
+                LEFT JOIN captures c ON c.id=b.capture_id
+                ORDER BY b.edited_at DESC""").fetchall():
+            writer.writerow(["位置框选", f"#{r['capture_id']}", r["park"], r["order_id"] or "",
+                             str(r["box"]), "", r["edited_at"]])
+        for r in db.execute(
+            f"""SELECT park, device, location, direction, annotator, created_at
+                FROM manual_device_registry {cond} ORDER BY created_at DESC""", cparams).fetchall():
+            writer.writerow(["机位字典", r["device"], r["park"], "",
+                             f"{r['location']}" + (f"（{r['direction']}）" if r["direction"] else ""),
+                             r["annotator"], r["created_at"]])
+    return Response(
+        output.getvalue().encode("utf-8-sig"),  # BOM 便于 Excel 直开
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment; filename=label_records.csv"})
 
 
 # ---------------------------------------------------------------------------

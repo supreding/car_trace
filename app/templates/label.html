@@ -90,6 +90,7 @@
   </select>
   <select id="parkSel" style="width:auto"></select>
   <button onclick="loadQueue()">刷新队列</button>
+  <button onclick="showRecords()">标注记录</button>
   <span id="qcount" class="kbd"></span>
 </div>
 
@@ -188,6 +189,19 @@
         </div>
       </div>
     </div>
+  </div>
+</div>
+<div id="recordsOverlay" style="display:none; position:fixed; inset:0; background:rgba(2,6,23,.78); z-index:40; overflow:auto; padding:24px">
+  <div style="background:var(--panel); border:1px solid var(--line); border-radius:10px; max-width:1150px; margin:0 auto; padding:14px">
+    <div style="display:flex; gap:8px; align-items:center; margin-bottom:10px">
+      <h2 style="font-size:16px; margin:0">人工标注记录（全部，最新在前）</h2>
+      <input id="recAnnotator" placeholder="按标注人过滤" style="width:150px">
+      <button onclick="loadRecords()">查询</button>
+      <a id="recCsv" class="badge blue" href="/api/label/records.csv" target="_blank">导出 CSV</a>
+      <div style="flex:1"></div>
+      <button onclick="closeRecords()">关闭（Esc）</button>
+    </div>
+    <div id="recordsBody" style="font-size:13px"></div>
   </div>
 </div>
 <div id="toast" class="toast"></div>
@@ -431,12 +445,64 @@ async function saveBox() {
   await selectCapture(state.ci, true);
 }
 
+/* ---------------- 标注记录 ---------------- */
+async function showRecords() {
+  $("recordsOverlay").style.display = "block";
+  $("recAnnotator").value = $("annotator").value.trim();
+  await loadRecords();
+}
+function closeRecords() { $("recordsOverlay").style.display = "none"; }
+async function loadRecords() {
+  const who = $("recAnnotator").value.trim();
+  const csvQ = who ? `?annotator=${encodeURIComponent(who)}` : "";
+  $("recCsv").href = "/api/label/records.csv" + csvQ;
+  const r = await api(`/api/label/records?limit=200${csvQ}`);
+  const table = (headTexts, rows) => `
+    <h4 style="margin:10px 0 4px">${esc(headTexts[0])}（${rows.length}）</h4>
+    <table style="width:100%; border-collapse:collapse" border="1">
+      <tr style="color:var(--muted)">${headTexts.map(h => `<th style="padding:3px 6px;text-align:left">${esc(h)}</th>`).join("")}</tr>
+      ${rows.join("") || `<tr><td colspan="${headTexts.length}" style="color:var(--muted)">无记录</td></tr>`}
+    </table>`;
+  const caps = r.capture_records.map(x => {
+    const changes = [];
+    if (x.corrected_status) changes.push("状态→" + x.corrected_status);
+    if (x.corrected_stage) changes.push("环节→" + x.corrected_stage);
+    if (x.corrected_direction) changes.push("方向→" + x.corrected_direction);
+    if (x.corrected_color) changes.push("颜色→" + x.corrected_color);
+    if (x.corrected_type) changes.push("车型→" + x.corrected_type);
+    if (x.corrected_plate) changes.push("车牌→" + x.corrected_plate);
+    if (x.corrected_time) changes.push("时间→" + x.corrected_time);
+    if (x.no_vehicle_manual) changes.push("标记误检");
+    if (x.corrected_plate && !changes.some(c => c.startsWith("车牌"))) changes.push("车牌→" + x.corrected_plate);
+    return `<tr><td>#${x.capture_id}</td><td>${esc(x.park || "")}</td><td>${esc(x.order_id || "")}</td>
+      <td>${esc(changes.join("；") || "身份/车牌复核")}</td><td>${esc(x.annotator || "")}</td>
+      <td>${esc(x.updated_at || "")}</td></tr>`;
+  });
+  const anchors = r.anchors.map(x => `
+    <tr><td>${esc(x.order_id)}</td><td>${esc(x.park || "")}</td><td>${esc(x.kind)}</td>
+      <td>${esc(x.anchor_time)}</td><td>${esc(x.annotator || "")}</td><td>${esc(x.created_at || "")}</td></tr>`);
+  const boxes = r.box_edits.map(x => `
+    <tr><td>#${x.capture_id}</td><td>${esc(x.park || "")}</td><td>${esc(x.order_id || "")}</td>
+      <td>${esc(x.box)}</td><td>${esc(x.edited_at || "")}</td></tr>`);
+  const devices = r.devices.map(x => `
+    <tr><td>${esc(x.device)}</td><td>${esc(x.park || "")}</td><td>${esc(x.location)}</td>
+      <td>${esc(x.direction || "—")}</td><td>${esc(x.annotator || "")}</td><td>${esc(x.created_at || "")}</td></tr>`);
+  $("recordsBody").innerHTML =
+    table(["照片", "园区", "订单", "修正内容", "标注人", "时间"], caps) +
+    table(["订单", "园区", "锚点类型", "时刻", "标注人", "时间"], anchors) +
+    table(["照片", "园区", "订单", "框 [l,t,r,b]", "时间"], boxes) +
+    table(["设备", "园区", "机位", "方向", "标注人", "时间"], devices);
+}
+
 /* ---------------- 快捷键与初始化 ---------------- */
 function nextOrder() { if (state.qi + 1 < state.queue.length) selectOrder(state.qi + 1); else toast("队列到底了"); }
 function prevOrder() { if (state.qi > 0) selectOrder(state.qi - 1); }
 document.addEventListener("keydown", ev => {
   if (["INPUT", "TEXTAREA", "SELECT"].includes(ev.target.tagName)) return;
-  if (ev.key === "Escape") { cancelBox(); return; }
+  if (ev.key === "Escape") {
+    if ($("recordsOverlay").style.display === "block") { closeRecords(); return; }
+    cancelBox(); return;
+  }
   if (ev.key === "Enter") { if (getBox()) saveBox(); else toast("框未画完：先按键盘 B 键开始框选"); return; }
   if (ev.key === "b" || ev.key === "B") { startBox(); return; }
   if (ev.key === "ArrowLeft" || ev.key === "j") { prevOrder(); return; }
