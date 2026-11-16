@@ -792,8 +792,10 @@ def compute_capture_statuses(captures, th=None):
         except ValueError:
             continue
         stage = capture.get("stage") or ""
-        camera = capture.get("osd_camera") or ""
-        direction = "in" if "进" in camera else ("out" if "出" in camera else "")
+        # 人工方向修正（环节选"进大门/出大门"映射而来）优先于 OSD 设备名
+        direction = (capture.get("_dir_override")
+                     or ("in" if "进" in (capture.get("osd_camera") or "")
+                         else ("out" if "出" in (capture.get("osd_camera") or "") else "")))
         if (capture.get("capture_status") or "") != "no_vehicle":
             if stage == "入磅":
                 weigh_t = t          # 先入账再判定：本张即"上磅"时刻
@@ -1027,6 +1029,8 @@ def order_detail(order_id: str):
             corr = corrections.get(item["id"]) or {}
             if "stage" in corr:
                 item["stage"] = corr["stage"]
+            if "direction" in corr:
+                item["_dir_override"] = corr["direction"]
         attach_capture_statuses(items, lambda p: flow_thresholds(db, p))
         for item in items:
             corr = corrections.get(item["id"]) or {}
@@ -1313,6 +1317,8 @@ def track():
             corr = corrections.get(item["id"]) or {}
             if "stage" in corr:
                 item["stage"] = corr["stage"]
+            if "direction" in corr:
+                item["_dir_override"] = corr["direction"]
         attach_capture_statuses(items, lambda p: flow_thresholds(db, p))
         apply_status_overrides(db, items)
     return jsonify(items)
@@ -2378,7 +2384,12 @@ def label_capture_save():
     usability = field("usability") or "valid"
     if status and status not in PROGRESS_STATUSES:
         return jsonify({"error": f"未知状态: {status}"}), 400
-    if stage and stage not in build_db.STAGE_RANK:
+    # "进大门/出大门"是环节下拉里的方向标注选项：映射为方向修正，环节本身不变
+    stage_keep_existing = False
+    if stage in ("进大门", "出大门"):
+        direction = "in" if stage == "进大门" else "out"
+        stage_keep_existing = True
+    elif stage and stage not in build_db.STAGE_RANK:
         return jsonify({"error": f"未知环节: {stage}"}), 400
     if direction and direction not in {"in", "out"}:
         return jsonify({"error": "方向只能是 in/out"}), 400
@@ -2424,20 +2435,20 @@ def label_capture_save():
                  notes=CASE WHEN excluded.notes!='' THEN excluded.notes
                             ELSE capture_annotations.notes END,
                  annotator=excluded.annotator, updated_at=excluded.updated_at""",
-            (capture_id, usability, plate, color, vtype, status, stage,
+            (capture_id, usability, plate, color, vtype, status,
+             (existing["corrected_stage"] or "") if stage_keep_existing and existing
+             else ("" if stage_keep_existing else stage),
              direction, time_only,
              0 if no_vehicle_manual is None else no_vehicle_manual,
              str(payload.get("notes") or "").strip()[:500], annotator, now),
         )
 
-        # 2) 事实字段写回 captures（空值=该字段本次不改）
+        # 2) 事实字段写回 captures（空值=该字段本次不改；进大门/出大门不改
+        #    环节本身——方向经 corrected_direction 在状态机里生效）
         write_backs, write_params = [], []
-        if stage:
+        if stage and not stage_keep_existing:
             write_backs += ["stage=?", "stage_rank=?"]
             write_params += [stage, build_db.STAGE_RANK.get(stage, -1)]
-        if direction:
-            write_backs.append("osd_camera=?")
-            write_params.append({"in": "大门抓拍进", "out": "大门抓拍出"}[direction])
         if color:
             write_backs.append("vehicle_color=?")
             write_params.append(color)
@@ -2630,6 +2641,13 @@ def label_order_detail():
             [order_id, *park_params],
         ).fetchall()
         items = annotate_order_plates([dict(r) for r in rows], db)
+        corrections = fetch_label_corrections(db, [it["id"] for it in items])
+        for item in items:
+            corr = corrections.get(item["id"]) or {}
+            if "stage" in corr:
+                item["stage"] = corr["stage"]
+            if "direction" in corr:
+                item["_dir_override"] = corr["direction"]
         attach_capture_statuses(items, lambda p: flow_thresholds(db, p))
         overrides = fetch_status_overrides(db, [it["id"] for it in items])
         annotations = {}
@@ -3003,13 +3021,17 @@ def open_order_detail(order_id: str):
         ).fetchone()
         summary = order_summary(db, order_id, park if park else parks[0])
         th = flow_thresholds(db, park if park else parks[0])
-        items = attach_capture_statuses(
-            [dict(row) for row in rows], lambda p: flow_thresholds(db, p))
+        items = [dict(row) for row in rows]
         corrections = fetch_label_corrections(db, [it["id"] for it in items])
         for item in items:
             corr = corrections.get(item["id"]) or {}
             if "stage" in corr:
                 item["stage"] = corr["stage"]
+            if "direction" in corr:
+                item["_dir_override"] = corr["direction"]
+        attach_capture_statuses(items, lambda p: flow_thresholds(db, p))
+        for item in items:
+            corr = corrections.get(item["id"]) or {}
             if "status" in corr:
                 item["progress_status"] = corr["status"]
                 item["progress_source"] = "manual"

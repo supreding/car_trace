@@ -122,13 +122,8 @@
         </div>
       </div>
       <div class="sec">
-        <h4>环节归属 / 大门方向（有大门机位才有方向）</h4>
-        <div class="half">
-          <div><label>环节</label><select id="f_stage"></select></div>
-          <div><label>大门方向</label><select id="f_direction">
-            <option value="">(不改/无)</option><option value="in">进</option><option value="out">出</option>
-          </select></div>
-        </div>
+        <h4>环节归属（画面是大门口的照片，直接选 进大门 / 出大门）</h4>
+        <div><select id="f_stage"></select></div>
         <div class="row" style="margin-top:4px"><span id="deviceNow" class="kbd"></span></div>
       </div>
       <div class="sec">
@@ -212,6 +207,7 @@ const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const STATUS = ["大门进","等待入磅","入磅中","卸货","出磅中","大门出"];
 const STAGES = ["入磅","质检","出磅","抓拍","人脸"];
+const STAGE_GATE = {"进大门": "in", "出大门": "out"};   // 环节选项里的方向标注
 const COLORS = ["黄色","橙色","绿色","灰色","红色","蓝色","白色","金色","棕色","黑色"];
 const TYPES = ["轿车","SUV","MPV","面包车","皮卡","货车","客车","罐车","挂车","工程机械"];
 const statusColor = {"大门进":"blue","等待入磅":"amber","入磅中":"green","卸货":"purple","出磅中":"green","大门出":""};
@@ -285,8 +281,9 @@ async function selectCapture(idx, force) {
   $("stageArea").innerHTML = `<img id="bigimg" src="/api/image/${it.id}" onload="initCanvas()">`;
   $("stageMeta").textContent =
     `${it.stage} · ${it.camera_key || ""} · OSD方向=${it.osd_direction || "无"} · 时间 ${it.capture_time || "无"} · 车牌 ${it.plate_final || "—"}`;
-  fillSelect($("f_stage"), STAGES, (st.item.corrected_stage || "") || it.stage);
-  $("f_direction").value = st.item.corrected_direction || "";
+  fillSelect($("f_stage"), [...STAGES, ...Object.keys(STAGE_GATE)],
+    st.item.corrected_stage || (st.item.corrected_direction === "in" ? "进大门"
+      : st.item.corrected_direction === "out" ? "出大门" : it.stage));
   fillSelect($("f_color"), COLORS, (st.item.corrected_color || "") || it.vehicle_color || "");
   fillSelect($("f_type"), TYPES, (st.item.corrected_type || "") || it.vehicle_type || "");
   $("f_plate").value = st.item.corrected_plate || it.plate_final || "";
@@ -360,8 +357,7 @@ async function savePanel() {
   const pst = document.querySelector('input[name=pst]:checked');
   const fields = {
     corrected_status: pst ? pst.value : (cur.corrected_status || ""),
-    corrected_stage: $("f_stage").value,
-    corrected_direction: $("f_direction").value,
+    corrected_stage: $("f_stage").value,   // 选 进大门/出大门 时服务端映射为方向
     corrected_color: $("f_color").value,
     corrected_type: $("f_type").value,
     corrected_plate: $("f_plate").value.trim(),

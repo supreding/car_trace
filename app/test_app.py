@@ -19,12 +19,14 @@ import server
 
 class AppTestCase(unittest.TestCase):
     @classmethod
+    @classmethod
     def setUpClass(cls):
         server.app.config.update(TESTING=True)
         cls.client = server.app.test_client()
         cls.db = sqlite3.connect(server.DB_PATH)
         cls.db.row_factory = sqlite3.Row
 
+    @classmethod
     @classmethod
     def tearDownClass(cls):
         cls.db.close()
@@ -521,6 +523,7 @@ class OpenApiProgressTests(unittest.TestCase):
     """开放接口进度字段接线验证（临时注入 token，不动真实配置）。"""
 
     @classmethod
+    @classmethod
     def setUpClass(cls):
         server.app.config.update(TESTING=True)
         cls.client = server.app.test_client()
@@ -528,6 +531,7 @@ class OpenApiProgressTests(unittest.TestCase):
         cls._old = server.OPEN_API_TOKEN
         server.OPEN_API_TOKEN = cls.token
 
+    @classmethod
     @classmethod
     def tearDownClass(cls):
         server.OPEN_API_TOKEN = cls._old
@@ -561,6 +565,7 @@ class OpenApiProgressTests(unittest.TestCase):
 class LabelWorkspaceTests(unittest.TestCase):
     """标注工作台端到端：保存写回、锚点合成事件、队列、回放。测试后恢复原值。"""
 
+    @classmethod
     @classmethod
     def setUpClass(cls):
         server.app.config.update(TESTING=True)
@@ -676,6 +681,48 @@ class LabelWorkspaceTests(unittest.TestCase):
                            (row["stage"], row["stage_rank"], capture_id))
                 db.execute("DELETE FROM capture_annotations WHERE capture_id=?", (capture_id,))
                 db.commit()
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class GateStageChoiceTests(unittest.TestCase):
+    """环节下拉选"进大门/出大门" = 方向修正：环节本身不变、不伪造设备名，
+    状态机按方向重算（该帧成为离场确认事件）。"""
+
+    @classmethod
+    def setUpClass(cls):
+        server.app.config.update(TESTING=True)
+        cls.client = server.app.test_client()
+        with closing(server.get_db()) as db:
+            cls.row = dict(db.execute("""SELECT id, order_id, stage, stage_rank, coalesce(osd_camera,'') AS osd_camera FROM captures
+                WHERE stage='抓拍' AND capture_time!=''
+                AND coalesce(capture_status,'vehicle')!='no_vehicle' LIMIT 1""").fetchone())
+
+    @classmethod
+    def tearDownClass(cls):
+        with closing(server.get_db()) as db:
+            db.execute("DELETE FROM capture_annotations WHERE capture_id=?", (cls.row["id"],))
+            db.execute("DELETE FROM annotation_audit WHERE capture_id=?", (cls.row["id"],))
+            db.execute("""UPDATE captures SET stage=?, stage_rank=? WHERE id=?""",
+                       (cls.row["stage"], cls.row["stage_rank"], cls.row["id"]))
+            db.commit()
+
+    def test_gate_stage_choice_maps_direction(self):
+        response = self.client.post("/api/label/capture", json={
+            "capture_id": self.row["id"], "annotator": "测试",
+            "fields": {"corrected_stage": "出大门"}})
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        with closing(server.get_db()) as db:
+            after = db.execute("SELECT stage, osd_camera FROM captures WHERE id=?",
+                               (self.row["id"],)).fetchone()
+        self.assertEqual(after["stage"], self.row["stage"])           # 环节本身不变
+        self.assertEqual(after["osd_camera"], self.row["osd_camera"])   # 设备名不被伪造
+        detail = self.client.get(f"/api/order/{self.row['order_id']}").get_json()
+        target = [i for i in detail["items"] if i["id"] == self.row["id"]][0]
+        self.assertEqual(target["progress_status"], "大门出")          # 方向修正生效
+        self.assertFalse(detail["progress_assumed"])                  # 离场被确认
 
 
 if __name__ == "__main__":
