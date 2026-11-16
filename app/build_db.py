@@ -718,8 +718,14 @@ def ocr_capture(payload: dict) -> dict:
             if candidate in bottom_joined:
                 vehicle_type = candidate
                 break
-        camera_match = re.search(r"(CAMERA\s*\d{1,3})", bottom_joined)
-        camera = camera_match.group(1).replace(" ", "") if camera_match else ""
+        # 设备名：中文命名（如"大门抓拍进01"）携带进/出方向，优先于默认名 Camera xx；
+        # 设备名同时出现在右下角与"监控点信息/设备编号"字段，任一处命中即可
+        cn_match = re.search(r"(大门抓拍[进出])", bottom_joined)
+        if cn_match:
+            camera = cn_match.group(1)
+        else:
+            camera_match = re.search(r"(camera\s*\d{1,3})", bottom_joined, re.IGNORECASE)
+            camera = camera_match.group(1).replace(" ", "") if camera_match else ""
 
     # 顶部失败时才用底部OSD时间兜底（其日期可能被换行切断，写库阶段
     # 仍会按 folder/embedded 校验，不通过则标记 conflict）。
@@ -769,13 +775,15 @@ def image_quality(image: Image.Image) -> float:
 
 
 def process_missing(conn: sqlite3.Connection, limit: int = 0, force: bool = False,
-                    retry_failed: bool = False) -> int:
+                    retry_failed: bool = False, stage: str = "") -> int:
     """补充 OCR：时间戳、底部OSD参考、质量分。失败时降级为阶段顺序，不伪造时间。
 
     OCR 在进程池中并行执行（每个 worker 独立加载 RapidOCR），主进程写库；
     结束后对仍无时间的帧做兄弟帧补时（fill_times_from_siblings）。
     retry_failed=True 只重跑 ocr_status='fallback' 的历史失败帧（启用时刻带
     抢救通道后再试一次），不动已成功的帧。
+    stage 参数限定只处理指定环节（配合 force 做定向回填，如历史抓拍照片
+    补中文设备名 osd_camera），空串=不限。
     """
     from concurrent.futures import ProcessPoolExecutor
 
@@ -787,13 +795,23 @@ def process_missing(conn: sqlite3.Connection, limit: int = 0, force: bool = Fals
         where = "coalesce(ocr_status,'')='fallback'"
     else:
         where = "coalesce(ocr_status,'')=''"
-    rows = conn.execute(
-        f"""SELECT id, filepath, stage FROM captures
-            WHERE {where}
-            ORDER BY date, order_id, stage_rank, filename"""
-        + (" LIMIT ?" if limit else ""),
-        () if not limit else (limit,),
-    ).fetchall()
+    if stage:
+        where += " AND stage=?"
+        rows = conn.execute(
+            f"""SELECT id, filepath, stage FROM captures
+                WHERE {where}
+                ORDER BY date, order_id, stage_rank, filename"""
+            + (" LIMIT ?" if limit else ""),
+            (stage,) if not limit else (stage, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            f"""SELECT id, filepath, stage FROM captures
+                WHERE {where}
+                ORDER BY date, order_id, stage_rank, filename"""
+            + (" LIMIT ?" if limit else ""),
+            () if not limit else (limit,),
+        ).fetchall()
     payloads = [{"id": int(row[0]), "filepath": str(resolve_stored_path(row[1])),
                  "stage": row[2]} for row in rows]
     started = time.time()
@@ -2765,6 +2783,9 @@ def main() -> None:
     parser.add_argument("--sync-only", action="store_true", help="只扫描目录，不跑OCR")
     parser.add_argument("--process-missing", action="store_true", help="补充OCR时间戳/OSD")
     parser.add_argument("--force-process", action="store_true", help="强制重跑OCR")
+    parser.add_argument("--stage", default="",
+                        help="配合 --force-process/--process-missing 只处理指定环节"
+                             "（如 --stage 抓拍 定向回填中文设备名）")
     parser.add_argument("--retry-failed", action="store_true",
                         help="只重跑 ocr_status=fallback 的帧（启用时刻带抢救通道）")
     parser.add_argument("--associate-only", action="store_true", help="只重新聚合订单内车辆")
@@ -2814,7 +2835,7 @@ def main() -> None:
     if args.process_missing or args.force_process or not (
         args.sync_only or args.associate_only or standalone or args.retry_failed
     ):
-        process_missing(conn, args.limit, args.force_process)
+        process_missing(conn, args.limit, args.force_process, stage=args.stage)
     if args.undo_loose_assign:
         undo_loose_assign(conn, args.capture_id or None)
     elif args.assign_loose:

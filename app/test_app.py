@@ -444,6 +444,23 @@ class ProgressStatusTests(unittest.TestCase):
         self.assertEqual(info["progress_status"], "大门出")
         self.assertTrue(info["progress_assumed"])
 
+    def test_gate_out_photo_confirms_departure(self):
+        # 出方向大门照片（OSD 设备名"大门抓拍出"）= 离场实锤：
+        # 即使出磅照片缺失也不带推定标记
+        events = [("2026-10-29 10:00:00", "入磅", ""),
+                  ("2026-10-29 12:30:00", "抓拍", "out")]
+        info = server.compute_progress_status(events, now=datetime(2026, 10, 29, 12, 31, 0))
+        self.assertEqual(info["progress_status"], "大门出")
+        self.assertFalse(info["progress_assumed"])
+
+    def test_undirected_snap_still_assumed(self):
+        # 对照：无方向的场院抓拍在同样场景下只能走静默自愈（带推定标记）
+        events = [("2026-10-29 10:00:00", "入磅", ""),
+                  ("2026-10-29 12:30:00", "抓拍", "")]
+        info = server.compute_progress_status(events, now=datetime(2026, 10, 30, 12, 0, 0))
+        self.assertEqual(info["progress_status"], "大门出")
+        self.assertTrue(info["progress_assumed"])
+
     def test_full_flow(self):
         events = [("2026-10-29 09:00:00", "抓拍"), ("2026-10-29 09:02:00", "质检"),
                   ("2026-10-29 09:03:00", "入磅"), ("2026-10-29 09:04:00", "抓拍"),
@@ -484,6 +501,19 @@ class ProgressStatusTests(unittest.TestCase):
         self.assertTrue(states[2]["progress_assumed"])
         self.assertIn("漏拍", states[2]["progress_note"])
 
+    def test_capture_status_gate_out_photo(self):
+        """逐张：出方向大门照片那一刻即为"大门出"（确认）。"""
+        caps = [
+            {"id": 1, "capture_time": "2026-10-29 10:00:00", "stage": "入磅",
+             "capture_status": "vehicle", "osd_camera": ""},
+            {"id": 2, "capture_time": "2026-10-29 12:30:00", "stage": "抓拍",
+             "capture_status": "vehicle", "osd_camera": "大门抓拍出01"},
+        ]
+        states = server.compute_capture_statuses(caps)
+        self.assertEqual(states[0]["progress_status"], "入磅中")
+        self.assertEqual(states[1]["progress_status"], "大门出")
+        self.assertFalse(states[1]["progress_assumed"])
+
 
 class OpenApiProgressTests(unittest.TestCase):
     """开放接口进度字段接线验证（临时注入 token，不动真实配置）。"""
@@ -510,6 +540,9 @@ class OpenApiProgressTests(unittest.TestCase):
         items = data["items"]
         self.assertTrue(items)
         for item in items:
+            # 无任何有效时间戳事件的订单状态为空串（无证据不判定），跳过
+            if not item["progress_status"]:
+                continue
             self.assertIn(item["progress_status"], server.PROGRESS_STATUSES)
             self.assertIn("last_stage", item)
             self.assertIn("last_event_time", item)

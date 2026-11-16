@@ -116,7 +116,7 @@ def cosine(left: np.ndarray, right: np.ndarray) -> float:
 CAPTURE_FIELDS = """
     id, filename, date, coalesce(park,'') AS park, order_id, stage, camera_key, resolution,
     capture_time, hour, ocr_status,
-    osd_plate, osd_color, osd_type,
+    osd_plate, osd_color, osd_type, osd_camera,
     plate_final, plate_observed, plate_confidence, recognition_source,
     vehicle_color, vehicle_color_conf, vehicle_type, vehicle_type_conf,
     attr_model_version,
@@ -628,16 +628,22 @@ PROGRESS_EVENT_WHERE = ("capture_time!='' AND coalesce(capture_status,'vehicle')
                         "AND order_id!='' AND order_id!='未关联图片'")
 
 
-def _progress_state_at(weigh_t, out_t, snap_t, gate_t, last_t, now, th):
+def _progress_state_at(weigh_t, out_t, snap_t, gate_out_t, gate_t, last_t, now, th):
     """按已发生的累计事件时间，判定时刻 now 车辆所处的进度状态。
 
-    weigh_t/out_t/snap_t 是至今最新的入磅/出磅/抓拍时间，gate_t 是首个有效
-    事件（进园锚点），last_t 是最新事件时间（静默计算基准）；全部应 <= now。
-    th 为阈值字典（silence_tail_min/exit_assume_min/weigh_min/gate_in_min）。
+    weigh_t/out_t/snap_t 是至今最新的入磅/出磅/抓拍时间，gate_out_t 是最新
+    "出方向"大门照片时间（OSD 设备名判定，如"大门抓拍出"），gate_t 是首个
+    有效事件（进园锚点），last_t 是最新事件时间（静默计算基准）；全部应
+    <= now。th 为阈值字典（silence_tail_min/exit_assume_min/weigh_min/gate_in_min）。
     返回 (状态, 是否推定, 推定说明, 状态锚点时间或None)。
     """
     silence = (now - last_t) if last_t else None
     silence_tail = timedelta(minutes=th["silence_tail_min"])
+    # 出方向大门照片晚于全部过磅事件：离场被照片直接确认（非推定），
+    # 出磅照片漏拍也能凭它收尾
+    if (gate_out_t and (not weigh_t or gate_out_t > weigh_t)
+            and (not out_t or gate_out_t > out_t)):
+        return PROGRESS_GATE_OUT, False, "", None
     if weigh_t and (not out_t or weigh_t > out_t):
         if silence and silence > silence_tail:
             # 卸货/复磅后长时间杳无音信：出磅照片大概率漏拍，保守推定离场
@@ -728,9 +734,11 @@ def compute_progress_status(events, now=None, th=None):
     事件时 progress_status 为空串。now 与 th 供测试注入。
     """
     parsed = []
-    for time_text, stage in events:
+    for event in events:
+        time_text, stage = event[0], event[1]
+        direction = event[2] if len(event) > 2 else ""
         try:
-            parsed.append((datetime.strptime(time_text, "%Y-%m-%d %H:%M:%S"), stage))
+            parsed.append((datetime.strptime(time_text, "%Y-%m-%d %H:%M:%S"), stage, direction))
         except ValueError:
             continue
     if not parsed:
@@ -738,15 +746,16 @@ def compute_progress_status(events, now=None, th=None):
                 "last_stage": "", "last_event_time": ""}
     now = now or datetime.now()
     th = th or DEFAULT_PROGRESS_TH
-    weigh_t = max((t for t, s in parsed if s == "入磅"), default=None)
-    out_t = max((t for t, s in parsed if s == "出磅"), default=None)
-    snap_t = max((t for t, s in parsed if s == "抓拍"), default=None)
+    weigh_t = max((t for t, s, d in parsed if s == "入磅"), default=None)
+    out_t = max((t for t, s, d in parsed if s == "出磅"), default=None)
+    snap_t = max((t for t, s, d in parsed if s == "抓拍"), default=None)
+    gate_out_t = max((t for t, s, d in parsed if s == "抓拍" and d == "out"), default=None)
     gate_t = min(parsed)[0]
-    last_time, last_stage = max(parsed, key=lambda pair: pair[0])
+    last_time, last_stage, _ = max(parsed, key=lambda pair: pair[0])
     if out_t and snap_t and snap_t > out_t:
         last_time, last_stage = snap_t, "抓拍"
     status, assumed, note, anchor = _progress_state_at(
-        weigh_t, out_t, snap_t, gate_t, last_time, now, th)
+        weigh_t, out_t, snap_t, gate_out_t, gate_t, last_time, now, th)
     minutes = int((now - anchor).total_seconds() // 60) if anchor else None
     return {"progress_status": status, "progress_assumed": assumed, "progress_note": note,
             "progress_minutes": minutes, "last_stage": last_stage,
@@ -768,7 +777,7 @@ def compute_capture_statuses(captures, th=None):
         range(len(captures)),
         key=lambda i: ((captures[i].get("capture_time") or ""),
                        captures[i].get("id") or 0))
-    weigh_t = out_t = snap_t = gate_t = last_t = None
+    weigh_t = out_t = snap_t = gate_out_t = gate_t = last_t = None
     for i in order:
         capture = captures[i]
         try:
@@ -776,6 +785,8 @@ def compute_capture_statuses(captures, th=None):
         except ValueError:
             continue
         stage = capture.get("stage") or ""
+        camera = capture.get("osd_camera") or ""
+        direction = "in" if "进" in camera else ("out" if "出" in camera else "")
         if (capture.get("capture_status") or "") != "no_vehicle":
             if stage == "入磅":
                 weigh_t = t          # 先入账再判定：本张即"上磅"时刻
@@ -783,11 +794,13 @@ def compute_capture_statuses(captures, th=None):
                 out_t = t
             elif stage == "抓拍":
                 snap_t = t
+                if direction == "out":
+                    gate_out_t = t   # 出方向大门照片：离场实锤事件
             last_t = t
             if gate_t is None:
                 gate_t = t           # 首个有效事件 = 进园锚点
         status, assumed, note, anchor = _progress_state_at(
-            weigh_t, out_t, snap_t, gate_t, last_t, t, th)
+            weigh_t, out_t, snap_t, gate_out_t, gate_t, last_t, t, th)
         info = {"progress_status": status, "progress_assumed": assumed, "progress_note": note}
         if anchor:
             info["progress_minutes"] = int((t - anchor).total_seconds() // 60)
@@ -813,20 +826,27 @@ def attach_capture_statuses(items, th_getter=None):
 
 
 def fetch_progress_events(db, order_ids):
-    """按订单号批量取事件流，返回 {(park, order_id): [(capture_time, stage)]}。"""
+    """按订单号批量取事件流，返回 {(park, order_id): [(capture_time, stage, direction)]}。
+
+    direction 来自 OSD 设备名（osd_camera，如"大门抓拍进01"）：进/出方向
+    已由上游 NVR 标明的照片直接判定，无名设备（Camera xx）为空串。
+    """
     events = {}
     ids = sorted(set(order_ids))
     if not ids:
         return events
     placeholders = ",".join("?" * len(ids))
     rows = db.execute(
-        f"""SELECT coalesce(park,'') AS park, order_id, capture_time, stage
+        f"""SELECT coalesce(park,'') AS park, order_id, capture_time, stage,
+                   coalesce(osd_camera,'') AS osd_camera
             FROM captures WHERE {PROGRESS_EVENT_WHERE} AND order_id IN ({placeholders})""",
         ids,
     ).fetchall()
     for row in rows:
+        camera = row["osd_camera"] or ""
+        direction = "in" if "进" in camera else ("out" if "出" in camera else "")
         events.setdefault((row["park"], row["order_id"]), []).append(
-            (row["capture_time"], row["stage"]))
+            (row["capture_time"], row["stage"], direction))
     return events
 
 
@@ -937,15 +957,20 @@ def order_detail(order_id: str):
         summary = order_summary(db, order_id, park if park else parks[0])
         items = annotate_order_plates([dict(row) for row in rows], db)
         attach_capture_statuses(items, lambda p: flow_thresholds(db, p))
-        events = [(row["capture_time"], row["stage"]) for row in rows
+        # 事件流带方向（osd_camera 设备名），出向大门照片才能确认离场
+        events = [(row["capture_time"], row["stage"],
+                   "in" if "进" in (row["osd_camera"] or "")
+                   else ("out" if "出" in (row["osd_camera"] or "") else ""))
+                  for row in rows
                   if row["capture_time"] and (row["capture_status"] or "") != "no_vehicle"]
+        th = flow_thresholds(db, park if park else parks[0])
     if not rows:
         return jsonify({"error": "订单不存在", "items": []}), 404
     response = {"order_id": order_id, "park": park if park else parks[0],
                 "order_time": summary["order_time"], "plate": summary["plate"],
                 "attributes": dict(attrs) if attrs else None,
                 "items": items}
-    response.update(compute_progress_status(events))
+    response.update(compute_progress_status(events, th=th))
     return jsonify(response)
 
 
@@ -2349,7 +2374,10 @@ def open_order_detail(order_id: str):
             (order_id, park if park else parks[0]),
         ).fetchone()
         summary = order_summary(db, order_id, park if park else parks[0])
-        events = [(row["capture_time"], row["stage"]) for row in rows
+        events = [(row["capture_time"], row["stage"],
+                   "in" if "进" in (row["osd_camera"] or "")
+                   else ("out" if "出" in (row["osd_camera"] or "") else ""))
+                  for row in rows
                   if row["capture_time"] and (row["capture_status"] or "") != "no_vehicle"]
         th = flow_thresholds(db, park if park else parks[0])
     data = {"order_id": order_id, "park": park if park else parks[0],
