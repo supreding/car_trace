@@ -25,7 +25,7 @@ import re
 import shutil
 import sqlite3
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 from contextlib import closing
 from datetime import datetime, timedelta
 from functools import wraps
@@ -565,11 +565,17 @@ def order_summary(db: sqlite3.Connection, order_id: str, park: str) -> dict:
 #   等待入磅 同上但超过 GATE_IN（在场上排队/待检；进园锚点取首个事件，中途的
 #            场院抓拍不重置，避免排队一动就变回"大门进"）
 #   入磅中   最后事件为入磅，距今 ≤ WEIGH（称重进行中）
-#   卸货     已入磅未出磅（超过 WEIGH 后的整个在卸时段；出磅照片缺失会停在此态）
-#   出磅中   最后事件为出磅、其后无抓拍，距今 ≤ EXIT_ASSUME（称重完至确认离场）
-#   大门出   出磅后出现抓拍；或出磅超过 EXIT_ASSUME 仍无后续（推定已离场）
+#   卸货     已入磅未出磅（超过 WEIGH 后的整个在卸时段）
+#   出磅中   最后事件为出磅、其后无抓拍，距今 ≤ 出磅窗口（称重完至确认离场）
+#   大门出   出磅后出现抓拍（确认）；或推定（见下，带 progress_assumed 标记）
 #
-# 阈值可用环境变量覆盖：STATUS_GATE_IN_MIN / STATUS_WEIGH_MIN / STATUS_EXIT_ASSUME_MIN。
+# 两条自愈规则（漏拍流程不再永久卡死，均标"推定"）：
+#   - 卸货/等待状态下，静默（距今最后一张有效抓拍）超过本园区"在场最长静默"
+#     p97.5（压过隔夜停车本底）→ 推定大门出，说明"疑似漏拍出磅/流程照片缺失"；
+#   - 出磅后超过本园区"出磅→离场抓拍"p95 仍无抓拍 → 推定大门出。
+# 阈值自适应：exit/silence 两项按园区从存量订单自动拟合（flow_thresholds），
+# 环境变量 STATUS_EXIT_ASSUME_MIN / STATUS_SILENCE_TAIL_MIN 显式设置时全园区强制；
+# GATE_IN/WEIGH 仍为固定值（STATUS_GATE_IN_MIN / STATUS_WEIGH_MIN 可覆盖）。
 # 照片经每 30 分钟的定时流水线入库，状态时效以此为准（约 30~60 分钟延迟）。
 # ---------------------------------------------------------------------------
 
@@ -591,41 +597,135 @@ def _env_minutes(name: str, default: float) -> float:
         return default
 
 
+def _env_minutes_opt(name: str):
+    """环境变量未设置/非法时返回 None（表示交给按园区自适应阈值）。"""
+    try:
+        value = os.environ.get(name, "").strip()
+        return float(value) if value else None
+    except ValueError:
+        return None
+
+
 PROGRESS_GATE_IN_MIN = _env_minutes("STATUS_GATE_IN_MIN", 15)
 PROGRESS_WEIGH_MIN = _env_minutes("STATUS_WEIGH_MIN", 10)
-PROGRESS_EXIT_ASSUME_MIN = _env_minutes("STATUS_EXIT_ASSUME_MIN", 60)
+# 出磅推定窗口 / 静默自愈阈值：显式设置环境变量则全园区强制；否则按园区分位数自适应
+PROGRESS_EXIT_ASSUME_ENV = _env_minutes_opt("STATUS_EXIT_ASSUME_MIN")
+PROGRESS_SILENCE_TAIL_ENV = _env_minutes_opt("STATUS_SILENCE_TAIL_MIN")
+PROGRESS_EXIT_ASSUME_FALLBACK = 60.0      # 样本不足时的出磅→离场窗口（分钟）
+PROGRESS_SILENCE_TAIL_FALLBACK = 1080.0   # 样本不足时的静默自愈阈值（18 小时）
+PROGRESS_MIN_SAMPLES = 10                 # 分位数拟合所需最小样本数
+
+# 测试/无库上下文用的默认阈值（与原固定行为一致）
+DEFAULT_PROGRESS_TH = {
+    "gate_in_min": PROGRESS_GATE_IN_MIN,
+    "weigh_min": PROGRESS_WEIGH_MIN,
+    "exit_assume_min": PROGRESS_EXIT_ASSUME_ENV or PROGRESS_EXIT_ASSUME_FALLBACK,
+    "silence_tail_min": PROGRESS_SILENCE_TAIL_ENV or PROGRESS_SILENCE_TAIL_FALLBACK,
+}
 
 # 事件流取数条件：只认有 OCR 时间、检出车辆、归属真实订单的抓拍
 PROGRESS_EVENT_WHERE = ("capture_time!='' AND coalesce(capture_status,'vehicle')!='no_vehicle' "
                         "AND order_id!='' AND order_id!='未关联图片'")
 
 
-def _progress_state_at(weigh_t, out_t, snap_t, gate_t, now):
+def _progress_state_at(weigh_t, out_t, snap_t, gate_t, last_t, now, th):
     """按已发生的累计事件时间，判定时刻 now 车辆所处的进度状态。
 
     weigh_t/out_t/snap_t 是至今最新的入磅/出磅/抓拍时间，gate_t 是首个有效
-    事件（进园锚点，大门进/等待入磅从它起算，后续场院抓拍不重置）；全部应
-    <= now。无任何事件返回空串（无徽章）。
+    事件（进园锚点），last_t 是最新事件时间（静默计算基准）；全部应 <= now。
+    th 为阈值字典（silence_tail_min/exit_assume_min/weigh_min/gate_in_min）。
+    返回 (状态, 是否推定, 推定说明, 状态锚点时间或None)。
     """
+    silence = (now - last_t) if last_t else None
+    silence_tail = timedelta(minutes=th["silence_tail_min"])
     if weigh_t and (not out_t or weigh_t > out_t):
-        # 最新一次过磅是入磅（出磅后复检入磅也算回此分支）
-        return (PROGRESS_WEIGHING if now - weigh_t <= timedelta(minutes=PROGRESS_WEIGH_MIN)
-                else PROGRESS_UNLOADING)
+        if silence and silence > silence_tail:
+            # 卸货/复磅后长时间杳无音信：出磅照片大概率漏拍，保守推定离场
+            return PROGRESS_GATE_OUT, True, "疑似漏拍出磅，按园区静默阈值推定已离场", None
+        if now - weigh_t <= timedelta(minutes=th["weigh_min"]):
+            return PROGRESS_WEIGHING, False, "", weigh_t
+        return PROGRESS_UNLOADING, False, "", weigh_t
     if out_t:
         if snap_t and snap_t > out_t:
-            return PROGRESS_GATE_OUT
-        return (PROGRESS_WEIGHOUT if now - out_t <= timedelta(minutes=PROGRESS_EXIT_ASSUME_MIN)
-                else PROGRESS_GATE_OUT)
+            return PROGRESS_GATE_OUT, False, "", None
+        if now - out_t <= timedelta(minutes=th["exit_assume_min"]):
+            return PROGRESS_WEIGHOUT, False, "", out_t
+        return PROGRESS_GATE_OUT, True, "出磅后长时间无抓拍，推定已离场", None
     if gate_t:
-        return (PROGRESS_GATE_IN if now - gate_t <= timedelta(minutes=PROGRESS_GATE_IN_MIN)
-                else PROGRESS_WAIT_WEIGH)
-    return ""
+        if silence and silence > silence_tail:
+            return PROGRESS_GATE_OUT, True, "全流程照片缺失，按园区静默阈值推定已离场", None
+        if now - gate_t <= timedelta(minutes=th["gate_in_min"]):
+            return PROGRESS_GATE_IN, False, "", gate_t
+        return PROGRESS_WAIT_WEIGH, False, "", gate_t
+    return "", False, "", None
 
 
-def compute_progress_status(events, now=None):
-    """events: [(capture_time, stage)]（已按上面的条件过滤）；返回状态三字段。
+_FLOW_TH_CACHE: dict = {}
 
-    无有效事件时 progress_status 为空串。now 参数供测试注入时钟。
+
+def flow_thresholds(db, park):
+    """按园区从存量订单拟合状态推定阈值（进程内缓存，数据变化自动失效）。
+
+    - exit_assume_min：出磅→离场确认抓拍间隔的 p95（等结算的车别急着标离场）
+    - silence_tail_min：订单在场时段最长静默的 p97.5（压过隔夜停车本底，
+      静默超过它即视为已离场证据，用于漏拍流程自愈）
+    环境变量 STATUS_EXIT_ASSUME_MIN / STATUS_SILENCE_TAIL_MIN 显式设置时强制
+    全园区覆盖；样本不足时退回兜底常量。返回阈值字典。
+    """
+    if PROGRESS_EXIT_ASSUME_ENV is not None and PROGRESS_SILENCE_TAIL_ENV is not None:
+        return {"gate_in_min": PROGRESS_GATE_IN_MIN, "weigh_min": PROGRESS_WEIGH_MIN,
+                "exit_assume_min": PROGRESS_EXIT_ASSUME_ENV,
+                "silence_tail_min": PROGRESS_SILENCE_TAIL_ENV}
+    version = db.execute("SELECT coalesce(MAX(rowid),0), COUNT(*) FROM captures").fetchone()
+    version = (version[0], version[1])
+    slot = _FLOW_TH_CACHE.get(park)
+    if slot and slot[0] == version:
+        return slot[1]
+    exit_gaps, silences = [], []
+    rows = db.execute(
+        f"""SELECT order_id, capture_time, stage FROM captures
+            WHERE {PROGRESS_EVENT_WHERE} AND coalesce(park,'')=?
+            ORDER BY order_id, capture_time""",
+        (park,),
+    ).fetchall()
+    by_order = defaultdict(list)
+    for row in rows:
+        by_order[row["order_id"]].append(
+            (datetime.strptime(row["capture_time"], "%Y-%m-%d %H:%M:%S"), row["stage"]))
+    for events in by_order.values():
+        ts = [t for t, _ in events]
+        if len(ts) >= 2:
+            silences.append(max((b - a).total_seconds() / 60 for a, b in zip(ts, ts[1:])))
+        out_times = [t for t, s in events if s == "出磅"]
+        if out_times:
+            post_snaps = [t for t, s in events if s == "抓拍" and t > max(out_times)]
+            if post_snaps:
+                exit_gaps.append((min(post_snaps) - max(out_times)).total_seconds() / 60)
+    th = {
+        "gate_in_min": PROGRESS_GATE_IN_MIN,
+        "weigh_min": PROGRESS_WEIGH_MIN,
+        "exit_assume_min": PROGRESS_EXIT_ASSUME_ENV or (
+            _quantile(exit_gaps, 0.95) if len(exit_gaps) >= PROGRESS_MIN_SAMPLES
+            else PROGRESS_EXIT_ASSUME_FALLBACK),
+        "silence_tail_min": PROGRESS_SILENCE_TAIL_ENV or (
+            _quantile(silences, 0.975) if len(silences) >= PROGRESS_MIN_SAMPLES
+            else PROGRESS_SILENCE_TAIL_FALLBACK),
+    }
+    _FLOW_TH_CACHE[park] = (version, th)
+    return th
+
+
+def _quantile(values, q):
+    vs = sorted(values)
+    return vs[min(len(vs) - 1, int(len(vs) * q))]
+
+
+def compute_progress_status(events, now=None, th=None):
+    """events: [(capture_time, stage)]（已按上面的条件过滤）；返回状态字段组。
+
+    含 progress_status / progress_assumed（是否推定）/ progress_note（推定
+    说明）/ progress_minutes（当前状态已持续分钟数）与最后事件摘要。无有效
+    事件时 progress_status 为空串。now 与 th 供测试注入。
     """
     parsed = []
     for time_text, stage in events:
@@ -634,8 +734,10 @@ def compute_progress_status(events, now=None):
         except ValueError:
             continue
     if not parsed:
-        return {"progress_status": "", "last_stage": "", "last_event_time": ""}
+        return {"progress_status": "", "progress_assumed": False, "progress_note": "",
+                "last_stage": "", "last_event_time": ""}
     now = now or datetime.now()
+    th = th or DEFAULT_PROGRESS_TH
     weigh_t = max((t for t, s in parsed if s == "入磅"), default=None)
     out_t = max((t for t, s in parsed if s == "出磅"), default=None)
     snap_t = max((t for t, s in parsed if s == "抓拍"), default=None)
@@ -643,26 +745,30 @@ def compute_progress_status(events, now=None):
     last_time, last_stage = max(parsed, key=lambda pair: pair[0])
     if out_t and snap_t and snap_t > out_t:
         last_time, last_stage = snap_t, "抓拍"
-    return {"progress_status": _progress_state_at(weigh_t, out_t, snap_t, gate_t, now),
-            "last_stage": last_stage,
+    status, assumed, note, anchor = _progress_state_at(
+        weigh_t, out_t, snap_t, gate_t, last_time, now, th)
+    minutes = int((now - anchor).total_seconds() // 60) if anchor else None
+    return {"progress_status": status, "progress_assumed": assumed, "progress_note": note,
+            "progress_minutes": minutes, "last_stage": last_stage,
             "last_event_time": last_time.strftime("%Y-%m-%d %H:%M:%S")}
 
 
-def compute_capture_statuses(captures):
+def compute_capture_statuses(captures, th=None):
     """给同一订单的一组抓拍逐张标注拍摄时刻的进度状态。
 
-    推导规则与 compute_progress_status 同口径，只是判定时刻换成"该张照片的
-    拍摄时间"：入磅照片本身标"入磅中"，出磅照片标"出磅中"，出磅后的抓拍标
-    "大门出"；入磅前的抓拍/质检只记位置不刷新进园锚点（否则排队每动一下都
-    变回"大门进"）。no_vehicle、无时间、时间无法解析的照片不产生事件，但仍
-    按此前事件标状态（此前无事件则标空串）。返回与 captures 等长的状态列表。
+    推导规则与 compute_progress_status 同口径，判定时刻换成"该张照片的拍摄
+    时间"：入磅照片本身标"入磅中"，出磅照片标"出磅中"，出磅后的抓拍标"大门
+    出"；入磅前的抓拍/质检只记位置不刷新进园锚点。no_vehicle、无时间、时间
+    无法解析的照片不产生事件，但仍按此前事件标状态（含静默自愈推定）。返回
+    与 captures 等长的状态字段字典列表。
     """
+    th = th or DEFAULT_PROGRESS_TH
     states = [""] * len(captures)
     order = sorted(
         range(len(captures)),
         key=lambda i: ((captures[i].get("capture_time") or ""),
                        captures[i].get("id") or 0))
-    weigh_t = out_t = snap_t = gate_t = None
+    weigh_t = out_t = snap_t = gate_t = last_t = None
     for i in order:
         capture = captures[i]
         try:
@@ -677,22 +783,32 @@ def compute_capture_statuses(captures):
                 out_t = t
             elif stage == "抓拍":
                 snap_t = t
+            last_t = t
             if gate_t is None:
                 gate_t = t           # 首个有效事件 = 进园锚点
-        states[i] = _progress_state_at(weigh_t, out_t, snap_t, gate_t, t)
+        status, assumed, note, anchor = _progress_state_at(
+            weigh_t, out_t, snap_t, gate_t, last_t, t, th)
+        info = {"progress_status": status, "progress_assumed": assumed, "progress_note": note}
+        if anchor:
+            info["progress_minutes"] = int((t - anchor).total_seconds() // 60)
+        states[i] = info
     return states
 
 
-def attach_capture_statuses(items):
-    """按 (park, order_id) 分组为每组抓拍附上 progress_status 字段（就地修改）。"""
+def attach_capture_statuses(items, th_getter=None):
+    """按 (park, order_id) 分组为每组抓拍附上逐张进度状态字段（就地修改）。
+
+    th_getter(park) 返回该园区阈值字典；缺省用默认阈值。
+    """
     groups = {}
     for item in items:
         key = (item.get("park") or "", item.get("order_id") or "")
         if key[1]:
             groups.setdefault(key, []).append(item)
-    for group in groups.values():
-        for item, state in zip(group, compute_capture_statuses(group)):
-            item["progress_status"] = state
+    for (park, _order_id), group in groups.items():
+        th = th_getter(park) if th_getter else None
+        for item, info in zip(group, compute_capture_statuses(group, th)):
+            item.update(info)
     return items
 
 
@@ -780,7 +896,8 @@ def orders():
                                     "type": attrs["vehicle_type_conf"]}
             row.update(order_summary(db, row["order_id"], row["park"] or ""))
             row.update(compute_progress_status(
-                progress_events.get((row["park"] or "", row["order_id"]), [])))
+                progress_events.get((row["park"] or "", row["order_id"]), []),
+                th=flow_thresholds(db, row["park"] or "")))
     return jsonify(rows)
 
 
@@ -819,7 +936,7 @@ def order_detail(order_id: str):
         ).fetchone()
         summary = order_summary(db, order_id, park if park else parks[0])
         items = annotate_order_plates([dict(row) for row in rows], db)
-        attach_capture_statuses(items)
+        attach_capture_statuses(items, lambda p: flow_thresholds(db, p))
         events = [(row["capture_time"], row["stage"]) for row in rows
                   if row["capture_time"] and (row["capture_status"] or "") != "no_vehicle"]
     if not rows:
@@ -1077,7 +1194,7 @@ def track():
         else:
             return jsonify([])
         items = annotate_order_plates([dict(row) for row in rows], db)
-        attach_capture_statuses(items)
+        attach_capture_statuses(items, lambda p: flow_thresholds(db, p))
     return jsonify(items)
 
 
@@ -2193,7 +2310,8 @@ def open_orders():
                                      "type": attrs["vehicle_type_conf"]}
             item.update(order_summary(db, item["order_id"], item["park"]))
             item.update(compute_progress_status(
-                progress_events.get((item["park"], item["order_id"]), [])))
+                progress_events.get((item["park"], item["order_id"]), []),
+                th=flow_thresholds(db, item["park"])))
             items.append(item)
     return _open_ok({"total": total, "page": page, "page_size": page_size, "items": items})
 
@@ -2233,11 +2351,13 @@ def open_order_detail(order_id: str):
         summary = order_summary(db, order_id, park if park else parks[0])
         events = [(row["capture_time"], row["stage"]) for row in rows
                   if row["capture_time"] and (row["capture_status"] or "") != "no_vehicle"]
+        th = flow_thresholds(db, park if park else parks[0])
     data = {"order_id": order_id, "park": park if park else parks[0],
             "order_time": summary["order_time"], "plate": summary["plate"],
             "attributes": dict(attrs) if attrs else None,
-            "items": attach_capture_statuses([dict(row) for row in rows])}
-    data.update(compute_progress_status(events))
+            "items": attach_capture_statuses(
+                [dict(row) for row in rows], lambda p: flow_thresholds(db, p))}
+    data.update(compute_progress_status(events, th=th))
     return _open_ok({"data": data})
 
 
@@ -2336,9 +2456,9 @@ def open_yard():
                            if key in recent_pairs}
         enriched = []
         for (park, order_id), events in progress_events.items():
-            info = compute_progress_status(events)
+            info = compute_progress_status(events, th=flow_thresholds(db, park))
             if info["progress_status"] == PROGRESS_GATE_OUT:
-                continue  # 已离场不算在园
+                continue  # 已离场不算在园（含静默推定离场）
             enriched.append((info["last_event_time"], park, order_id, events, info))
         enriched.sort(key=lambda entry: entry[0], reverse=True)
         total = len(enriched)

@@ -209,6 +209,14 @@ class AppTestCase(unittest.TestCase):
             self.assertIn("progress_status", item,
                           f"抓拍 #{item['id']} 缺少逐张进度状态")
 
+    # 8.4b 按园区自适应阈值：从存量完整订单拟合，带缓存
+    def test_flow_thresholds(self):
+        th = server.flow_thresholds(self.db, "")
+        self.assertGreater(th["exit_assume_min"], 0)
+        self.assertGreaterEqual(th["silence_tail_min"], th["exit_assume_min"],
+                                "静默自愈阈值应不小于出磅窗口（更保守）")
+        self.assertIs(th, server.flow_thresholds(self.db, ""), "同版本数据应命中缓存")
+
     # 8.5 订单级汇总：每个订单确定大致发生时间（order_time）与唯一车牌号（plate）
     def test_order_summary_plate_and_time(self):
         rows = self.get_json("/api/orders?limit=100")
@@ -406,6 +414,36 @@ class ProgressStatusTests(unittest.TestCase):
         self.assertEqual(info["last_event_time"], "2026-10-29 10:03:00")
         self.assertEqual(info["last_stage"], "抓拍")
 
+    def test_exit_timeout_assumed(self):
+        # 出磅后超过默认窗口（60 分钟）无抓拍：大门出但必须带推定标记
+        info = server.compute_progress_status([("2026-10-29 10:00:00", "出磅")],
+                                              now=datetime(2026, 10, 29, 11, 30, 0))
+        self.assertEqual(info["progress_status"], "大门出")
+        self.assertTrue(info["progress_assumed"])
+        self.assertIn("推定", info["progress_note"])
+
+    def test_threshold_override_keeps_weighout(self):
+        th = dict(server.DEFAULT_PROGRESS_TH, exit_assume_min=200)
+        info = server.compute_progress_status([("2026-10-29 10:00:00", "出磅")],
+                                              now=datetime(2026, 10, 29, 11, 30, 0), th=th)
+        self.assertEqual(info["progress_status"], "出磅中")
+        self.assertFalse(info["progress_assumed"])
+
+    def test_silence_autoheal_unload(self):
+        # 卸货后长时间杳无音信：按静默阈值推定离场（疑似漏拍出磅），不再永久卡死
+        events = [("2026-10-29 10:00:00", "入磅"), ("2026-10-29 10:05:00", "抓拍")]
+        info = server.compute_progress_status(events, now=datetime(2026, 10, 30, 12, 0, 0))
+        self.assertEqual(info["progress_status"], "大门出")
+        self.assertTrue(info["progress_assumed"])
+        self.assertIn("漏拍", info["progress_note"])
+
+    def test_silence_autoheal_wait(self):
+        # 全流程缺失（只有场院抓拍）+ 长静默：同样推定离场
+        info = server.compute_progress_status([("2026-10-29 10:00:00", "抓拍")],
+                                              now=datetime(2026, 10, 30, 12, 0, 0))
+        self.assertEqual(info["progress_status"], "大门出")
+        self.assertTrue(info["progress_assumed"])
+
     def test_full_flow(self):
         events = [("2026-10-29 09:00:00", "抓拍"), ("2026-10-29 09:02:00", "质检"),
                   ("2026-10-29 09:03:00", "入磅"), ("2026-10-29 09:04:00", "抓拍"),
@@ -425,9 +463,26 @@ class ProgressStatusTests(unittest.TestCase):
             {"id": 7, "capture_time": "2026-10-29 11:05:00", "stage": "抓拍", "capture_status": "vehicle"},
             {"id": 8, "capture_time": "2026-10-29 11:06:00", "stage": "抓拍", "capture_status": "no_vehicle"},
         ]
-        self.assertEqual(server.compute_capture_statuses(caps),
+        self.assertEqual([info["progress_status"] for info in server.compute_capture_statuses(caps)],
                          ["大门进", "等待入磅", "等待入磅", "入磅中",
                           "卸货", "出磅中", "大门出", "大门出"])
+        # 入磅照片自带状态持续分钟数（照片时刻-上磅时刻）
+        self.assertEqual(server.compute_capture_statuses(caps)[3]["progress_minutes"], 0)
+
+    def test_capture_status_autoheal(self):
+        """逐张静默自愈：事件后再无动静超过静默阈值，之后的帧推定大门出；
+        若中途车辆重新被抓拍，静默重置，恢复卸货标注。"""
+        caps = [
+            {"id": 1, "capture_time": "2026-10-29 09:00:00", "stage": "入磅", "capture_status": "vehicle"},
+            {"id": 2, "capture_time": "2026-10-30 12:00:00", "stage": "抓拍", "capture_status": "vehicle"},
+            {"id": 3, "capture_time": "2026-10-31 09:00:00", "stage": "抓拍", "capture_status": "no_vehicle"},
+        ]
+        states = server.compute_capture_statuses(caps)
+        self.assertEqual(states[0]["progress_status"], "入磅中")
+        self.assertEqual(states[1]["progress_status"], "卸货")  # 重新出现，静默重置
+        self.assertEqual(states[2]["progress_status"], "大门出")
+        self.assertTrue(states[2]["progress_assumed"])
+        self.assertIn("漏拍", states[2]["progress_note"])
 
 
 class OpenApiProgressTests(unittest.TestCase):

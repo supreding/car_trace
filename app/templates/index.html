@@ -726,8 +726,14 @@
     // 大门进出用蓝，卸货紫，大门出为终态用默认灰弱化
     const statusColor = {"大门进": "blue", "等待入磅": "amber", "入磅中": "green",
                          "卸货": "purple", "出磅中": "green", "大门出": ""};
-    function statusBadge(st, lastTime, lastStage) {
-      return st ? `<span class="badge ${statusColor[st] || ""}" title="最后事件 ${esc(lastTime || "—")}（${esc(lastStage || "—")}）">${esc(st)}</span>` : "";
+    function statusBadge(st, lastTime, lastStage, assumed, note, minutes) {
+      if (!st) return "";
+      const label = assumed ? `${st}(推定)` : st;
+      const tip = [
+        lastTime ? `最后事件 ${lastTime}${lastStage ? `（${lastStage}）` : ""}` : "",
+        minutes != null ? `该状态已持续 ${minutes} 分钟` : "",
+        assumed && note ? `推定依据：${note}` : ""].filter(Boolean).join("；");
+      return `<span class="badge ${statusColor[st] || ""}"${assumed ? ' style="opacity:.72"' : ""} title="${esc(tip)}">${esc(label)}</span>`;
     }
     const COLOR_CN = {yellow: "黄色", orange: "橙色", green: "绿色", gray: "灰色", red: "红色", blue: "蓝色", white: "白色", golden: "金色", brown: "棕色", black: "黑色"};
     const TYPE_CN = {sedan: "轿车", suv: "SUV", van: "厢式车", hatchback: "两厢车", mpv: "MPV", pickup: "皮卡", bus: "客车", truck: "货车", estate: "旅行车"};
@@ -758,7 +764,8 @@
       <div class="s">${esc((it.first_seen || "").slice(5, 16))} ~ ${esc((it.last_seen || "").slice(11, 19))}</div></div></div>`;
       }
       const t = `订单 ${it.order_id}`;
-      const stBadge = statusBadge(it.progress_status, it.last_event_time, it.last_stage);
+      const stBadge = statusBadge(it.progress_status, it.last_event_time, it.last_stage,
+                                  it.progress_assumed, it.progress_note, it.progress_minutes);
       const s = [it.plate ? `车牌 ${esc(it.plate)}` : "", `${it.count}张`, it.date_span > 1 ? `跨${it.date_span}天` : "",
       esc(COLOR_CN[it.vehicle_color] || it.vehicle_color || ""), esc(TYPE_CN[it.vehicle_type] || it.vehicle_type || "")]
         .filter(Boolean).join(" · ");
@@ -799,7 +806,7 @@
     function tlRow(x) {
       const badges = [
         // 拍摄时刻的车辆进度状态（按本单截至该张照片的事件推导），排最前
-        x.progress_status ? `<span class="badge ${statusColor[x.progress_status] || ""}" title="拍摄这张照片时车辆所处的进度状态">${esc(x.progress_status)}</span>` : "",
+        statusBadge(x.progress_status, null, null, x.progress_assumed, x.progress_note, x.progress_minutes),
         x.stage ? `<span class="badge ${stageColor[x.stage] || ""}">${esc(x.stage)}</span>` : "",
         x.capture_status === "no_vehicle" ? '<span class="badge red">未检测到车辆</span>' : "",
         x.detection_count > 1 ? `<span class="badge amber">多目标 ${x.detection_count}</span>` : "",
