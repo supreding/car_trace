@@ -654,6 +654,10 @@ def plate_pass(
         # 标记，否则这些行永远满足 lpr_plate IS NULL，GPU 流水线每轮重复
         # 识别上万张无牌图（服务器实测每 30 分钟空转一轮的根源）。
         where += " AND lpr_attempted_at IS NULL"
+    # 人工已标车牌的帧不被自动 LPR 覆盖（统一标注面板保护，force 也不覆盖）。
+    where += (" AND NOT EXISTS (SELECT 1 FROM capture_annotations ca"
+              " WHERE ca.capture_id=captures.id"
+              " AND coalesce(ca.corrected_plate,'')!='')")
     where += " AND coalesce(park,'') NOT LIKE :qpark"
     sql = (f"SELECT id, vehicle_crop_path, coalesce(osd_plate,'') AS osd "
            f"FROM captures WHERE {where} ORDER BY id")
@@ -797,6 +801,11 @@ def correct_pass(
              AND coalesce(order_id,'')!='' AND order_id!='未关联图片'
              AND coalesce(park,'') NOT LIKE ?
              AND id NOT IN (SELECT capture_id FROM manual_box_edits)
+             -- 人工已标颜色/车型的帧不被属性复核覆盖（统一标注面板保护）
+             AND NOT EXISTS (SELECT 1 FROM capture_annotations ca
+                             WHERE ca.capture_id=captures.id
+                               AND (coalesce(ca.corrected_color,'')!=''
+                                    OR coalesce(ca.corrected_type,'')!=''))
            ORDER BY id""",
         (build_db.QUARANTINE_PARK_LIKE,),
     ).fetchall():

@@ -12,6 +12,8 @@ from datetime import datetime
 
 import numpy as np
 
+from contextlib import closing
+
 import server
 
 
@@ -554,6 +556,126 @@ class OpenApiProgressTests(unittest.TestCase):
             self.assertIn(item["progress_status"], server.PROGRESS_STATUSES)
             self.assertNotEqual(item["progress_status"], server.PROGRESS_GATE_OUT)
             self.assertIn("plate", item)
+
+
+class LabelWorkspaceTests(unittest.TestCase):
+    """标注工作台端到端：保存写回、锚点合成事件、队列、回放。测试后恢复原值。"""
+
+    @classmethod
+    def setUpClass(cls):
+        server.app.config.update(TESTING=True)
+        cls.client = server.app.test_client()
+
+    def post(self, url, **body):
+        response = self.client.post(url, json=body)
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        return response.get_json()
+
+    def test_label_capture_writeback_and_override(self):
+        from datetime import timedelta
+        with closing(server.get_db()) as db:
+            row = db.execute("""SELECT id, order_id, capture_time FROM captures
+                WHERE stage='抓拍' AND capture_time!=''
+                AND coalesce(capture_status,'vehicle')!='no_vehicle' LIMIT 1""").fetchone()
+        capture_id, order_id = row["id"], row["order_id"]
+        with closing(server.get_db()) as db:
+            orig = dict(db.execute(
+                """SELECT stage, stage_rank, capture_time, hour, ocr_status,
+                          plate_final, vehicle_color FROM captures WHERE id=?""",
+                (capture_id,)).fetchone())
+        try:
+            data = self.post("/api/label/capture", capture_id=capture_id,
+                             annotator="测试", notes="t",
+                             fields={"corrected_stage": "入磅", "corrected_status": "入磅中",
+                                     "corrected_direction": "out", "corrected_color": "白色",
+                                     "corrected_time": "08:00:00",
+                                     "corrected_plate": "皖L00001", "no_vehicle_manual": 0,
+                                     "usability": "valid"})
+            item = data["item"]
+            self.assertEqual(item["stage"], "入磅")                      # 写回
+            self.assertEqual(item["capture_time"].split(" ")[1], "08:00:00")
+            self.assertEqual(item["ocr_status"], "manual")               # 防OCR覆盖
+            self.assertEqual(item["plate_final"], "皖L00001")
+            self.assertEqual(item["vehicle_color"], "白色")
+            detail = self.client.get(f"/api/order/{order_id}").get_json()
+            target = [i for i in detail["items"] if i["id"] == capture_id][0]
+            self.assertEqual(target["progress_status"], "入磅中")         # override
+            self.assertEqual(target["progress_source"], "manual")
+        finally:
+            with closing(server.get_db()) as db:
+                db.execute("""UPDATE captures SET stage=?, stage_rank=?, capture_time=?,
+                              hour=?, ocr_status=?, plate_final=?, vehicle_color=?
+                              WHERE id=?""",
+                           (orig["stage"], orig["stage_rank"], orig["capture_time"],
+                            orig["hour"], orig["ocr_status"], orig["plate_final"],
+                            orig["vehicle_color"], capture_id))
+                db.execute("DELETE FROM capture_annotations WHERE capture_id=?", (capture_id,))
+                db.execute("DELETE FROM annotation_audit WHERE capture_id=?", (capture_id,))
+                db.commit()
+
+    def test_label_queue_assumed_only(self):
+        data = self.client.get("/api/label/queue?type=assumed").get_json()
+        for item in data["items"]:
+            self.assertTrue(item["progress_assumed"])
+            self.assertFalse(item["reviewed"])
+
+    def test_anchor_gate_out_confirms_departure(self):
+        from datetime import timedelta
+        with closing(server.get_db()) as db:
+            row = db.execute("""SELECT order_id, coalesce(park,'') AS park FROM captures
+                WHERE stage='入磅' AND capture_time!='' AND order_id!=''
+                GROUP BY order_id, park LIMIT 1""").fetchone()
+            last = db.execute("""SELECT MAX(capture_time) FROM captures
+                WHERE order_id=? AND capture_time!=''""",
+                (row["order_id"],)).fetchone()[0]
+        anchor_time = (datetime.strptime(last, "%Y-%m-%d %H:%M:%S")
+                       + timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+        self.post("/api/label/anchor", park=row["park"], order_id=row["order_id"],
+                  kind="gate_out", anchor_time=anchor_time, annotator="测试")
+        detail = self.client.get(f"/api/order/{row['order_id']}").get_json()
+        try:
+            self.assertEqual(detail["progress_status"], "大门出")
+            self.assertFalse(detail["progress_assumed"])   # 锚点=确认，非推定
+        finally:
+            with closing(server.get_db()) as db:
+                db.execute("DELETE FROM manual_order_anchors WHERE order_id=? AND annotator='测试'",
+                           (row["order_id"],))
+                db.commit()
+
+    def test_device_registry_roundtrip(self):
+        self.post("/api/label/device", park="测试园", device="Camera 99",
+                  location="大门", direction="in", annotator="测试")
+        with closing(server.get_db()) as db:
+            row = db.execute("""SELECT location, direction FROM manual_device_registry
+                WHERE park='测试园' AND device='Camera 99'""").fetchone()
+            self.assertEqual((row["location"], row["direction"]), ("大门", "in"))
+            db.execute("DELETE FROM manual_device_registry WHERE park='测试园'")
+            db.commit()
+
+    def test_replay_manual_restores_writeback(self):
+        with closing(server.get_db()) as db:
+            row = db.execute("""SELECT id, stage, stage_rank FROM captures
+                WHERE stage='抓拍' LIMIT 1""").fetchone()
+        capture_id = row["id"]
+        try:
+            self.post("/api/label/capture", capture_id=capture_id, annotator="测试",
+                      fields={"corrected_stage": "出磅"})
+            with closing(server.get_db()) as db:   # 模拟全库重建后的丢失
+                db.execute("UPDATE captures SET stage='抓拍', stage_rank=-1 WHERE id=?",
+                           (capture_id,))
+                db.commit()
+            stats = server.build_db.replay_manual(server.get_db())
+            self.assertGreaterEqual(stats["applied"], 1)
+            with closing(server.get_db()) as db:
+                stage = db.execute("SELECT stage FROM captures WHERE id=?",
+                                   (capture_id,)).fetchone()["stage"]
+            self.assertEqual(stage, "出磅")
+        finally:
+            with closing(server.get_db()) as db:
+                db.execute("""UPDATE captures SET stage=?, stage_rank=? WHERE id=?""",
+                           (row["stage"], row["stage_rank"], capture_id))
+                db.execute("DELETE FROM capture_annotations WHERE capture_id=?", (capture_id,))
+                db.commit()
 
 
 if __name__ == "__main__":

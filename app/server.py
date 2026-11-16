@@ -68,10 +68,17 @@ def resolve_capture_path(stored_path: str) -> Path:
     return candidates[0]
 
 
+_LABEL_SCHEMA_READY = False
+
+
 def get_db() -> sqlite3.Connection:
+    global _LABEL_SCHEMA_READY
     connection = sqlite3.connect(DB_PATH, timeout=15)
     connection.row_factory = sqlite3.Row
     ensure_schema(connection)
+    if not _LABEL_SCHEMA_READY:
+        ensure_label_tables(connection)   # 标注工作台表/列，进程内只执行一次
+        _LABEL_SCHEMA_READY = True
     return connection
 
 
@@ -826,10 +833,11 @@ def attach_capture_statuses(items, th_getter=None):
 
 
 def fetch_progress_events(db, order_ids):
-    """按订单号批量取事件流，返回 {(park, order_id): [(capture_time, stage, direction)]}。
+    """按订单号批量取事件流 {(park, order_id): [(capture_time, stage, direction)]}。
 
-    direction 来自 OSD 设备名（osd_camera，如"大门抓拍进01"）：进/出方向
-    已由上游 NVR 标明的照片直接判定，无名设备（Camera xx）为空串。
+    人工优先：环节/方向修正（capture_annotations）联接覆盖自动值；订单锚点
+    （manual_order_anchors 的 gate_in/gate_out/weigh_in）作为合成事件追加，
+    保存即生效。无方向的场院抓拍 direction 为空串。
     """
     events = {}
     ids = sorted(set(order_ids))
@@ -837,17 +845,74 @@ def fetch_progress_events(db, order_ids):
         return events
     placeholders = ",".join("?" * len(ids))
     rows = db.execute(
-        f"""SELECT coalesce(park,'') AS park, order_id, capture_time, stage,
-                   coalesce(osd_camera,'') AS osd_camera
-            FROM captures WHERE {PROGRESS_EVENT_WHERE} AND order_id IN ({placeholders})""",
+        f"""SELECT coalesce(c.park,'') AS park, c.order_id, c.capture_time,
+                   coalesce(nullif(ca.corrected_stage,''), c.stage) AS stage,
+                   CASE WHEN coalesce(nullif(ca.corrected_direction,''),'')!=''
+                        THEN ca.corrected_direction
+                        WHEN c.osd_camera LIKE '%出%' THEN 'out'
+                        WHEN c.osd_camera LIKE '%进%' THEN 'in'
+                        ELSE '' END AS direction
+            FROM captures c
+            LEFT JOIN capture_annotations ca ON ca.capture_id=c.id
+            WHERE {PROGRESS_EVENT_WHERE} AND c.order_id IN ({placeholders})""",
         ids,
     ).fetchall()
     for row in rows:
-        camera = row["osd_camera"] or ""
-        direction = "in" if "进" in camera else ("out" if "出" in camera else "")
         events.setdefault((row["park"], row["order_id"]), []).append(
-            (row["capture_time"], row["stage"], direction))
+            (row["capture_time"], row["stage"], row["direction"] or ""))
+    anchor_rows = db.execute(
+        f"""SELECT park, order_id, kind, anchor_time FROM manual_order_anchors
+            WHERE order_id IN ({placeholders})
+              AND kind IN ('gate_in','gate_out','weigh_in')""",
+        ids,
+    ).fetchall()
+    anchor_stage = {"gate_out": ("抓拍", "out"), "gate_in": ("抓拍", "in"),
+                    "weigh_in": ("入磅", "")}
+    for row in anchor_rows:
+        stage, direction = anchor_stage[row["kind"]]
+        events.setdefault((row["park"] or "", row["order_id"]), []).append(
+            (row["anchor_time"], stage, direction))
     return events
+
+
+def fetch_label_corrections(db, capture_ids) -> dict[int, dict]:
+    """人工修正映射 {capture_id: {'stage'/'direction'/'status': 值}}。"""
+    ids = sorted({int(i) for i in capture_ids if i})
+    if not ids:
+        return {}
+    placeholders = ",".join("?" * len(ids))
+    rows = db.execute(
+        f"""SELECT capture_id, corrected_stage, corrected_direction,
+                   corrected_status
+            FROM capture_annotations WHERE capture_id IN ({placeholders})""",
+        ids,
+    ).fetchall()
+    out: dict[int, dict] = {}
+    for row in rows:
+        item = {}
+        if (row["corrected_stage"] or ""):
+            item["stage"] = row["corrected_stage"]
+        if (row["corrected_direction"] or ""):
+            item["direction"] = row["corrected_direction"]
+        if (row["corrected_status"] or ""):
+            item["status"] = row["corrected_status"]
+        if item:
+            out[int(row["capture_id"])] = item
+    return out
+
+
+def apply_status_overrides(db, items) -> list[dict]:
+    """把人工进度状态覆盖进逐张列表（就地修改并返回）。"""
+    overrides = fetch_status_overrides(db, [it["id"] for it in items])
+    for item in items:
+        override = overrides.get(item["id"])
+        if override:
+            item["progress_status"] = override
+            item["progress_source"] = "manual"
+            item["progress_assumed"] = False
+        else:
+            item.setdefault("progress_source", "auto")
+    return items
 
 
 @app.route("/api/orders")
@@ -956,13 +1021,37 @@ def order_detail(order_id: str):
         ).fetchone()
         summary = order_summary(db, order_id, park if park else parks[0])
         items = annotate_order_plates([dict(row) for row in rows], db)
+        # 人工修正优先：环节覆盖 → 逐张推导（含方向）→ 状态 override
+        corrections = fetch_label_corrections(db, [r["id"] for r in rows])
+        for item in items:
+            corr = corrections.get(item["id"]) or {}
+            if "stage" in corr:
+                item["stage"] = corr["stage"]
         attach_capture_statuses(items, lambda p: flow_thresholds(db, p))
-        # 事件流带方向（osd_camera 设备名），出向大门照片才能确认离场
-        events = [(row["capture_time"], row["stage"],
-                   "in" if "进" in (row["osd_camera"] or "")
-                   else ("out" if "出" in (row["osd_camera"] or "") else ""))
-                  for row in rows
-                  if row["capture_time"] and (row["capture_status"] or "") != "no_vehicle"]
+        for item in items:
+            corr = corrections.get(item["id"]) or {}
+            if "status" in corr:
+                item["progress_status"] = corr["status"]
+                item["progress_source"] = "manual"
+                item["progress_assumed"] = False
+            else:
+                item.setdefault("progress_source", "auto")
+        events = [(it["capture_time"], it["stage"],
+                   (corrections.get(it["id"]) or {}).get("direction")
+                   or _event_direction(it.get("osd_camera") or ""))
+                  for it in items
+                  if it.get("capture_time")
+                  and (it.get("capture_status") or "") != "no_vehicle"]
+        # 订单时点锚点 = 合成事件（gate_out/gate_in/weigh_in），保存即生效
+        for a in db.execute(
+                """SELECT kind, anchor_time FROM manual_order_anchors
+                   WHERE coalesce(park,'')=? AND order_id=?
+                     AND kind IN ('gate_in','gate_out','weigh_in')""",
+                (park if park else parks[0], order_id)).fetchall():
+            stage, direction = {"gate_out": ("抓拍", "out"),
+                                "gate_in": ("抓拍", "in"),
+                                "weigh_in": ("入磅", "")}[a["kind"]]
+            events.append((a["anchor_time"], stage, direction))
         th = flow_thresholds(db, park if park else parks[0])
     if not rows:
         return jsonify({"error": "订单不存在", "items": []}), 404
@@ -1219,7 +1308,13 @@ def track():
         else:
             return jsonify([])
         items = annotate_order_plates([dict(row) for row in rows], db)
+        corrections = fetch_label_corrections(db, [it["id"] for it in items])
+        for item in items:
+            corr = corrections.get(item["id"]) or {}
+            if "stage" in corr:
+                item["stage"] = corr["stage"]
         attach_capture_statuses(items, lambda p: flow_thresholds(db, p))
+        apply_status_overrides(db, items)
     return jsonify(items)
 
 
@@ -2152,6 +2247,423 @@ def merge_vehicles():
 
 
 # ---------------------------------------------------------------------------
+# 标注工作台（/label 页后端）：全维度人工标注 + 消费链路
+# 字段生效方式（见 人工标注界面实施方案.md 消费地图）：
+#   事实字段（环节/方向/颜色/车型/时间/有无车/车牌）保存即写回 captures，
+#   派生字段（进度状态）走 capture_annotations.corrected_status 联接替换；
+#   ocr_status='manual' 标记人工改过时间的帧，OCR 重跑自动排除。
+# ---------------------------------------------------------------------------
+
+LABEL_ANCHOR_KINDS = ("gate_in", "weigh_in", "unload_done", "gate_out", "reviewed")
+LABEL_LOCATIONS = ("大门", "入磅地磅", "出磅地磅", "卸货区", "场院", "其他")
+
+
+def ensure_label_tables(db: sqlite3.Connection) -> None:
+    """统一标注面板所需的表与列（幂等，可重复执行）。DDL 收编在
+    build_db.ensure_label_schema，避免两处漂移。"""
+    ensure_annotation_tables(db)
+    build_db.ensure_label_schema(db)
+
+
+def _event_direction(camera: str) -> str:
+    return "in" if "进" in camera else ("out" if "出" in camera else "")
+
+
+def fetch_status_overrides(db: sqlite3.Connection, capture_ids) -> dict[int, str]:
+    """人工进度状态覆盖：{capture_id: corrected_status}（空串不返回）。"""
+    ids = sorted({int(i) for i in capture_ids if i})
+    if not ids:
+        return {}
+    placeholders = ",".join("?" * len(ids))
+    rows = db.execute(
+        f"""SELECT capture_id, corrected_status FROM capture_annotations
+            WHERE capture_id IN ({placeholders})
+              AND coalesce(corrected_status,'')!=''""",
+        ids,
+    ).fetchall()
+    return {int(r["capture_id"]): r["corrected_status"] for r in rows}
+
+
+def _capture_label_state(db: sqlite3.Connection, capture_id: int) -> dict | None:
+    """标注面板回显：人工字段当前值 + captures 关键字段。"""
+    row = db.execute(
+        """SELECT c.id, c.capture_time, c.date, c.hour, c.stage, c.order_id,
+                  coalesce(c.park,'') AS park, c.plate_final, c.vehicle_color,
+                  c.vehicle_type, c.capture_status, c.osd_camera, c.camera_key,
+                  c.ocr_status, c.vehicle_crop_path, c.vehicle_box,
+                  ca.usability, ca.corrected_plate, ca.corrected_color,
+                  ca.corrected_type, ca.corrected_status, ca.corrected_stage,
+                  ca.corrected_direction, ca.corrected_time,
+                  ca.no_vehicle_manual, ca.notes, ca.annotator,
+                  ca.updated_at AS annotation_updated_at
+           FROM captures c
+           LEFT JOIN capture_annotations ca ON ca.capture_id=c.id
+           WHERE c.id=?""",
+        (capture_id,),
+    ).fetchone()
+    if not row:
+        return None
+    item = dict(row)
+    item["osd_direction"] = _event_direction(item.get("osd_camera") or "")
+    item["progress_minutes"] = None
+    info = compute_capture_statuses([item], None)[0] if item.get("capture_time") else {"progress_status": ""}
+    item["progress_status"] = info.get("progress_status", "")
+    item["progress_assumed"] = bool(info.get("progress_assumed"))
+    return item
+
+
+@app.route("/label")
+def label_workspace():
+    """标注工作台（独立页，供标注人批量作业）。"""
+    return render_template("label.html")
+
+
+@app.route("/api/label/capture")
+def label_capture_state():
+    capture_id = positive_int(request.args.get("capture_id", ""))
+    if not capture_id:
+        return jsonify({"error": "缺少有效图片ID"}), 400
+    with closing(get_db()) as db:
+        ensure_label_tables(db)
+        state = _capture_label_state(db, capture_id)
+        if not state:
+            return jsonify({"error": "抓拍不存在"}), 404
+        anchors = [dict(r) for r in db.execute(
+            """SELECT id, kind, anchor_time, annotator, note
+               FROM manual_order_anchors WHERE park=? AND order_id=?
+               ORDER BY anchor_time""",
+            (state["park"], state["order_id"] or ""),
+        ).fetchall()]
+        devices = [dict(r) for r in db.execute(
+            """SELECT device, location, direction FROM manual_device_registry
+               WHERE park=?""", (state["park"],)).fetchall()]
+    return jsonify({"item": state, "anchors": anchors, "devices": devices})
+
+
+@app.route("/api/label/capture", methods=["POST"])
+def label_capture_save():
+    """统一标注保存：人工字段 upsert + 事实字段写回 captures + 审计。"""
+    payload = request.get_json(silent=True) or {}
+    capture_id = positive_int(str(payload.get("capture_id", "")))
+    annotator = str(payload.get("annotator", "")).strip()[:80]
+    fields = payload.get("fields") or {}
+    if not capture_id:
+        return jsonify({"error": "缺少有效图片ID"}), 400
+    if not annotator:
+        return jsonify({"error": "请填写标注人"}), 400
+
+    def field(name):
+        value = fields.get(name)
+        return "" if value is None else str(value).strip()
+
+    status = field("corrected_status")
+    stage = field("corrected_stage")
+    direction = field("corrected_direction")
+    color = field("corrected_color")
+    vtype = field("corrected_type")
+    time_only = field("corrected_time")
+    plate = normalize_plate(field("corrected_plate"))
+    usability = field("usability") or "valid"
+    if status and status not in PROGRESS_STATUSES:
+        return jsonify({"error": f"未知状态: {status}"}), 400
+    if stage and stage not in build_db.STAGE_RANK:
+        return jsonify({"error": f"未知环节: {stage}"}), 400
+    if direction and direction not in {"in", "out"}:
+        return jsonify({"error": "方向只能是 in/out"}), 400
+    if usability not in {"valid", "invalid", "uncertain"}:
+        return jsonify({"error": "usability 非法"}), 400
+    if time_only and not re.match(r"^\d{2}:\d{2}:\d{2}$", time_only):
+        return jsonify({"error": "时间格式应为 HH:MM:SS"}), 400
+    no_vehicle_manual = fields.get("no_vehicle_manual")
+    if no_vehicle_manual is not None:
+        no_vehicle_manual = 1 if no_vehicle_manual in (True, 1, "1", "true") else 0
+
+    with closing(get_db()) as db:
+        ensure_label_tables(db)
+        row = db.execute(
+            "SELECT id, date, capture_time, ocr_status FROM captures WHERE id=?",
+            (capture_id,),
+        ).fetchone()
+        if not row:
+            return jsonify({"error": "抓拍不存在"}), 404
+        existing = db.execute(
+            "SELECT * FROM capture_annotations WHERE capture_id=?", (capture_id,)
+        ).fetchone()
+        now = datetime.now().isoformat(timespec="seconds")
+
+        # 1) 人工字段留档（派生字段 corrected_status 也在本行）
+        db.execute(
+            """INSERT INTO capture_annotations
+                 (capture_id, usability, corrected_plate, corrected_color,
+                  corrected_type, corrected_status, corrected_stage,
+                  corrected_direction, corrected_time, no_vehicle_manual,
+                  notes, annotator, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(capture_id) DO UPDATE SET
+                 usability=excluded.usability,
+                 corrected_plate=excluded.corrected_plate,
+                 corrected_color=excluded.corrected_color,
+                 corrected_type=excluded.corrected_type,
+                 corrected_status=excluded.corrected_status,
+                 corrected_stage=excluded.corrected_stage,
+                 corrected_direction=excluded.corrected_direction,
+                 corrected_time=excluded.corrected_time,
+                 no_vehicle_manual=excluded.no_vehicle_manual,
+                 notes=CASE WHEN excluded.notes!='' THEN excluded.notes
+                            ELSE capture_annotations.notes END,
+                 annotator=excluded.annotator, updated_at=excluded.updated_at""",
+            (capture_id, usability, plate, color, vtype, status, stage,
+             direction, time_only,
+             0 if no_vehicle_manual is None else no_vehicle_manual,
+             str(payload.get("notes") or "").strip()[:500], annotator, now),
+        )
+
+        # 2) 事实字段写回 captures（空值=该字段本次不改）
+        write_backs, write_params = [], []
+        if stage:
+            write_backs += ["stage=?", "stage_rank=?"]
+            write_params += [stage, build_db.STAGE_RANK.get(stage, -1)]
+        if direction:
+            write_backs.append("osd_camera=?")
+            write_params.append({"in": "大门抓拍进", "out": "大门抓拍出"}[direction])
+        if color:
+            write_backs.append("vehicle_color=?")
+            write_params.append(color)
+        if vtype:
+            write_backs.append("vehicle_type=?")
+            write_params.append(vtype)
+        if plate:
+            write_backs.append("plate_final=?")
+            write_params.append(plate)
+        if time_only:
+            write_backs += ["capture_time=?", "hour=?", "ocr_status='manual'"]
+            write_params += [f"{row['date']} {time_only}", int(time_only[:2])]
+        if no_vehicle_manual is not None:
+            write_backs.append("capture_status=?")
+            write_params.append("no_vehicle" if no_vehicle_manual else "vehicle")
+        if write_backs:
+            db.execute(
+                f"UPDATE captures SET {', '.join(write_backs)} WHERE id=?",
+                [*write_params, capture_id],
+            )
+
+        db.execute(
+            """INSERT INTO annotation_audit
+                 (action, capture_id, details, annotator, created_at)
+               VALUES ('label_capture', ?, ?, ?, ?)""",
+            (capture_id, json.dumps({"fields": fields}, ensure_ascii=False)[:800],
+             annotator, now),
+        )
+        db.commit()
+        state = _capture_label_state(db, capture_id)
+    return jsonify({"ok": True, "item": state,
+                    "message": "已保存并写回；时间/环节/方向/车牌/属性改动实时生效"})
+
+
+@app.route("/api/label/anchor", methods=["POST"])
+def label_anchor_save():
+    payload = request.get_json(silent=True) or {}
+    park = str(payload.get("park", "")).strip()
+    order_id = str(payload.get("order_id", "")).strip()
+    kind = str(payload.get("kind", "")).strip()
+    anchor_time = str(payload.get("anchor_time", "")).strip()
+    annotator = str(payload.get("annotator", "")).strip()[:80]
+    note = str(payload.get("note", "")).strip()[:300]
+    if not order_id or kind not in LABEL_ANCHOR_KINDS or not annotator:
+        return jsonify({"error": "order_id/kind/annotator 必填，kind 非法"}), 400
+    try:
+        datetime.strptime(anchor_time, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return jsonify({"error": "时刻格式应为 YYYY-MM-DD HH:MM:SS"}), 400
+    with closing(get_db()) as db:
+        ensure_label_tables(db)
+        db.execute(
+            """INSERT INTO manual_order_anchors
+                 (park, order_id, kind, anchor_time, annotator, note)
+               VALUES (?,?,?,?,?,?)""",
+            (park, order_id, kind, anchor_time, annotator, note),
+        )
+        db.commit()
+    return jsonify({"ok": True, "message": "锚点已记录；整单状态将按新事件重算"})
+
+
+@app.route("/api/label/anchor/<int:anchor_id>", methods=["DELETE"])
+def label_anchor_delete(anchor_id: int):
+    annotator = str((request.get_json(silent=True) or {}).get("annotator", "")).strip()[:80]
+    with closing(get_db()) as db:
+        ensure_label_tables(db)
+        db.execute("DELETE FROM manual_order_anchors WHERE id=?", (anchor_id,))
+        db.execute(
+            """INSERT INTO annotation_audit (action, details, annotator, created_at)
+               VALUES ('label_anchor_delete', ?, ?, datetime('localtime'))""",
+            (f"anchor_id={anchor_id}", annotator),
+        )
+        db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/label/device", methods=["POST"])
+def label_device_save():
+    payload = request.get_json(silent=True) or {}
+    park = str(payload.get("park", "")).strip()
+    device = str(payload.get("device", "")).strip()
+    location = str(payload.get("location", "")).strip()
+    direction = str(payload.get("direction", "")).strip()
+    annotator = str(payload.get("annotator", "")).strip()[:80]
+    if not park or not device or location not in LABEL_LOCATIONS or not annotator:
+        return jsonify({"error": "park/device/location/annotator 必填，location 非法"}), 400
+    if direction and direction not in {"in", "out"}:
+        return jsonify({"error": "方向只能是 in/out"}), 400
+    with closing(get_db()) as db:
+        ensure_label_tables(db)
+        db.execute(
+            """INSERT INTO manual_device_registry
+                 (park, device, location, direction, annotator)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(park, device) DO UPDATE SET
+                 location=excluded.location, direction=excluded.direction,
+                 annotator=excluded.annotator""",
+            (park, device, location, direction, annotator),
+        )
+        db.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/label/queue")
+def label_queue():
+    """批量作业队列：按原因列出待标注订单（推定/无状态/全部，已复核默认排除）。
+
+    复核标记 = manual_order_anchors.kind='reviewed'；queue=reviewed 反向只看已复核。
+    """
+    queue_type = request.args.get("type", "assumed").strip()
+    park = park_param()
+    limit = min(500, positive_int(request.args.get("limit", "200"), 200))
+    offset = positive_int(request.args.get("offset", "0"), 0)
+    with closing(get_db()) as db:
+        ensure_label_tables(db)
+        ids = [r[0] for r in db.execute(
+            """SELECT DISTINCT order_id FROM captures
+               WHERE order_id!='' AND order_id!='未关联图片'""").fetchall()]
+        events = fetch_progress_events(db, ids)
+        reviewed = {(r["park"], r["order_id"]) for r in db.execute(
+            """SELECT park, order_id FROM manual_order_anchors
+               WHERE kind='reviewed'""").fetchall()}
+        anchors_by_order = {}
+        for r in db.execute(
+            """SELECT park, order_id, kind, anchor_time, annotator, note, id
+               FROM manual_order_anchors ORDER BY anchor_time""").fetchall():
+            anchors_by_order.setdefault((r["park"], r["order_id"]), []).append(dict(r))
+        items = []
+        for (opark, oid), ev in events.items():
+            if park and opark != park:
+                continue
+            info = compute_progress_status(ev, th=flow_thresholds(db, opark))
+            is_reviewed = (opark, oid) in reviewed
+            if queue_type == "reviewed":
+                if not is_reviewed:
+                    continue
+            elif is_reviewed:
+                continue
+            reason = ""
+            if info["progress_assumed"]:
+                reason = "推定:" + info["progress_status"]
+            elif not info["progress_status"]:
+                reason = "无有效事件"
+            elif queue_type == "all":
+                reason = info["progress_status"]
+            if queue_type == "assumed" and not info["progress_assumed"]:
+                continue
+            if queue_type == "empty" and info["progress_status"]:
+                continue
+            if queue_type not in {"all", "reviewed"} and not reason:
+                continue
+            summary = order_summary(db, oid, opark)
+            items.append({
+                "park": opark, "order_id": oid, "reason": reason,
+                "progress_status": info["progress_status"],
+                "progress_assumed": info["progress_assumed"],
+                "progress_note": info["progress_note"],
+                "last_event_time": info["last_event_time"],
+                "plate": summary["plate"], "reviewed": is_reviewed,
+                "anchors": anchors_by_order.get((opark, oid), []),
+                "capture_count": len(ev),
+            })
+        items.sort(key=lambda x: x["last_event_time"], reverse=True)
+        total = len(items)
+        items = items[offset:offset + limit]
+    return jsonify({"total": total, "items": items})
+
+
+@app.route("/api/label/order")
+def label_order_detail():
+    """标注工作台的单订单视图：轨迹 + 逐张人工字段 + 锚点。"""
+    order_id = request.args.get("order_id", "").strip()
+    park = request.args.get("park", "").strip()
+    if not order_id:
+        return jsonify({"error": "缺少订单号"}), 400
+    with closing(get_db()) as db:
+        ensure_label_tables(db)
+        parks = [r[0] for r in db.execute(
+            "SELECT DISTINCT coalesce(park,'') FROM captures WHERE order_id=?",
+            (order_id,)).fetchall()]
+        if not parks:
+            return jsonify({"error": "订单不存在"}), 404
+        if not park:
+            park = parks[0]
+        park_clause, park_params = park_where(park)
+        rows = db.execute(
+            f"""SELECT {CAPTURE_FIELDS} FROM captures
+                WHERE order_id=?{(' AND ' + park_clause) if park_clause else ''}
+                {TRACK_ORDER}""",
+            [order_id, *park_params],
+        ).fetchall()
+        items = annotate_order_plates([dict(r) for r in rows], db)
+        attach_capture_statuses(items, lambda p: flow_thresholds(db, p))
+        overrides = fetch_status_overrides(db, [it["id"] for it in items])
+        annotations = {}
+        if overrides:
+            marks = list(overrides)
+            placeholders = ",".join("?" * len(marks))
+            for r in db.execute(
+                f"""SELECT capture_id, corrected_status, corrected_stage,
+                           corrected_direction, corrected_color, corrected_type,
+                           corrected_time, no_vehicle_manual, corrected_plate,
+                           usability, notes, annotator
+                    FROM capture_annotations WHERE capture_id IN ({placeholders})""",
+                marks,
+            ).fetchall():
+                annotations[r["capture_id"]] = dict(r)
+        for item in items:
+            ov = overrides.get(item["id"])
+            if ov:
+                item["progress_status"] = ov
+                item["progress_source"] = "manual"
+                item["progress_assumed"] = False
+            else:
+                item["progress_source"] = "auto"
+        anchors = [dict(r) for r in db.execute(
+            """SELECT id, kind, anchor_time, annotator, note
+               FROM manual_order_anchors WHERE park=? AND order_id=?
+               ORDER BY anchor_time""", (park, order_id)).fetchall()]
+        devices = [dict(r) for r in db.execute(
+            "SELECT device, location, direction FROM manual_device_registry WHERE park=?",
+            (park,)).fetchall()]
+        th = flow_thresholds(db, park)
+        events = [(it["capture_time"], it["stage"],
+                   "in" if "进" in (it.get("osd_camera") or "")
+                   else ("out" if "出" in (it.get("osd_camera") or "") else ""))
+                  for it in items
+                  if it.get("capture_time")
+                  and (it.get("capture_status") or "") != "no_vehicle"]
+    data = {"order_id": order_id, "park": park, "parks": parks,
+            "items": items, "annotations": annotations,
+            "anchors": anchors, "devices": devices,
+            "flow_thresholds": {k: round(v, 1) for k, v in th.items()}}
+    data.update(compute_progress_status(events, th=th))
+    return jsonify(data)
+
+
+# ---------------------------------------------------------------------------
 # 对外开放接口（/api/open/ 前缀，只读，供第三方系统对接）
 #
 # 与内部页面接口（无鉴权、裸数组）刻意分开：
@@ -2374,17 +2886,39 @@ def open_order_detail(order_id: str):
             (order_id, park if park else parks[0]),
         ).fetchone()
         summary = order_summary(db, order_id, park if park else parks[0])
-        events = [(row["capture_time"], row["stage"],
-                   "in" if "进" in (row["osd_camera"] or "")
-                   else ("out" if "出" in (row["osd_camera"] or "") else ""))
-                  for row in rows
-                  if row["capture_time"] and (row["capture_status"] or "") != "no_vehicle"]
         th = flow_thresholds(db, park if park else parks[0])
+        items = attach_capture_statuses(
+            [dict(row) for row in rows], lambda p: flow_thresholds(db, p))
+        corrections = fetch_label_corrections(db, [it["id"] for it in items])
+        for item in items:
+            corr = corrections.get(item["id"]) or {}
+            if "stage" in corr:
+                item["stage"] = corr["stage"]
+            if "status" in corr:
+                item["progress_status"] = corr["status"]
+                item["progress_source"] = "manual"
+                item["progress_assumed"] = False
+            else:
+                item.setdefault("progress_source", "auto")
+        events = [(it["capture_time"], it["stage"],
+                   (corrections.get(it["id"]) or {}).get("direction")
+                   or _event_direction(it.get("osd_camera") or ""))
+                  for it in items
+                  if it.get("capture_time")
+                  and (it.get("capture_status") or "") != "no_vehicle"]
+        for a in db.execute(
+                """SELECT kind, anchor_time FROM manual_order_anchors
+                   WHERE coalesce(park,'')=? AND order_id=?
+                     AND kind IN ('gate_in','gate_out','weigh_in')""",
+                (park if park else parks[0], order_id)).fetchall():
+            stage, direction = {"gate_out": ("抓拍", "out"),
+                                "gate_in": ("抓拍", "in"),
+                                "weigh_in": ("入磅", "")}[a["kind"]]
+            events.append((a["anchor_time"], stage, direction))
     data = {"order_id": order_id, "park": park if park else parks[0],
             "order_time": summary["order_time"], "plate": summary["plate"],
             "attributes": dict(attrs) if attrs else None,
-            "items": attach_capture_statuses(
-                [dict(row) for row in rows], lambda p: flow_thresholds(db, p))}
+            "items": items}
     data.update(compute_progress_status(events, th=th))
     return _open_ok({"data": data})
 

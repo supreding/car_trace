@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>标注工作台</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #0f172a; --panel: #1e293b; --panel2: #172033; --line: #334155;
+    --text: #e2e8f0; --muted: #94a3b8; --blue: #3b82f6; --blue-soft: #1e3a5f;
+    --green: #16a34a; --amber: #d97706; --red: #dc2626; --purple: #7c3aed;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.5 "Microsoft YaHei", system-ui, sans-serif; }
+  header { display: flex; align-items: center; gap: 10px; padding: 10px 16px;
+           background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5; }
+  header h1 { font-size: 16px; margin: 0; }
+  header .spacer { flex: 1; }
+  input, select, textarea, button {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 4px 8px; font: inherit;
+  }
+  button { cursor: pointer; }
+  button.primary { background: var(--blue); border-color: var(--blue); color: #fff; }
+  button.warn { background: var(--red); border-color: var(--red); color: #fff; }
+  .badge { display: inline-block; font-size: 11px; border-radius: 9px; padding: 1px 8px;
+           background: var(--panel2); border: 1px solid var(--line); color: var(--muted); }
+  .badge.green { color: var(--green); border-color: #bbf7d0; background: #f0fdf4; }
+  .badge.amber { color: var(--amber); border-color: #fde68a; background: #fffbeb; }
+  .badge.red { color: var(--red); border-color: #fecaca; background: #fef2f2; }
+  .badge.blue { color: #60a5fa; border-color: #bfdbfe; background: #eff6ff; }
+  .badge.purple { color: #a78bfa; border-color: #ddd6fe; background: #f5f3ff; }
+  .badge.manual { color: #facc15; border-color: #facc15; }
+
+  .layout { display: grid; grid-template-columns: 300px 1fr 340px; gap: 10px; padding: 10px; }
+  .col { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+         overflow: auto; max-height: calc(100vh - 120px); }
+  .col h3 { margin: 0; padding: 8px 10px; font-size: 13px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--panel); }
+  .qitem { padding: 8px 10px; border-bottom: 1px solid var(--line); cursor: pointer; }
+  .qitem:hover { background: var(--panel2); }
+  .qitem.active { background: var(--blue-soft); }
+  .qitem .t { font-weight: 600; }
+  .qitem .s { font-size: 12px; color: var(--muted); }
+
+  .order-head { padding: 10px; border-bottom: 1px solid var(--line); }
+  .order-head .sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .film { display: flex; gap: 6px; overflow-x: auto; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+  .film .frame { position: relative; flex: 0 0 auto; cursor: pointer; border: 2px solid transparent; border-radius: 6px; }
+  .film .frame.active { border-color: var(--blue); }
+  .film img { height: 72px; display: block; border-radius: 4px; }
+  .film .mark { position: absolute; top: 2px; left: 2px; }
+  .stagebox { position: relative; text-align: center; }
+  .stagebox img { max-width: 100%; max-height: 52vh; display: block; margin: 0 auto; border-radius: 6px; }
+  .stagebox canvas { position: absolute; inset: 0; margin: auto; cursor: crosshair; }
+  .stage-meta { font-size: 12px; color: var(--muted); padding: 6px 10px; }
+  .sec { border-bottom: 1px solid var(--line); padding: 8px 10px; }
+  .sec h4 { margin: 0 0 6px; font-size: 12px; color: var(--muted); }
+  .sec label { display: block; font-size: 12px; color: var(--muted); margin: 4px 0 2px; }
+  .sec .row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .sec input[type=text], .sec input[type=time], .sec select, .sec textarea { width: 100%; }
+  .sec .half { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .radios { display: grid; grid-template-columns: 1fr 1fr; gap: 2px; font-size: 13px; }
+  .radios label { display: flex; gap: 4px; align-items: center; margin: 0; color: var(--text); }
+  .kbd { color: var(--muted); font-size: 11px; }
+  .toast { position: fixed; left: 50%; bottom: 30px; transform: translateX(-50%);
+           background: var(--panel); border: 1px solid var(--line); padding: 8px 16px;
+           border-radius: 8px; display: none; z-index: 50; }
+  .empty { padding: 20px; color: var(--muted); text-align: center; }
+  .anchors .a { display: flex; gap: 6px; align-items: center; font-size: 12px; padding: 2px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>标注工作台</h1>
+  <span class="kbd">←/→ 切换订单 · 1-6 状态 · S 保存 · R 标记复核 · B 框选 · Esc 取消</span>
+  <div class="spacer"></div>
+  <label class="kbd">标注人</label>
+  <input id="annotator" style="width:110px" placeholder="必填">
+  <a href="/" style="color:var(--muted)">返回轨迹页</a>
+</header>
+
+<div class="toolbar" style="display:flex; gap:8px; padding:8px 10px; align-items:center;">
+  <span class="kbd">队列：</span>
+  <select id="qtype">
+    <option value="assumed">推定状态（待确认）</option>
+    <option value="empty">无有效事件</option>
+    <option value="all">全部订单</option>
+    <option value="reviewed">已复核</option>
+  </select>
+  <select id="parkSel" style="width:auto"></select>
+  <button onclick="loadQueue()">刷新队列</button>
+  <span id="qcount" class="kbd"></span>
+</div>
+
+<div class="layout">
+  <div class="col" id="queueCol"><h3>待标注队列</h3><div id="queue"><div class="empty">加载中…</div></div></div>
+
+  <div class="col" id="workCol">
+    <div id="orderHead" class="order-head"><div class="empty">从左侧选择订单</div></div>
+    <div id="film" class="film"></div>
+    <div id="stageArea" class="stagebox"><div class="empty">选择一张照片</div></div>
+    <div id="stageMeta" class="stage-meta"></div>
+    <div style="padding:6px 10px">
+      <button onclick="saveBox()" id="boxBtn">B 框选车辆（两次点击：左上角→右下角）</button>
+      <span id="boxHint" class="kbd"></span>
+    </div>
+  </div>
+
+  <div class="col" id="panelCol">
+    <h3>标注面板 · <span id="capId" class="kbd"></span></h3>
+    <div id="panel">
+      <div class="sec">
+        <h4>进度状态（派生值可人工覆盖，保存后标"人工"）</h4>
+        <div class="radios" id="statusRadios"></div>
+        <div class="row" style="margin-top:4px">
+          <button onclick="setStatus('')">清除人工状态</button>
+          <span id="statusNow" class="kbd"></span>
+        </div>
+      </div>
+      <div class="sec">
+        <h4>环节归属 / 大门方向（有大门机位才有方向）</h4>
+        <div class="half">
+          <div><label>环节</label><select id="f_stage"></select></div>
+          <div><label>大门方向</label><select id="f_direction">
+            <option value="">(不改/无)</option><option value="in">进</option><option value="out">出</option>
+          </select></div>
+        </div>
+        <div class="row" style="margin-top:4px"><span id="deviceNow" class="kbd"></span></div>
+      </div>
+      <div class="sec">
+        <h4>车辆属性 / 车牌 / 有无车 / 时间</h4>
+        <div class="half">
+          <div><label>颜色</label><select id="f_color"></select></div>
+          <div><label>车型</label><select id="f_type"></select>
+          </div>
+        </div>
+        <label>车牌（保存即写回 plate_final）</label>
+        <div class="row"><input type="text" id="f_plate" style="flex:1">
+          <select id="f_usability"><option value="valid">有效</option><option value="invalid">无效</option><option value="uncertain">存疑</option></select></div>
+        <label>有无车辆</label>
+        <div class="radios">
+          <label><input type="radio" name="nv" value="0"> 有车</label>
+          <label><input type="radio" name="nv" value="1"> 误检（无车）</label>
+        </div>
+        <label>抓拍时间（仅时刻，日期不变）</label>
+        <input type="text" id="f_time" placeholder="HH:MM:SS">
+      </div>
+      <div class="sec">
+        <h4>订单时点锚点（合成事件，保存即重算整单）</h4>
+        <div class="half">
+          <div><label>锚点类型</label><select id="a_kind">
+            <option value="gate_in">进园确认</option><option value="weigh_in">入磅确认</option>
+            <option value="unload_done">卸货完成</option><option value="gate_out">离场确认</option>
+          </select></div>
+          <div><label>时刻</label><input type="text" id="a_time" placeholder="HH:MM:SS"></div>
+        </div>
+        <div class="row" style="margin-top:4px">
+          <button class="primary" onclick="addAnchor()">添加锚点</button>
+          <button onclick="markReviewed()">R 标记本单已复核</button>
+        </div>
+        <div class="anchors" id="anchorList"></div>
+      </div>
+      <div class="sec">
+        <h4>机位字典（每台设备标一次：Camera 01 这类无名设备归位）</h4>
+        <label>设备名（默认取本张 OSD/相机）</label>
+        <input type="text" id="d_device">
+        <div class="half">
+          <div><label>机位</label><select id="d_location">
+            <option>大门</option><option>入磅地磅</option><option>出磅地磅</option>
+            <option>卸货区</option><option>场院</option><option>其他</option>
+          </select></div>
+          <div><label>固定方向</label><select id="d_direction">
+            <option value="">无/双向</option><option value="in">进</option><option value="out">出</option>
+          </select></div>
+        </div>
+        <div class="row" style="margin-top:4px"><button onclick="saveDevice()">登记机位</button></div>
+        <div id="deviceList" class="anchors"></div>
+      </div>
+      <div class="sec">
+        <h4>备注</h4>
+        <textarea id="f_notes" rows="2"></textarea>
+        <div class="row" style="margin-top:6px">
+          <button class="primary" onclick="savePanel()">S 保存全部标注</button>
+          <span id="savedBy" class="kbd"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<div id="toast" class="toast"></div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const STATUS = ["大门进","等待入磅","入磅中","卸货","出磅中","大门出"];
+const STAGES = ["入磅","质检","出磅","抓拍","人脸"];
+const COLORS = ["黄色","橙色","绿色","灰色","红色","蓝色","白色","金色","棕色","黑色"];
+const TYPES = ["轿车","SUV","MPV","面包车","皮卡","货车","客车","罐车","挂车","工程机械"];
+const statusColor = {"大门进":"blue","等待入磅":"amber","入磅中":"green","卸货":"purple","出磅中":"green","大门出":""};
+const state = { queue: [], qi: -1, type: "assumed", park: "", order: null, items: [], ci: -1,
+                boxMode: false, boxPts: [], imgW: 0, imgH: 0 };
+
+function toast(msg) { const t = $("toast"); t.textContent = msg; t.style.display = "block";
+  clearTimeout(t._h); t._h = setTimeout(() => t.style.display = "none", 2600); }
+async function api(url, opts) { const r = await fetch(url, opts); if (!r.ok) {
+  let m; try { m = (await r.json()).error } catch (e) { m = r.statusText } throw new Error(m || r.statusText); }
+  return r.json(); }
+function annotator() { const v = $("annotator").value.trim();
+  if (!v) { toast("请先在右上角填写标注人"); throw new Error("no annotator"); } return v; }
+
+function fillSelect(sel, list, current) {
+  sel.innerHTML = '<option value="">(不改/清空)</option>' +
+    list.map(x => `<option value="${esc(x)}"${x === current ? " selected" : ""}>${esc(x)}</option>`).join("");
+}
+
+/* ---------------- 队列 ---------------- */
+async function loadQueue(keepIndex) {
+  state.type = $("qtype").value; state.park = $("parkSel").value;
+  const q = await api(`/api/label/queue?type=${state.type}${state.park ? `&park=${encodeURIComponent(state.park)}` : ""}`);
+  state.queue = q.items; state.qi = keepIndex ? Math.min(state.qi, state.queue.length - 1) : -1;
+  $("qcount").textContent = `共 ${q.total} 单${state.type === "reviewed" ? "（已复核）" : ""}`;
+  $("queue").innerHTML = state.queue.length ? state.queue.map((it, i) => `
+    <div class="qitem ${i === state.qi ? "active" : ""}" onclick="selectOrder(${i})">
+      <div class="t">${esc(it.order_id)} ${it.reviewed ? '<span class="badge manual">已复核</span>' : ""}
+        <span class="badge ${statusColor[it.progress_status] || ""}">${esc(it.progress_status || "无状态")}</span></div>
+      <div class="s">${it.plate ? "车牌 " + esc(it.plate) : "无牌"} · ${it.capture_count}张 · 最后 ${esc((it.last_event_time || "").slice(5, 16))}</div>
+      <div class="s">${esc(it.reason || "")}${it.progress_note ? " · " + esc(it.progress_note) : ""}</div>
+    </div>`).join("") : '<div class="empty">队列空 🎉</div>';
+  if (state.qi >= 0) selectOrder(state.qi);
+}
+
+async function selectOrder(i) {
+  state.qi = i;
+  document.querySelectorAll(".qitem").forEach((el, idx) => el.classList.toggle("active", idx === i));
+  const it = state.queue[i]; if (!it) return;
+  state.order = await api(`/api/label/order?order_id=${encodeURIComponent(it.order_id)}&park=${encodeURIComponent(it.park)}`);
+  renderOrder();
+}
+
+function renderOrder() {
+  const o = state.order;
+  const st = o.progress_status;
+  $("orderHead").innerHTML = `
+    <div class="t" style="font-weight:600">订单 ${esc(o.order_id)} · ${esc(o.park)}
+      <span class="badge ${statusColor[st] || ""}">${esc(st || "无状态")}${o.progress_assumed ? "(推定)" : ""}</span></div>
+    <div class="sub">${o.items.length} 张 · 车牌 ${esc(o.plate || "—")} · 最后事件 ${esc((o.last_event_time || "—").slice(0, 19))}${o.progress_note ? " · " + esc(o.progress_note) : ""}
+      · 阈值 ${esc(JSON.stringify(o.flow_thresholds))} 分钟</div>
+    <div class="sub">锚点：${o.anchors.length ? o.anchors.map(a => `<span class="badge manual">${esc(a.kind)} ${esc(a.anchor_time.slice(11))}</span>`).join(" ") : "无"}</div>`;
+  $("film").innerHTML = o.items.map((it, idx) => `
+    <div class="frame ${idx === state.ci ? "active" : ""}" onclick="selectCapture(${idx})">
+      <img src="/api/crop/${it.id}" onerror="this.onerror=null;this.src='/api/thumb/${it.id}'" loading="lazy">
+      <span class="mark badge ${statusColor[it.progress_status] || ""}"
+        title="${esc(it.progress_status)}${it.progress_source === "manual" ? " · 人工" : ""}">${esc(it.progress_status ? it.progress_status.slice(0, 3) : "—")}</span>
+    </div>`).join("");
+  if (state.ci < 0 || state.ci >= o.items.length) state.ci = 0;
+  selectCapture(state.ci, true);
+}
+
+async function selectCapture(idx, force) {
+  if (!force && state.ci === idx) return;
+  state.ci = idx;
+  document.querySelectorAll(".frame").forEach((el, i) => el.classList.toggle("active", i === idx));
+  const it = state.order.items[idx]; if (!it) return;
+  const st = await api(`/api/label/capture?capture_id=${it.id}`);
+  $("capId").textContent = "#" + it.id;
+  // 大图 + 框选画布
+  $("stageArea").innerHTML = `<img id="bigimg" src="/api/image/${it.id}" onload="initCanvas()">`;
+  $("stageMeta").textContent =
+    `${it.stage} · ${it.camera_key || ""} · OSD方向=${it.osd_direction || "无"} · 时间 ${it.capture_time || "无"} · 车牌 ${it.plate_final || "—"}`;
+  fillSelect($("f_stage"), STAGES, (st.item.corrected_stage || "") || it.stage);
+  $("f_direction").value = st.item.corrected_direction || "";
+  fillSelect($("f_color"), COLORS, (st.item.corrected_color || "") || it.vehicle_color || "");
+  fillSelect($("f_type"), TYPES, (st.item.corrected_type || "") || it.vehicle_type || "");
+  $("f_plate").value = st.item.corrected_plate || it.plate_final || "";
+  $("f_usability").value = st.item.usability || "valid";
+  document.querySelectorAll('input[name=nv]').forEach(r => r.checked = (r.value === "1") === !!(st.item.capture_status === "no_vehicle"));
+  $("f_time").value = st.item.corrected_time || (it.capture_time || "").slice(11) || "";
+  $("f_notes").value = st.item.notes || "";
+  $("deviceNow").textContent = `设备名: ${it.osd_camera || it.camera_key || "—"}${st.item.osd_direction ? "（OSD方向 " + st.item.osd_direction + "）" : ""}`;
+  $("savedBy").textContent = st.item.annotation_updated_at ? `上次标注: ${st.item.annotator} @ ${st.item.annotation_updated_at}` : "";
+  renderStatusRadios(st.item.corrected_status || "");
+  renderAnchors(st.anchors, st.devices);
+}
+
+function renderStatusRadios(current) {
+  const derived = state.order && state.order.items[state.ci];
+  $("statusNow").textContent = current ? `人工值: ${current}` :
+    `自动推导: ${(derived && derived.progress_status) || "无"}${derived && derived.progress_assumed ? "(推定)" : ""}`;
+  $("statusRadios").innerHTML = STATUS.map((s, i) => `
+    <label><input type="radio" name="pst" value="${esc(s)}" ${s === current ? "checked" : ""}>
+      <span class="kbd">${i + 1}</span> ${esc(s)}</label>`).join("");
+}
+function setStatus(v) {
+  const radio = document.querySelector(`input[name=pst][value="${v}"]`);
+  if (radio) radio.checked = true; else renderStatusRadios("");
+}
+
+/* ---------------- 锚点 / 机位 ---------------- */
+function renderAnchors(anchors, devices) {
+  $("anchorList").innerHTML = anchors.length ? anchors.map(a => `
+    <div class="a"><span class="badge manual">${esc(a.kind)}</span>
+      ${esc(a.anchor_time.slice(0, 19))} · ${esc(a.annotator || "")}
+      <button style="padding:0 6px" onclick="delAnchor(${a.id})">删</button></div>`).join("")
+    : '<span class="kbd">暂无锚点</span>';
+  $("deviceList").innerHTML = devices.length ? devices.map(d => `
+    <div class="a"><span class="badge">${esc(d.device)}</span> ${esc(d.location)}${d.direction ? " · " + esc(d.direction) : ""}</div>`).join("")
+    : '<span class="kbd">本园区暂无机位登记</span>';
+}
+async function addAnchor() {
+  const it = state.order.items[state.ci];
+  await api("/api/label/anchor", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ park: state.order.park, order_id: state.order.order_id,
+      kind: $("a_kind").value, anchor_time: `${(it.capture_time || "").slice(0, 10)} ${$("a_time").value || (it.capture_time || "").slice(11)}`,
+      annotator: annotator() }) });
+  toast("锚点已保存，整单状态已重算"); await selectOrder(state.qi);
+}
+async function delAnchor(id) {
+  await api(`/api/label/anchor/${id}`, { method: "DELETE", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ annotator: annotator() }) });
+  await selectOrder(state.qi);
+}
+async function markReviewed() {
+  const it = state.order.items[state.ci];
+  await api("/api/label/anchor", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ park: state.order.park, order_id: state.order.order_id,
+      kind: "reviewed", anchor_time: (it.capture_time || "").slice(0, 19) || new Date().toISOString().slice(0, 19).replace("T", " "),
+      annotator: annotator() }) });
+  toast("已标记复核，切下一单"); nextOrder();
+}
+async function saveDevice() {
+  await api("/api/label/device", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ park: state.order.park, device: $("d_device").value.trim(),
+      location: $("d_location").value, direction: $("d_direction").value, annotator: annotator() }) });
+  toast("机位已登记"); await selectCapture(state.ci, true);
+}
+
+/* ---------------- 保存面板 ---------------- */
+async function savePanel() {
+  const it = state.order.items[state.ci];
+  const st = await api(`/api/label/capture?capture_id=${it.id}`);
+  const cur = st.item;
+  const pst = document.querySelector('input[name=pst]:checked');
+  const fields = {
+    corrected_status: pst ? pst.value : (cur.corrected_status || ""),
+    corrected_stage: $("f_stage").value,
+    corrected_direction: $("f_direction").value,
+    corrected_color: $("f_color").value,
+    corrected_type: $("f_type").value,
+    corrected_plate: $("f_plate").value.trim(),
+    usability: $("f_usability").value,
+    corrected_time: $("f_time").value.trim(),
+    no_vehicle_manual: document.querySelector('input[name=nv]:checked').value,
+    notes: $("f_notes").value.trim(),
+  };
+  await api("/api/label/capture", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ capture_id: it.id, annotator: annotator(), fields }) });
+  toast("已保存并写回；时间/环节/方向/车牌/属性实时生效");
+  await selectOrder(state.qi);   // 重取整单（状态/锚点/逐张全部刷新）
+}
+
+/* ---------------- 框选（两次点击） ---------------- */
+function initCanvas() {
+  const img = $("bigimg"), box = $("stageArea");
+  state.imgW = img.naturalWidth; state.imgH = img.naturalHeight;
+  let c = $("boxCanvas");
+  if (!c) { c = document.createElement("canvas"); c.id = "boxCanvas"; box.appendChild(c); }
+  c.width = img.clientWidth; c.height = img.clientHeight;
+  c.style.width = img.clientWidth + "px"; c.style.height = img.clientHeight + "px";
+  c.onclick = canvasClick;
+  drawBox();
+}
+function canvasClick(ev) {
+  if (!state.boxMode) return;
+  const img = $("bigimg"), c = $("boxCanvas"), r = c.getBoundingClientRect();
+  const x = (ev.clientX - r.left) * state.imgW / c.width;
+  const y = (ev.clientY - r.top) * state.imgH / c.height;
+  state.boxPts.push([x, y]);
+  if (state.boxPts.length === 2) { drawBox(); state.boxMode = false; $("boxHint").textContent = "矩形就绪，点【应用框选】保存"; }
+  else drawBox(true);
+}
+function drawBox(temp) {
+  const c = $("boxCanvas"); if (!c) return;
+  const ctx = c.getContext("2d"); ctx.clearRect(0, 0, c.width, c.height);
+  const sx = c.width / state.imgW, sy = c.height / state.imgH;
+  const cur = getBox();
+  if (cur) { ctx.strokeStyle = "#facc15"; ctx.lineWidth = 2;
+    const p = state.boxPts.map(pt => [pt[0] * sx, pt[1] * sy]);
+    ctx.strokeRect(Math.min(p[0][0], p[1][0]), Math.min(p[0][1], p[1][1]),
+                   Math.abs(p[1][0] - p[0][0]), Math.abs(p[1][1] - p[0][1])); }
+  else if (temp && state.boxPts.length === 1) {
+    ctx.fillStyle = "#facc15";
+    ctx.fillRect(state.boxPts[0][0] * sx - 3, state.boxPts[0][1] * sy - 3, 6, 6); }
+}
+function getBox() {
+  if (state.boxPts.length !== 2) return null;
+  const [[x1, y1], [x2, y2]] = state.boxPts;
+  return [Math.round(Math.min(x1, x2)), Math.round(Math.min(y1, y2)),
+          Math.round(Math.max(x1, x2)), Math.round(Math.max(y1, y2))];
+}
+async function saveBox() {
+  const box = getBox();
+  if (!box || state.boxPts.length !== 2) { toast("先按 B 进入框选，点击左上角与右下角"); return; }
+  const it = state.order.items[state.ci];
+  await api("/api/boxedit/save", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ capture_id: it.id, box }) });
+  toast("框选已保存：裁剪图已更新，车牌/特征下轮补算");
+  state.boxPts = []; await selectCapture(state.ci, true);
+}
+
+/* ---------------- 快捷键与初始化 ---------------- */
+function nextOrder() { if (state.qi + 1 < state.queue.length) selectOrder(state.qi + 1); else toast("队列到底了"); }
+function prevOrder() { if (state.qi > 0) selectOrder(state.qi - 1); }
+document.addEventListener("keydown", ev => {
+  if (["INPUT", "TEXTAREA", "SELECT"].includes(ev.target.tagName)) return;
+  if (ev.key === "Escape") { state.boxMode = false; state.boxPts = []; drawBox(); $("boxHint").textContent = ""; return; }
+  if (ev.key === "ArrowLeft" || ev.key === "j") { prevOrder(); return; }
+  if (ev.key === "ArrowRight" || ev.key === "k") { nextOrder(); return; }
+  if (ev.key === "b" || ev.key === "B") { state.boxMode = true; state.boxPts = []; $("boxHint").textContent = "框选模式：点左上角→右下角"; return; }
+  if (ev.key === "s" || ev.key === "S") { savePanel(); return; }
+  if (ev.key === "r" || ev.key === "R") { markReviewed(); return; }
+  if (/^[1-6]$/.test(ev.key)) setStatus(STATUS[+ev.key - 1]);
+});
+(async function init() {
+  $("annotator").value = localStorage.getItem("label_annotator") || "";
+  $("annotator").onchange = e => localStorage.setItem("label_annotator", e.target.value.trim());
+  const parks = await api("/api/parks");
+  const plist = Array.isArray(parks) ? parks : (parks.park_items || parks.items || []);
+  $("parkSel").innerHTML = '<option value="">全部园区</option>' +
+    plist.map(p => `<option value="${esc(p.park)}">${esc(p.park || "未标注园区")}（${p.captures}）</option>`).join("");
+  await loadQueue();
+})();
+</script>
+</body>
+</html>

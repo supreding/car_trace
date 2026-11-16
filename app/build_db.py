@@ -308,9 +308,103 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
           ON capture_annotations(usability);
         """
     )
+    ensure_label_schema(conn)
     _migrate_park_backfill(conn)
     ensure_order_attributes_schema(conn)
     conn.commit()
+
+
+def ensure_label_schema(conn: sqlite3.Connection) -> None:
+    """统一标注面板的表与列（幂等）：capture_annotations 人工修正列 +
+    manual_order_anchors 订单时点锚点 + manual_device_registry 设备机位字典。
+    server.ensure_label_tables 复用本函数，避免两处 DDL 漂移。
+    """
+    for column in ("corrected_color TEXT NOT NULL DEFAULT ''",
+                   "corrected_type TEXT NOT NULL DEFAULT ''",
+                   "corrected_status TEXT NOT NULL DEFAULT ''",
+                   "corrected_stage TEXT NOT NULL DEFAULT ''",
+                   "corrected_direction TEXT NOT NULL DEFAULT ''",
+                   "corrected_time TEXT NOT NULL DEFAULT ''",
+                   "no_vehicle_manual INTEGER NOT NULL DEFAULT 0"):
+        try:
+            conn.execute(f"ALTER TABLE capture_annotations ADD COLUMN {column}")
+        except sqlite3.OperationalError:
+            pass  # 列已存在
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS manual_order_anchors (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          park TEXT DEFAULT '',
+          order_id TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          anchor_time TEXT NOT NULL,
+          annotator TEXT NOT NULL DEFAULT '',
+          note TEXT NOT NULL DEFAULT '',
+          created_at TEXT DEFAULT (datetime('localtime'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_order_anchors_order
+          ON manual_order_anchors(order_id);
+        CREATE TABLE IF NOT EXISTS manual_device_registry (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          park TEXT DEFAULT '',
+          device TEXT NOT NULL,
+          location TEXT NOT NULL,
+          direction TEXT DEFAULT '',
+          annotator TEXT NOT NULL DEFAULT '',
+          note TEXT NOT NULL DEFAULT '',
+          created_at TEXT DEFAULT (datetime('localtime')),
+          UNIQUE(park, device)
+        );
+        """
+    )
+
+
+def replay_manual(conn: sqlite3.Connection) -> dict:
+    """全库重建后恢复人工成果：把人工表里的写回字段重新落到 captures。
+
+    人工表是唯一事实源，captures 对应列视为缓存；本命令幂等可重复执行。
+    """
+    ensure_label_schema(conn)
+    rows = conn.execute(
+        """SELECT capture_id, corrected_stage, corrected_direction,
+                  corrected_color, corrected_type, corrected_plate,
+                  corrected_time, no_vehicle_manual
+           FROM capture_annotations"""
+    ).fetchall()
+    applied = 0
+    for row in rows:
+        sets, params = [], []
+        if row["corrected_stage"]:
+            sets += ["stage=?", "stage_rank=?"]
+            params += [row["corrected_stage"], STAGE_RANK.get(row["corrected_stage"], -1)]
+        if row["corrected_direction"]:
+            sets.append("osd_camera=?")
+            params.append("大门抓拍出" if row["corrected_direction"] == "out" else "大门抓拍进")
+        if row["corrected_color"]:
+            sets.append("vehicle_color=?")
+            params.append(row["corrected_color"])
+        if row["corrected_type"]:
+            sets.append("vehicle_type=?")
+            params.append(row["corrected_type"])
+        if row["corrected_plate"]:
+            sets.append("plate_final=?")
+            params.append(row["corrected_plate"])
+        if row["corrected_time"]:
+            day = conn.execute("SELECT date FROM captures WHERE id=?",
+                               (row["capture_id"],)).fetchone()
+            if day and day["date"]:
+                sets += ["capture_time=?", "hour=?", "ocr_status='manual'"]
+                params += [f"{day['date']} {row['corrected_time']}",
+                           int(row["corrected_time"][:2])]
+        if row["no_vehicle_manual"]:
+            sets.append("capture_status=?")
+            params.append("no_vehicle")
+        if sets:
+            conn.execute(f"UPDATE captures SET {', '.join(sets)} WHERE id=?",
+                         [*params, row["capture_id"]])
+            applied += 1
+    conn.commit()
+    return {"annotated_rows": len(rows), "applied": applied}
 
 
 def ensure_order_attributes_schema(conn: sqlite3.Connection) -> None:
@@ -795,6 +889,8 @@ def process_missing(conn: sqlite3.Connection, limit: int = 0, force: bool = Fals
         where = "coalesce(ocr_status,'')='fallback'"
     else:
         where = "coalesce(ocr_status,'')=''"
+    # 人工改过时间的帧（ocr_status='manual'）不被自动 OCR 覆盖
+    where += " AND coalesce(ocr_status,'')!='manual'"
     if stage:
         where += " AND stage=?"
         rows = conn.execute(
@@ -877,11 +973,17 @@ def process_missing(conn: sqlite3.Connection, limit: int = 0, force: bool = Fals
                 elif ocr_status != "ok":
                     status_reason = "时间戳OCR不可用，时间不确定（按阶段顺序推断）"
                 # 车牌字段只在本次读到新 OSD 车牌时覆盖：重跑/重试的帧此前
-                # 可能已由 LPR/correct_pass 写入更可靠的车牌，空读数不得清掉。
+                # 可能已由 LPR/correct_pass 写入更可靠的车牌，空读数不得清掉；
+                # 人工已标车牌（capture_annotations.corrected_plate）更不得被
+                # 自动读数覆盖（统一标注面板保护）。
                 conn.execute(
                     """UPDATE captures SET capture_time=?, hour=?, ocr_status=?, quality_score=?,
                               osd_plate=?, osd_color=?, osd_type=?, osd_camera=?,
-                              plate_final=CASE WHEN ?!='' THEN ? ELSE plate_final END,
+                              plate_final=CASE WHEN ?!='' AND NOT EXISTS (
+                                    SELECT 1 FROM capture_annotations ca
+                                    WHERE ca.capture_id=captures.id
+                                      AND coalesce(ca.corrected_plate,'')!='')
+                                 THEN ? ELSE plate_final END,
                               plate_observed=CASE WHEN ?!='' THEN ? ELSE plate_observed END,
                               plate_confidence=CASE WHEN ?!='' THEN ? ELSE plate_confidence END,
                               recognition_source=CASE WHEN ?!='' THEN ? ELSE recognition_source END,
@@ -2788,6 +2890,9 @@ def main() -> None:
                              "（如 --stage 抓拍 定向回填中文设备名）")
     parser.add_argument("--retry-failed", action="store_true",
                         help="只重跑 ocr_status=fallback 的帧（启用时刻带抢救通道）")
+    parser.add_argument("--replay-manual", action="store_true",
+                        help="全库重建后从人工表恢复写回字段（环节/方向/颜色/车型/"
+                             "车牌/时间/误检标记），幂等可重复执行")
     parser.add_argument("--associate-only", action="store_true", help="只重新聚合订单内车辆")
     parser.add_argument("--assign-loose", action="store_true",
                         help="未关联货车归类到订单（默认试运行，加 --apply 落盘）")
@@ -2820,6 +2925,9 @@ def main() -> None:
 
     conn = sqlite3.connect(args.db)
     ensure_schema(conn)
+    if args.replay_manual:
+        print(f"人工标注回放完成：{replay_manual(conn)}")
+        return
     standalone = (args.assign_loose or args.assign_gate or args.undo_loose_assign
                   or args.dedup_gate or args.undo_dedup)
     # 默认流程始终全盘同步：每日流水线靠它发现新园区/新照片（库非空也必须
