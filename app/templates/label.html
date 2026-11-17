@@ -140,17 +140,20 @@
         <input type="text" id="f_time" placeholder="HH:MM:SS">
       </div>
       <div class="sec">
-        <h4>订单时点锚点（合成事件，保存即重算整单）</h4>
+        <h4>关键时刻确认（可选：整单没问题就跳过这步）</h4>
+        <div class="kbd" style="margin-bottom:6px">用途：系统标了"(推定)"、或照片缺得厉害时间对不上时，你从照片里看明白了实际时刻，就在这里钉下来——保存后系统立刻按它重算这一单的状态。</div>
         <div class="half">
-          <div><label>锚点类型</label><select id="a_kind">
-            <option value="gate_in">进园确认</option><option value="weigh_in">入磅确认</option>
-            <option value="unload_done">卸货完成</option><option value="gate_out">离场确认</option>
+          <div><label>确认什么</label><select id="a_kind">
+            <option value="gate_in">车辆几点进的园区</option>
+            <option value="weigh_in">车辆几点上的地磅</option>
+            <option value="unload_done">货几点卸完的</option>
+            <option value="gate_out">车辆几点离园区</option>
           </select></div>
-          <div><label>时刻</label><input type="text" id="a_time" placeholder="HH:MM:SS"></div>
+          <div><label>时刻（时:分:秒，留空默认取当前选中照片的时间）</label><input type="text" id="a_time"></div>
         </div>
         <div class="row" style="margin-top:4px">
-          <button class="primary" onclick="addAnchor()">添加锚点</button>
-          <button onclick="markReviewed()">R 标记本单已复核</button>
+          <button class="primary" onclick="addAnchor()">保存这条确认</button>
+          <button onclick="markReviewed()">R 整单没问题，标记已复核并下一单</button>
         </div>
         <div class="anchors" id="anchorList"></div>
       </div>
@@ -204,6 +207,8 @@ const STATUS = ["大门进","等待入磅","入磅中","卸货","出磅中","大
 const COLORS = ["黄色","橙色","绿色","灰色","红色","蓝色","白色","金色","棕色","黑色"];
 const TYPES = ["轿车","SUV","MPV","面包车","皮卡","货车","客车","罐车","挂车","工程机械"];
 const statusColor = {"大门进":"blue","等待入磅":"amber","入磅中":"green","卸货":"purple","出磅中":"green","大门出":""};
+const ANCHOR_CN = {gate_in: "进园确认", weigh_in: "入磅确认", unload_done: "卸货完成",
+                   gate_out: "离场确认", reviewed: "已复核"};
 const state = { queue: [], qi: -1, type: "assumed", park: "", order: null, items: [], ci: -1,
                 boxMode: false, boxPts: [], imgW: 0, imgH: 0 };
 
@@ -252,7 +257,7 @@ function renderOrder() {
       <span class="badge ${statusColor[st] || ""}">${esc(st || "无状态")}${o.progress_assumed ? "(推定)" : ""}</span></div>
     <div class="sub">${o.items.length} 张 · 车牌 ${esc(o.plate || "—")} · 最后事件 ${esc((o.last_event_time || "—").slice(0, 19))}${o.progress_note ? " · " + esc(o.progress_note) : ""}
       · 阈值 ${esc(JSON.stringify(o.flow_thresholds))} 分钟</div>
-    <div class="sub">锚点：${o.anchors.length ? o.anchors.map(a => `<span class="badge manual">${esc(a.kind)} ${esc(a.anchor_time.slice(11))}</span>`).join(" ") : "无"}</div>`;
+    <div class="sub">已确认的时刻：${o.anchors.length ? o.anchors.map(a => `<span class="badge manual">${esc(ANCHOR_CN[a.kind] || a.kind)} ${esc(a.anchor_time.slice(11))}</span>`).join(" ") : "无（整单状态正常时可不用填）"}</div>`;
   $("film").innerHTML = o.items.map((it, idx) => `
     <div class="frame ${idx === state.ci ? "active" : ""}" onclick="selectCapture(${idx})">
       <img src="/api/crop/${it.id}" onerror="this.onerror=null;this.src='/api/thumb/${it.id}'" loading="lazy">
@@ -303,21 +308,25 @@ function setStatus(v) {
 /* ---------------- 锚点 / 机位 ---------------- */
 function renderAnchors(anchors, devices) {
   $("anchorList").innerHTML = anchors.length ? anchors.map(a => `
-    <div class="a"><span class="badge manual">${esc(a.kind)}</span>
+    <div class="a"><span class="badge manual">${esc(ANCHOR_CN[a.kind] || a.kind)}</span>
       ${esc(a.anchor_time.slice(0, 19))} · ${esc(a.annotator || "")}
       <button style="padding:0 6px" onclick="delAnchor(${a.id})">删</button></div>`).join("")
-    : '<span class="kbd">暂无锚点</span>';
+    : '<span class="kbd">暂无已确认的时刻</span>';
   $("deviceList").innerHTML = devices.length ? devices.map(d => `
     <div class="a"><span class="badge">${esc(d.device)}</span> ${esc(d.location)}${d.direction ? " · " + esc(d.direction) : ""}</div>`).join("")
     : '<span class="kbd">本园区暂无机位登记</span>';
 }
 async function addAnchor() {
   const it = state.order.items[state.ci];
+  const hms = $("a_time").value.trim() || (it.capture_time || "").slice(11);
+  if (!/^\d{2}:\d{2}:\d{2}$/.test(hms)) {
+    toast("请填写时刻（时:分:秒），或先选中一张有时间照片再保存"); return;
+  }
   await api("/api/label/anchor", { method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ park: state.order.park, order_id: state.order.order_id,
-      kind: $("a_kind").value, anchor_time: `${(it.capture_time || "").slice(0, 10)} ${$("a_time").value || (it.capture_time || "").slice(11)}`,
+      kind: $("a_kind").value, anchor_time: `${(it.capture_time || "").slice(0, 10)} ${hms}`,
       annotator: annotator() }) });
-  toast("锚点已保存，整单状态已重算"); await selectOrder(state.qi);
+  toast("已保存：系统按你确认的时刻重算了这单的状态"); await selectOrder(state.qi);
 }
 async function delAnchor(id) {
   await api(`/api/label/anchor/${id}`, { method: "DELETE", headers: { "Content-Type": "application/json" },
@@ -330,7 +339,7 @@ async function markReviewed() {
     body: JSON.stringify({ park: state.order.park, order_id: state.order.order_id,
       kind: "reviewed", anchor_time: (it.capture_time || "").slice(0, 19) || new Date().toISOString().slice(0, 19).replace("T", " "),
       annotator: annotator() }) });
-  toast("已标记复核，切下一单"); nextOrder();
+  toast("已标记复核，自动切下一单"); nextOrder();
 }
 async function saveDevice() {
   await api("/api/label/device", { method: "POST", headers: { "Content-Type": "application/json" },
@@ -464,7 +473,7 @@ async function loadRecords() {
       <td>${esc(x.updated_at || "")}</td></tr>`;
   });
   const anchors = r.anchors.map(x => `
-    <tr><td>${esc(x.order_id)}</td><td>${esc(x.park || "")}</td><td>${esc(x.kind)}</td>
+    <tr><td>${esc(x.order_id)}</td><td>${esc(x.park || "")}</td><td>${esc(ANCHOR_CN[x.kind] || x.kind)}</td>
       <td>${esc(x.anchor_time)}</td><td>${esc(x.annotator || "")}</td><td>${esc(x.created_at || "")}</td></tr>`);
   const boxes = r.box_edits.map(x => `
     <tr><td>#${x.capture_id}</td><td>${esc(x.park || "")}</td><td>${esc(x.order_id || "")}</td>
@@ -474,7 +483,7 @@ async function loadRecords() {
       <td>${esc(x.direction || "—")}</td><td>${esc(x.annotator || "")}</td><td>${esc(x.created_at || "")}</td></tr>`);
   $("recordsBody").innerHTML =
     table(["照片", "园区", "订单", "修正内容", "标注人", "时间"], caps) +
-    table(["订单", "园区", "锚点类型", "时刻", "标注人", "时间"], anchors) +
+    table(["订单", "园区", "确认类型", "时刻", "标注人", "时间"], anchors) +
     table(["照片", "园区", "订单", "框 [l,t,r,b]", "时间"], boxes) +
     table(["设备", "园区", "机位", "方向", "标注人", "时间"], devices);
 }
