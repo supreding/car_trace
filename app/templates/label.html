@@ -144,6 +144,7 @@
         <div class="kbd" style="margin-bottom:6px">用途：系统标了"(推定)"、或照片缺得厉害时间对不上时，你从照片里看明白了实际时刻，就在这里钉下来——保存后系统立刻按它重算这一单的状态。</div>
         <div class="half">
           <div><label>确认什么</label><select id="a_kind">
+            <option value="skip" selected>看不出 / 没问题（跳过）</option>
             <option value="gate_in">车辆几点进的园区</option>
             <option value="weigh_in">车辆几点上的地磅</option>
             <option value="unload_done">货几点卸完的</option>
@@ -317,6 +318,10 @@ function renderAnchors(anchors, devices) {
     : '<span class="kbd">本园区暂无机位登记</span>';
 }
 async function addAnchor() {
+  if ($("a_kind").value === "skip") {
+    toast("当前是跳过状态：整单没问题就点【R 标记已复核】；要确认时刻请先在下拉里选类型");
+    return;
+  }
   const it = state.order.items[state.ci];
   const hms = $("a_time").value.trim() || (it.capture_time || "").slice(11);
   if (!/^\d{2}:\d{2}:\d{2}$/.test(hms)) {
