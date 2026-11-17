@@ -19,14 +19,12 @@ import server
 
 class AppTestCase(unittest.TestCase):
     @classmethod
-    @classmethod
     def setUpClass(cls):
         server.app.config.update(TESTING=True)
         cls.client = server.app.test_client()
         cls.db = sqlite3.connect(server.DB_PATH)
         cls.db.row_factory = sqlite3.Row
 
-    @classmethod
     @classmethod
     def tearDownClass(cls):
         cls.db.close()
@@ -537,7 +535,6 @@ class OpenApiProgressTests(unittest.TestCase):
     """开放接口进度字段接线验证（临时注入 token，不动真实配置）。"""
 
     @classmethod
-    @classmethod
     def setUpClass(cls):
         server.app.config.update(TESTING=True)
         cls.client = server.app.test_client()
@@ -545,7 +542,6 @@ class OpenApiProgressTests(unittest.TestCase):
         cls._old = server.OPEN_API_TOKEN
         server.OPEN_API_TOKEN = cls.token
 
-    @classmethod
     @classmethod
     def tearDownClass(cls):
         server.OPEN_API_TOKEN = cls._old
@@ -580,10 +576,14 @@ class LabelWorkspaceTests(unittest.TestCase):
     """标注工作台端到端：保存写回、锚点合成事件、队列、回放。测试后恢复原值。"""
 
     @classmethod
-    @classmethod
     def setUpClass(cls):
         server.app.config.update(TESTING=True)
         cls.client = server.app.test_client()
+
+    def get_json(self, url):
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        return response.get_json()
 
     def post(self, url, **body):
         response = self.client.post(url, json=body)
@@ -631,6 +631,17 @@ class LabelWorkspaceTests(unittest.TestCase):
                 db.execute("DELETE FROM capture_annotations WHERE capture_id=?", (capture_id,))
                 db.execute("DELETE FROM annotation_audit WHERE capture_id=?", (capture_id,))
                 db.commit()
+
+    def test_photo_queue_types(self):
+        # 照片级队列：五类都返回照片条目（含 capture_id 供定位）
+        for qtype in ("direction_unknown", "plate_missing", "time_missing",
+                      "attr_low", "attr_review"):
+            data = self.get_json(f"/api/label/queue?type={qtype}&limit=5")
+            self.assertEqual(data["level"], "photo")
+            for item in data["items"]:
+                self.assertIn("capture_id", item)
+                self.assertIn("order_id", item)
+                self.assertIn("reason", item)
 
     def test_label_queue_assumed_only(self):
         data = self.client.get("/api/label/queue?type=assumed").get_json()

@@ -2275,6 +2275,67 @@ def merge_vehicles():
 LABEL_ANCHOR_KINDS = ("gate_in", "weigh_in", "unload_done", "gate_out", "reviewed")
 LABEL_LOCATIONS = ("大门", "入磅地磅", "出磅地磅", "卸货区", "场院", "其他")
 
+# 照片级标注队列：每类挑出最值得人工看一眼的照片（自动修正过的自动排除）
+PHOTO_QUEUE_TYPES = {
+    "time_missing": ("时间缺失/OCR不确定（顺手补抓拍时刻）",
+                     "coalesce(capture_time,'')='' OR ocr_status IN ('fallback','conflict')"),
+    "plate_missing": ("车牌未识别（读得出就补车牌）",
+                      "coalesce(plate_final,'')='' AND vehicle_crop_path IS NOT NULL"),
+    "attr_low": ("颜色/车型低置信（<70%）",
+                 "((vehicle_color_conf IS NOT NULL AND vehicle_color_conf<0.7) OR "
+                 "(vehicle_type_conf IS NOT NULL AND vehicle_type_conf<0.7))"),
+    "attr_review": ("属性冲突待复核", "status_reason LIKE '%待人工复核%'"),
+    "direction_unknown": ("大门方向未知（画面是大门口就标 进大门/出大门）",
+                          "stage='抓拍' AND (osd_camera IS NULL OR (osd_camera NOT LIKE '%进%'"
+                          " AND osd_camera NOT LIKE '%出%'))"),
+}
+# 各队列排除人工已标注同字段的帧（标过的不再重复出现）
+PHOTO_QUEUE_MANUAL_EXCLUDE = {
+    "time_missing": "coalesce(ocr_status,'')!='manual'",
+    "plate_missing": ("NOT EXISTS (SELECT 1 FROM capture_annotations ca"
+                      " WHERE ca.capture_id=captures.id AND coalesce(ca.corrected_plate,'')!='')"),
+    "attr_low": ("NOT EXISTS (SELECT 1 FROM capture_annotations ca"
+                 " WHERE ca.capture_id=captures.id AND (coalesce(ca.corrected_color,'')!=''"
+                 " OR coalesce(ca.corrected_type,'')!=''))"),
+    "attr_review": ("NOT EXISTS (SELECT 1 FROM capture_annotations ca"
+                    " WHERE ca.capture_id=captures.id AND (coalesce(ca.corrected_color,'')!=''"
+                    " OR coalesce(ca.corrected_type,'')!=''))"),
+    "direction_unknown": ("NOT EXISTS (SELECT 1 FROM capture_annotations ca"
+                          " WHERE ca.capture_id=captures.id AND coalesce(ca.corrected_direction,'')!='')"),
+}
+
+
+def _photo_queue_items(db, queue_type, park, limit, offset):
+    """照片级队列：按类型挑照片，返回 (items, total)。"""
+    title, extra = PHOTO_QUEUE_TYPES[queue_type]
+    where = (f"coalesce(order_id,'')!='' AND order_id!='未关联图片' "
+             f"AND coalesce(capture_status,'vehicle')!='no_vehicle' "
+             f"AND {QUARANTINE_EXCLUDE} AND ({extra}) "
+             f"AND {PHOTO_QUEUE_MANUAL_EXCLUDE[queue_type]}")
+    parameters: list = []
+    if park:
+        where += " AND coalesce(park,'')=?"
+        parameters.append(park)
+    total = db.execute(f"SELECT COUNT(*) FROM captures WHERE {where}", parameters).fetchone()[0]
+    rows = db.execute(
+        f"""SELECT id, date, capture_time, stage, order_id, coalesce(park,'') AS park,
+                   plate_final, vehicle_color, vehicle_type, status_reason,
+                   vehicle_crop_path IS NOT NULL AS has_crop
+            FROM captures WHERE {where}
+            ORDER BY date DESC, id DESC LIMIT ? OFFSET ?""",
+        [*parameters, limit, offset],
+    ).fetchall()
+    items = []
+    for row in rows:
+        items.append({
+            "capture_id": row["id"], "park": row["park"], "order_id": row["order_id"],
+            "capture_time": row["capture_time"], "date": row["date"], "stage": row["stage"],
+            "plate": row["plate_final"] or "", "vehicle_color": row["vehicle_color"] or "",
+            "vehicle_type": row["vehicle_type"] or "",
+            "has_crop": bool(row["has_crop"]), "reason": title, "level": "photo",
+        })
+    return items, total
+
 
 def ensure_label_tables(db: sqlite3.Connection) -> None:
     """统一标注面板所需的表与列（幂等，可重复执行）。DDL 收编在
@@ -2557,7 +2618,8 @@ def label_device_save():
 
 @app.route("/api/label/queue")
 def label_queue():
-    """批量作业队列：按原因列出待标注订单（推定/无状态/全部，已复核默认排除）。
+    """批量作业队列：订单级（推定/无状态/全部/已复核）+ 照片级（时间/车牌/
+    属性/方向等按缺陷挑照片）。照片级返回 level='photo'，订单级 level='order'。
 
     复核标记 = manual_order_anchors.kind='reviewed'；queue=reviewed 反向只看已复核。
     """
@@ -2567,6 +2629,9 @@ def label_queue():
     offset = positive_int(request.args.get("offset", "0"), 0)
     with closing(get_db()) as db:
         ensure_label_tables(db)
+        if queue_type in PHOTO_QUEUE_TYPES:
+            items, total = _photo_queue_items(db, queue_type, park, limit, offset)
+            return jsonify({"level": "photo", "total": total, "items": items})
         ids = [r[0] for r in db.execute(
             """SELECT DISTINCT order_id FROM captures
                WHERE order_id!='' AND order_id!='未关联图片'""").fetchall()]
@@ -2617,7 +2682,7 @@ def label_queue():
         items.sort(key=lambda x: x["last_event_time"], reverse=True)
         total = len(items)
         items = items[offset:offset + limit]
-    return jsonify({"total": total, "items": items})
+    return jsonify({"level": "order", "total": total, "items": items})
 
 
 @app.route("/api/label/order")

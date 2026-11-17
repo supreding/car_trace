@@ -82,13 +82,18 @@
 
 <div class="toolbar" style="display:flex; gap:8px; padding:8px 10px; align-items:center;">
   <span class="kbd">队列：</span>
-  <select id="qtype">
-    <option value="assumed">推定状态（待确认）</option>
-    <option value="empty">无有效事件</option>
-    <option value="all">全部订单</option>
-    <option value="reviewed">已复核</option>
+  <select id="qtype" onchange="loadQueue()">
+    <option value="assumed">订单：推定状态（待确认）</option>
+    <option value="empty">订单：无有效事件</option>
+    <option value="all">订单：全部</option>
+    <option value="reviewed">订单：已复核</option>
+    <option value="direction_unknown">照片：大门方向未知</option>
+    <option value="plate_missing">照片：车牌未识别</option>
+    <option value="attr_low">照片：颜色/车型低置信</option>
+    <option value="attr_review">照片：属性冲突待复核</option>
+    <option value="time_missing">照片：时间缺失/不确定</option>
   </select>
-  <select id="parkSel" style="width:auto"></select>
+  <select id="parkSel" style="width:auto" onchange="loadQueue()"></select>
   <button onclick="loadQueue()">刷新队列</button>
   <button onclick="showRecords()">标注记录</button>
   <span id="qcount" class="kbd"></span>
@@ -230,8 +235,21 @@ function fillSelect(sel, list, current) {
 async function loadQueue(keepIndex) {
   state.type = $("qtype").value; state.park = $("parkSel").value;
   const q = await api(`/api/label/queue?type=${state.type}${state.park ? `&park=${encodeURIComponent(state.park)}` : ""}`);
-  state.queue = q.items; state.qi = keepIndex ? Math.min(state.qi, state.queue.length - 1) : -1;
-  $("qcount").textContent = `共 ${q.total} 单${state.type === "reviewed" ? "（已复核）" : ""}`;
+  state.queue = q.items; state.level = q.level || "order";
+  state.qi = keepIndex ? Math.min(state.qi, state.queue.length - 1) : -1;
+  const unit = state.level === "photo" ? "张" : "单";
+  $("qcount").textContent = `共 ${q.total} ${unit}${state.type === "reviewed" ? "（已复核）" : ""}`;
+  if (state.level === "photo") {
+    $("queue").innerHTML = state.queue.length ? state.queue.map((it, i) => `
+      <div class="qitem ${i === state.qi ? "active" : ""}" onclick="selectOrder(${i})">
+        <div class="t">#${it.capture_id} <span class="badge">${esc(it.stage || "—")}</span>
+          ${it.plate ? `<span class="badge blue">${esc(it.plate)}</span>` : ""}</div>
+        <div class="s">${esc(it.order_id || "未关联订单")} · ${esc((it.capture_time || it.date || "").slice(0, 16))}</div>
+        <div class="s">${esc(it.reason)}</div>
+      </div>`).join("") : '<div class="empty">队列空 🎉</div>';
+    if (state.qi >= 0) selectOrder(state.qi);
+    return;
+  }
   $("queue").innerHTML = state.queue.length ? state.queue.map((it, i) => `
     <div class="qitem ${i === state.qi ? "active" : ""}" onclick="selectOrder(${i})">
       <div class="t">${esc(it.order_id)} ${it.reviewed ? '<span class="badge manual">已复核</span>' : ""}
@@ -247,10 +265,13 @@ async function selectOrder(i) {
   document.querySelectorAll(".qitem").forEach((el, idx) => el.classList.toggle("active", idx === i));
   const it = state.queue[i]; if (!it) return;
   state.order = await api(`/api/label/order?order_id=${encodeURIComponent(it.order_id)}&park=${encodeURIComponent(it.park)}`);
-  renderOrder();
+  // 照片级队列：载入订单后直接定位到该张照片
+  const targetCi = it.capture_id
+    ? state.order.items.findIndex(x => x.id === it.capture_id) : -1;
+  renderOrder(targetCi);
 }
 
-function renderOrder() {
+function renderOrder(targetCi) {
   const o = state.order;
   const st = o.progress_status;
   $("orderHead").innerHTML = `
@@ -265,7 +286,7 @@ function renderOrder() {
       <span class="mark badge ${statusColor[it.progress_status] || ""}"
         title="${esc(it.progress_status)}${it.progress_source === "manual" ? " · 人工" : ""}">${esc(it.progress_status ? it.progress_status.slice(0, 3) : "—")}</span>
     </div>`).join("");
-  if (state.ci < 0 || state.ci >= o.items.length) state.ci = 0;
+  state.ci = (targetCi >= 0 && targetCi < o.items.length) ? targetCi : 0;
   selectCapture(state.ci, true);
 }
 
