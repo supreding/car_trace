@@ -1,6 +1,6 @@
 # 车辆轨迹查询系统 API 接口清单
 
-更新时间：2026-09-10　对应代码：`app/server.py`　线上环境：阿里云 ECS（47.101.32.59）
+更新时间：2026-11-23　对应代码：`app/server.py`（本机/局域网部署，无独立云服务器）
 
 接口分两组，**用途和防护等级不同**：
 
@@ -35,9 +35,9 @@
 
 | 项目 | 约定 |
 |---|---|
-| Base URL | `http://47.101.32.59`（80 端口，无需带端口号） |
+| Base URL | `http://<服务机IP>:5000`（默认 5000 端口，由 start_server.ps1 `-Port` 参数决定，仅限内网） |
 | 方法 | 全部只读，仅 `GET` |
-| 鉴权 | 请求头 `X-API-Token: 8cc5318daf2faaeb93dbf21c030dcc053deae8afc5f4c10d`（推荐）；图片类接口也支持 `?token=8cc5318daf2faaeb93dbf21c030dcc053deae8afc5f4c10d` 查询参数，便于直接嵌入 `<img>` 标签。token 由服务端环境变量 `OPEN_API_TOKEN` 配置（systemd 单元内），**未配置时整组接口返回 503 停用**。当前线上 token：`8cc5318daf2faaeb93dbf21c030dcc053deae8afc5f4c10d`（同存于服务器 `/data/car-trace/deploy_linux/open_api_token.txt`） |
+| 鉴权 | 请求头 `X-API-Token: <token>`（推荐）；图片类接口也支持 `?token=<token>` 查询参数，便于直接嵌入 `<img>` 标签。token 由服务端环境变量 `OPEN_API_TOKEN` 配置（启动脚本 `-OpenApiToken` 参数可写入），**未配置时整组接口返回 503 停用** |
 | 响应格式（列表） | `{"code": 0, "message": "ok", "total": 总条数, "page": 页码, "page_size": 每页条数, "items": [...]}` |
 | 响应格式（单对象） | `{"code": 0, "message": "ok", "data": {...}}` |
 | 响应格式（错误） | `{"code": <HTTP状态码>, "message": "错误说明"}`，HTTP 状态码与 code 一致 |
@@ -98,34 +98,35 @@
 ### 1.4 调用示例
 
 ```bash
-# 自检 token
-curl -H "X-API-Token: 8cc5318daf2faaeb93dbf21c030dcc053deae8afc5f4c10d" http://47.101.32.59/api/open/ping
+# 自检 token（服务地址/端口按启动脚本参数调整，默认 localhost:5000）
+curl -H "X-API-Token: $OPEN_API_TOKEN" http://localhost:5000/api/open/ping
 
 # 查 2026-08-05 至 2026-08-08 的订单（第 1 页，每页 100 条）
-curl -H "X-API-Token: 8cc5318daf2faaeb93dbf21c030dcc053deae8afc5f4c10d" \
-  "http://47.101.32.59/api/open/orders?date_from=2026-08-05&date_to=2026-08-08&page=1&page_size=100"
+curl -H "X-API-Token: $OPEN_API_TOKEN" \
+  "http://localhost:5000/api/open/orders?date_from=2026-08-05&date_to=2026-08-08&page=1&page_size=100"
 
 # 查某天的车辆，再取某辆车的完整轨迹
-curl -H "X-API-Token: 8cc5318daf2faaeb93dbf21c030dcc053deae8afc5f4c10d" "http://47.101.32.59/api/open/vehicles?date=2026-08-05"
-curl -H "X-API-Token: 8cc5318daf2faaeb93dbf21c030dcc053deae8afc5f4c10d" "http://47.101.32.59/api/open/vehicle/122"
+curl -H "X-API-Token: $OPEN_API_TOKEN" "http://localhost:5000/api/open/vehicles?date=2026-08-05"
+curl -H "X-API-Token: $OPEN_API_TOKEN" "http://localhost:5000/api/open/vehicle/122"
 
 # 按车牌片段 + 时段查抓拍明细
-curl -H "X-API-Token: 8cc5318daf2faaeb93dbf21c030dcc053deae8afc5f4c10d" \
-  "http://47.101.32.59/api/open/captures?date=2026-08-05&plate=CE1929&start_hour=8&end_hour=18"
+curl -H "X-API-Token: $OPEN_API_TOKEN" \
+  "http://localhost:5000/api/open/captures?date=2026-08-05&plate=CE1929&start_hour=8&end_hour=18"
 
 # 在园车辆看板轮询（默认看近 24 小时有活动的订单）
-curl -H "X-API-Token: 8cc5318daf2faaeb93dbf21c030dcc053deae8afc5f4c10d" \
-  "http://47.101.32.59/api/open/yard?active_hours=24"
+curl -H "X-API-Token: $OPEN_API_TOKEN" \
+  "http://localhost:5000/api/open/yard?active_hours=24"
 
 # 车辆裁剪图（查询参数方式鉴权，可直接嵌 <img src>）
-<img src="http://47.101.32.59/api/open/crop/3088?token=8cc5318daf2faaeb93dbf21c030dcc053deae8afc5f4c10d">
+<img src="http://localhost:5000/api/open/crop/3088?token=$OPEN_API_TOKEN">
 ```
 
 ```python
+import os
 import requests
 
-BASE = "http://47.101.32.59"
-HEADERS = {"X-API-Token": "8cc5318daf2faaeb93dbf21c030dcc053deae8afc5f4c10d"}
+BASE = "http://localhost:5000"
+HEADERS = {"X-API-Token": os.environ["OPEN_API_TOKEN"]}
 
 resp = requests.get(f"{BASE}/api/open/orders",
                     params={"date": "2026-08-10", "page": 1, "page_size": 100},
@@ -211,46 +212,11 @@ if data["code"] == 0:
 表，`detect_pass`（含 `--force`）与 `correct_pass` 跳过这些抓拍，人工修正不会被自动
 覆盖。撤销标记请用 `/api/boxedit/reset`。
 
----
-
-## 三、线上服务器运维（阿里云 ECS 47.101.32.59）
-
-**部署布局**：项目实际位于 **`/data/car-trace`**（500G 数据盘，照片/数据库/裁剪图全在此盘），
-`/opt/car-trace` 为指向它的软链接。数据库为**单库多园区**（`app/granary.db`，当前含
-山高荃银丰麦田库 4908 张 + 农易行临泉辉煌库 3394 张），`app/nongyixing.db` 为合并前
-的历史库（仅留档，未被服务使用）。
-
-**查询服务**：systemd 服务 `car-trace`（waitress，监听 0.0.0.0:80），开机自启、崩溃自动拉起。
-
-```bash
-systemctl status  car-trace        # 状态
-systemctl restart car-trace        # 重启（改代码/配置后执行）
-journalctl -u car-trace -f         # 服务日志
-```
-
-**定时流水线**：systemd 定时器 `car-trace-pipeline.timer`，**每 30 分钟自动执行**
-（2026-09-21 应现场要求由每日 03:00 改为每半小时）：
-数据库备份（`/data/backups/`，gzip，保留 7 份）→ 全园区照片同步（**自动发现新园区**）+ OCR
-→ GPU 流水线（**只处理新增/未处理**）。无新增图片时自动跳过 GPU（状态记为 SKIPPED）。
-照片从现场到可查询的延迟因此约为 30~60 分钟（拍照 → NVR 归档 → 下一次定时器）。
-
-```bash
-systemctl list-timers car-trace-pipeline.timer   # 下次触发时间
-systemctl start car-trace-pipeline               # 手动立即触发（上传急用）
-cat /data/pipeline_status.txt                    # 最近一次结果：OK / SKIPPED / FAILURE
-journalctl -u car-trace-pipeline -f              # 运行日志
-```
-
-**新园区接入**：照片放 `/data/car-trace/data/<园区名>/<月份照片根>/<日期>/<订单号>/`，
-等定时器自动处理（每 30 分钟，或手动触发）；页面园区下拉框自动出现新园区，无需改任何配置/代码。
-
 **人工合并可靠性**：页面上的"合并车辆"决定按抓拍锚定持久化（`manual_vehicle_merge_pairs` 表），
-每日重聚类后自动重放，不受车辆编号重排影响；人工"移动/拆出"同样持久生效。
+每次重聚类后自动重放，不受车辆编号重排影响；人工"移动/拆出"同样持久生效。
 注意：`vehicle_id` 编号本身每次重聚类会变化，对外系统持久引用请用 `order_id + park`。
 
-**历史备份**：`app/granary.db.bak-20260907`（相对路径迁移前）、
-`app/granary.db.bak-merge-20260909`（双库合并前），确认无用后可删。
+---
 
-**Windows 开发机**：查询服务 `启动查询服务.bat`、流水线 `启动识别流水线.bat`（需 GPU + Python 3.12，
-依赖见 requirements-*.txt）；部署包生成脚本 `make_deploy_package.py`。
+部署与运维（启动方式、数据布局、归类收尾、大门去重）见项目根目录《部署说明.txt》。
 

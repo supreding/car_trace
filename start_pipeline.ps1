@@ -154,7 +154,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "识别流水线执行失败（退出码 $LASTEXITCODE）"
 }
 
-# ---- 7. 归类收尾（与服务器 daily_pipeline.sh 步骤对齐）----
+# ---- 7. 归类收尾（与 deploy_linux/daily_pipeline.sh 步骤对齐）----
 # 只跑同步+GPU 不会移动照片：归类依赖特征入库后显式执行，否则新散图永远
 # 停留在「未关联图片」。全部写 loose_assignments / gate_dedup_log 日志，
 # 可 --undo-loose-assign / --undo-dedup 撤销；单步失败只告警不阻断。
