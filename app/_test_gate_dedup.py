@@ -336,6 +336,35 @@ def test_quarantine_excluded_from_assign_and_associate():
     print("[PASS] 隔离园区被归类/重聚排除")
 
 
+def test_same_park_duplicate_kept_for_review():
+    """同园区内同文件名副本（上游把同一张过磅照片写进同园区两个订单）：
+    保留两边待人工，绝不自动隔离——去重不得把照片从订单里拉走。"""
+    tmp = Path(tempfile.mkdtemp())
+    conn = make_db(tmp)
+    root = tmp / "data"
+    name = "出磅2026年11月5日08：15：59_2346200.jpg"
+    fa = root / "园区A" / MONTH / DAY / ORDER_A / name
+    fb = root / "园区A" / MONTH / DAY / ORDER_B / name
+    make_jpg(fa)
+    copy_jpg(fa, fb)
+    build_db.sync_files(conn, root)
+    cid_a = conn.execute("SELECT id FROM captures WHERE park=? AND order_id=? AND filename=?",
+                         ("园区A", ORDER_A, name)).fetchone()[0]
+    cid_b = conn.execute("SELECT id FROM captures WHERE park=? AND order_id=? AND filename=?",
+                         ("园区A", ORDER_B, name)).fetchone()[0]
+    report = build_db.dedup_gate_captures(conn, apply_changes=True, root=root)
+    assert report["dup_groups"] == 1 and report["moved"] == 0, report
+    assert report["same_park_review_groups"] == 1, report
+    assert fa.is_file() and fb.is_file()
+    rows = conn.execute("SELECT id, park, order_id FROM captures WHERE id IN (?,?)",
+                        (cid_a, cid_b)).fetchall()
+    assert {r[1:] for r in rows} == {("园区A", ORDER_A), ("园区A", ORDER_B)}, rows
+    assert conn.execute("SELECT COUNT(*) FROM gate_dedup_log").fetchone()[0] == 0
+    conn.close()
+    shutil.rmtree(tmp, ignore_errors=True)
+    print("[PASS] 同园区重复保留两边待人工（不隔离）")
+
+
 if __name__ == "__main__":
     test_a_class_uid_rules()
     test_b_class_requires_identical_bytes()
@@ -343,5 +372,6 @@ if __name__ == "__main__":
     test_uuid_collision()
     test_cross_park_timeline_wins_and_rescan_idempotent()
     test_all_unassociated_needs_review()
+    test_same_park_duplicate_kept_for_review()
     test_quarantine_excluded_from_assign_and_associate()
     print("ALL TESTS PASSED")

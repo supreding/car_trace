@@ -56,6 +56,18 @@ def normalize_plate(value: str) -> str:
     return PLATE_CLEAN_RE.sub("", (value or "").upper())[:10]
 
 
+def _row_matches_plate(row: sqlite3.Row | dict, query: str) -> bool:
+    """车牌模糊检索：无视首字省份 + 易混淆字符（0/O/D/Q、1/I/L/T、2/Z、5/S、8/B 等）
+    + 少/多 1 位容错，同时匹配 plate_final、图像车牌 lpr_plate 与 OSD 车牌 osd_plate。"""
+    if not query:
+        return True
+    keys = row.keys()
+    for field in ("plate_final", "lpr_plate", "osd_plate"):
+        if field in keys and row[field] and build_db.plate_matches_query(row[field], query):
+            return True
+    return False
+
+
 def resolve_capture_path(stored_path: str) -> Path:
     """同时支持开发机绝对路径与便携包内相对路径。"""
     path = Path(stored_path)
@@ -125,6 +137,7 @@ CAPTURE_FIELDS = """
     capture_time, hour, ocr_status,
     osd_plate, osd_color, osd_type, osd_camera,
     plate_final, plate_observed, plate_confidence, recognition_source,
+    lpr_plate, lpr_conf,
     vehicle_color, vehicle_color_conf, vehicle_type, vehicle_type_conf,
     attr_model_version,
     vehicle_crop_path, vehicle_box, crop_source, detection_count, vehicle_det_score,
@@ -346,7 +359,7 @@ def vehicle_move():
         return jsonify({"error": "scope 无效"}), 400
     target_raw = str(payload.get("target_plate", "") or "").strip()
     target_plate = normalize_plate(target_raw)
-    target_key = target_plate[1:] if len(target_plate) >= 2 else ""
+    target_key = build_db._plate_body(target_plate)
 
     with closing(get_db()) as db:
         row = db.execute(
@@ -359,16 +372,25 @@ def vehicle_move():
 
         if target_key:
             # 园区隔离：目标车牌只在抓拍所属园区内查找，移动不跨园区。
-            hit = db.execute(
-                """SELECT vehicle_id FROM captures WHERE vehicle_id IS NOT NULL
-                   AND coalesce(plate_final,'')!='' AND coalesce(park,'')=?
-                   AND substr(plate_final,2)=?
-                   LIMIT 1""",
-                (capture_park, target_key),
-            ).fetchone()
-            if not hit:
+            # 支持无视首字省份 + 易混淆字符 + 少/多 1 位容错（精确主体优先）。
+            candidates = db.execute(
+                """SELECT vehicle_id, plate_final FROM captures WHERE vehicle_id IS NOT NULL
+                   AND coalesce(plate_final,'')!='' AND coalesce(park,'')=?""",
+                (capture_park,),
+            ).fetchall()
+            best_vid = None
+            best_dist = 99.0
+            for cand in candidates:
+                pf = cand["plate_final"] or ""
+                if build_db._plate_body(pf) == target_key:
+                    best_vid, best_dist = cand["vehicle_id"], 0.0
+                    break
+                d = build_db._plate_edit_distance(pf, target_plate)
+                if d <= 1.0 and d < best_dist:
+                    best_vid, best_dist = cand["vehicle_id"], d
+            if best_vid is None:
                 return jsonify({"error": f"未找到车牌含「{target_plate}」的车辆聚合"}), 404
-            new_vid = hit["vehicle_id"]
+            new_vid = best_vid
         else:
             new_vid = None  # 拆出为独立车辆
 
@@ -1069,7 +1091,8 @@ def order_detail(order_id: str):
 
 @app.route("/api/search")
 def search():
-    """综合查询：车牌（片段+形近归一）、车型、时段、订单号，均走 SQL 结构化字段。"""
+    """综合查询：车牌（无视首字省份+形近归一+少/多1位容错，覆盖 plate_final/lpr_plate/osd_plate）、
+    车型、时段、订单号。"""
     plate = normalize_plate(request.args.get("plate", ""))
     vehicle_type = request.args.get("vehicle_type", "").strip()
     start_hour = request.args.get("start_hour", "").strip()
@@ -1081,9 +1104,9 @@ def search():
     # 隔离园区照片（共用大门去重落败副本）不参与检索
     where, parameters = [QUARANTINE_EXCLUDE], []
     if plate:
-        where.append("(replace(upper(plate_final),' ','') LIKE ? "
-                     "OR replace(upper(osd_plate),' ','') LIKE ?)")
-        parameters.extend([f"%{plate}%", f"%{plate}%"])
+        where.append("(coalesce(plate_final,'')!='' "
+                     "OR coalesce(lpr_plate,'')!='' "
+                     "OR coalesce(osd_plate,'')!='')")
     if vehicle_type:
         where.append("vehicle_type=?")
         parameters.append(vehicle_type)
@@ -1105,14 +1128,23 @@ def search():
         parameters.extend(park_params)
     if not where:
         return jsonify({"error": "至少提供一个查询条件", "items": []}), 400
-    parameters.append(limit)
     with closing(get_db()) as db:
-        rows = db.execute(
-            f"""SELECT {CAPTURE_FIELDS} FROM captures
-                WHERE {' AND '.join(where)}
-                ORDER BY date DESC, capture_time DESC, id DESC LIMIT ?""",
-            parameters,
-        ).fetchall()
+        if plate:
+            rows = db.execute(
+                f"""SELECT {CAPTURE_FIELDS} FROM captures
+                    WHERE {' AND '.join(where)}
+                    ORDER BY date DESC, capture_time DESC, id DESC""",
+                parameters,
+            ).fetchall()
+            rows = [r for r in rows if _row_matches_plate(r, plate)][:limit]
+        else:
+            parameters.append(limit)
+            rows = db.execute(
+                f"""SELECT {CAPTURE_FIELDS} FROM captures
+                    WHERE {' AND '.join(where)}
+                    ORDER BY date DESC, capture_time DESC, id DESC LIMIT ?""",
+                parameters,
+            ).fetchall()
     return jsonify([dict(row) for row in rows])
 
 
@@ -1291,13 +1323,15 @@ def track():
                 (vehicle_id,),
             ).fetchall()
         elif plate:
-            # 支持车牌片段；同时命中识别结果与摄像头OSD参考值。
+            # 支持无视首字省份 + 形近字符 + 少/多 1 位容错 + 片段查询；
+            # 同时命中 plate_final、图像车牌 lpr_plate 与摄像头 OSD 参考值。
             # 同牌车可能出现在多个园区（身份独立），可选 park 参数只看一个园区。
             where = [QUARANTINE_EXCLUDE,
                      "coalesce(capture_status,'vehicle')!='no_vehicle'",
-                     "(replace(upper(plate_final),' ','') LIKE ? "
-                     "OR replace(upper(osd_plate),' ','') LIKE ?)"]
-            parameters: list[object] = [f"%{plate}%", f"%{plate}%"]
+                     "(coalesce(plate_final,'')!='' "
+                     "OR coalesce(lpr_plate,'')!='' "
+                     "OR coalesce(osd_plate,'')!='')"]
+            parameters: list[object] = []
             if date:
                 where.append("date=?")
                 parameters.append(date)
@@ -1309,6 +1343,7 @@ def track():
                 f"SELECT {CAPTURE_FIELDS} FROM captures WHERE {' AND '.join(where)} "
                 f"{TRACK_ORDER}", parameters
             ).fetchall()
+            rows = [r for r in rows if _row_matches_plate(r, plate)]
         else:
             return jsonify([])
         items = annotate_order_plates([dict(row) for row in rows], db)
@@ -1381,7 +1416,10 @@ def track_by_img():
                          and query["vehicle_type"] != row["vehicle_type"])
         if type_conflict:
             continue
-        same_plate = query["plate_final"] and row["plate_final"] == query["plate_final"]
+        same_plate = bool(
+            query["plate_final"] and row["plate_final"]
+            and build_db._plate_edit_distance(query["plate_final"], row["plate_final"]) <= 1.0
+        )
         same_color = (query["vehicle_color"] and row["vehicle_color"]
                       and query["vehicle_color"] == row["vehicle_color"])
         threshold = 0.84 if same_plate else 0.90
@@ -1497,8 +1535,17 @@ def boxedit_context(capture_id: int):
                 (capture_id,)).fetchall():
             item = dict(inst)
             item["box"] = json.loads(item.pop("vehicle_box")) if item["vehicle_box"] else None
-            item["crop_url"] = (f"/api/crop/{capture_id}" if item["instance_index"] == 0
-                                else f"/api/instance_crop/{item['id']}")
+            if item["instance_index"] == 0:
+                # 兜底防脱节：主车条目始终与 captures 实时框/属性对齐，避免主卡与框选列表矛盾
+                if capture["box"] and item["box"] != capture["box"]:
+                    item["box"] = capture["box"]
+                    item["vehicle_det_score"] = capture.get("vehicle_det_score")
+                    item["vehicle_color"] = capture.get("vehicle_color")
+                    item["vehicle_type"] = capture.get("vehicle_type")
+                    item["lpr_plate"] = capture.get("plate_final") or item.get("lpr_plate")
+                item["crop_url"] = f"/api/crop/{capture_id}"
+            else:
+                item["crop_url"] = f"/api/instance_crop/{item['id']}"
             instances.append(item)
     source = resolve_capture_path(capture.pop("filepath"))
     if not source.is_file():
@@ -1642,14 +1689,25 @@ def boxedit_promote():
             (capture_id,)).fetchone()
         if not main:
             return jsonify({"error": "主车实例记录缺失，请先重跑检测阶段"}), 422
-        # 新主车像素来源：实例裁剪文件优先；缺失则按实例框从原图重裁。
+        # 安全对调主车与实例裁剪图（避免先覆盖 crop_path 导致旧主车缩略图永久丢失、两行显示同一张图）。
         crop_rel = row["vehicle_crop_path"] or _default_crop_relpath(capture_id)
         crop_path = resolve_capture_path(crop_rel)
         crop_path.parent.mkdir(parents=True, exist_ok=True)
         inst_box = json.loads(inst["vehicle_box"]) if inst["vehicle_box"] else None
-        inst_file = resolve_capture_path(inst["crop_path"]) if inst["crop_path"] else None
+        inst_rel = inst["crop_path"]
+        inst_file = resolve_capture_path(inst_rel) if inst_rel else None
         if inst_file and inst_file.is_file():
-            shutil.copyfile(inst_file, crop_path)
+            if crop_path.is_file() and crop_path.resolve() != inst_file.resolve():
+                tmp_swap = crop_path.with_suffix(".swap.tmp")
+                shutil.copyfile(crop_path, tmp_swap)
+                shutil.copyfile(inst_file, crop_path)
+                shutil.copyfile(tmp_swap, inst_file)
+                try:
+                    tmp_swap.unlink()
+                except OSError:
+                    pass
+            else:
+                shutil.copyfile(inst_file, crop_path)
         elif inst_box:
             source = resolve_capture_path(row["filepath"])
             if not source.is_file():
@@ -1659,13 +1717,15 @@ def boxedit_promote():
                     image = ImageOps.exif_transpose(opened).convert("RGB")
             except (OSError, ValueError):
                 return jsonify({"error": "原图无法读取"}), 422
+            if inst_file and crop_path.is_file() and crop_path.resolve() != inst_file.resolve():
+                inst_file.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(crop_path, inst_file)
             image.crop(tuple(_clamp_box(inst_box, *image.size))).save(
                 crop_path, "JPEG", quality=94, optimize=True)
         else:
             return jsonify({"error": "实例裁剪文件缺失且无可用框，无法切换"}), 422
-        # 行内容对调 + 车辆归属清空（下方 associate_orders 会重新归组）。
-        # 框串统一归一化为 json.dumps 格式，与 detect_pass 写入格式一致。
-        cols = ("crop_path", "vehicle_box", "vehicle_det_score", "vehicle_color",
+        # 行内容对调（crop_path 固定随槽位：main 用 crop_rel，inst 用 inst_rel，磁盘文件已对调）。
+        cols = ("vehicle_box", "vehicle_det_score", "vehicle_color",
                 "vehicle_color_conf", "vehicle_type", "vehicle_type_conf",
                 "attr_model_version", "lpr_plate", "lpr_conf", "lpr_attempted_at",
                 "reid_embedding", "reid_source", "reid_model_version")
@@ -1680,25 +1740,30 @@ def boxedit_promote():
             return vals
 
         set_sql = ", ".join(f"{name}=?" for name in cols)
-        db.execute(f"UPDATE vehicle_instances SET {set_sql} WHERE id=?",
-                   norm_row(inst) + [main["id"]])
-        db.execute(f"UPDATE vehicle_instances SET {set_sql}, vehicle_id=NULL WHERE id=?",
-                   norm_row(main) + [inst["id"]])
+        db.execute(f"UPDATE vehicle_instances SET crop_path=?, {set_sql} WHERE id=?",
+                   [crop_rel, *norm_row(inst), main["id"]])
+        db.execute(f"UPDATE vehicle_instances SET crop_path=?, {set_sql}, vehicle_id=NULL WHERE id=?",
+                   [inst_rel or main["crop_path"], *norm_row(main), inst["id"]])
         now = datetime.now().isoformat(timespec="seconds")
         box_json = json.dumps(inst_box) if inst_box else (inst["vehicle_box"] or "[]")
+        inst_plate = inst["lpr_plate"] or ""
+        inst_lpr_conf = inst["lpr_conf"]
         db.execute(
             """UPDATE captures SET vehicle_crop_path=?, vehicle_box=?, crop_source='人工切换',
                       vehicle_det_score=?, vehicle_color=?, vehicle_color_conf=?,
                       vehicle_type=?, vehicle_type_conf=?, attr_model_version=?,
-                      lpr_plate=?, lpr_conf=?, lpr_attempted_at=NULL,
-                      plate_final=NULL, plate_confidence=NULL, recognition_source='',
+                      lpr_plate=?, lpr_conf=?, lpr_attempted_at=?,
+                      plate_final=?, plate_confidence=?,
+                      recognition_source=?,
                       reid_embedding=?, reid_source=?, reid_model_version=?,
                       vehicle_id=NULL, status_reason='人工切换主车', processed_at=?
                WHERE id=?""",
             [crop_rel, box_json, inst["vehicle_det_score"],
              inst["vehicle_color"], inst["vehicle_color_conf"],
              inst["vehicle_type"], inst["vehicle_type_conf"], inst["attr_model_version"],
-             inst["lpr_plate"], inst["lpr_conf"],
+             inst["lpr_plate"], inst_lpr_conf, inst["lpr_attempted_at"],
+             (inst_plate or None), (inst_lpr_conf if inst_plate else None),
+             ("车牌模型" if inst_plate else ""),
              inst["reid_embedding"], inst["reid_source"], inst["reid_model_version"],
              now, capture_id])
         db.execute(
@@ -3257,9 +3322,9 @@ def open_captures():
         parameters.extend(park_params)
     plate = normalize_plate(request.args.get("plate", ""))
     if plate:
-        where.append("(replace(upper(plate_final),' ','') LIKE ? "
-                     "OR replace(upper(osd_plate),' ','') LIKE ?)")
-        parameters.extend([f"%{plate}%", f"%{plate}%"])
+        where.append("(coalesce(plate_final,'')!='' "
+                     "OR coalesce(lpr_plate,'')!='' "
+                     "OR coalesce(osd_plate,'')!='')")
     vehicle_type = request.args.get("vehicle_type", "").strip()
     if vehicle_type:
         where.append("vehicle_type=?")
@@ -3275,14 +3340,24 @@ def open_captures():
     where_sql = " AND ".join(where) if where else "1=1"
     page, page_size, offset = open_pagination()
     with closing(get_db()) as db:
-        total = db.execute(
-            f"SELECT COUNT(*) FROM captures WHERE {where_sql}", parameters
-        ).fetchone()[0]
-        rows = db.execute(
-            f"""SELECT {CAPTURE_FIELDS} FROM captures WHERE {where_sql}
-                ORDER BY date, capture_time, id LIMIT ? OFFSET ?""",
-            [*parameters, page_size, offset],
-        ).fetchall()
+        if plate:
+            all_rows = db.execute(
+                f"""SELECT {CAPTURE_FIELDS} FROM captures WHERE {where_sql}
+                    ORDER BY date, capture_time, id""",
+                parameters,
+            ).fetchall()
+            matched = [r for r in all_rows if _row_matches_plate(r, plate)]
+            total = len(matched)
+            rows = matched[offset:offset + page_size]
+        else:
+            total = db.execute(
+                f"SELECT COUNT(*) FROM captures WHERE {where_sql}", parameters
+            ).fetchone()[0]
+            rows = db.execute(
+                f"""SELECT {CAPTURE_FIELDS} FROM captures WHERE {where_sql}
+                    ORDER BY date, capture_time, id LIMIT ? OFFSET ?""",
+                [*parameters, page_size, offset],
+            ).fetchall()
     return _open_ok({"total": total, "page": page, "page_size": page_size,
                      "items": [dict(row) for row in rows]})
 

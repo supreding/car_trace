@@ -747,7 +747,8 @@
     function parkQ2() {const q = parkQ(); return q ? "?" + q.slice(1) : "";}
 
     function imgTag(x, w) { // 优先车辆裁剪，缺失回退原图
-      const src = x.vehicle_crop_path ? `/api/crop/${x.id}` : `/api/thumb/${x.id}`;
+      const ver = state.cropVer ? `?v=${state.cropVer}` : "";
+      const src = x.vehicle_crop_path ? `/api/crop/${x.id}${ver}` : `/api/thumb/${x.id}`;
       return `<img src="${src}" loading="lazy" onerror="this.onerror=null;this.src='/api/thumb/${x.id}'" onclick="showModal('/api/image/${x.id}')" alt="">`;
     }
 
@@ -998,7 +999,7 @@
       const cards = data.instances.map(v => {
         const main = v.instance_index === 0;
         return `<div class="bx-card${main ? " cur" : ""}" id="bxcard-${id}-${v.id}" onclick="bxSelect(${id},${v.id})">
-          <img src="${v.crop_url}" loading="lazy" onerror="this.style.visibility='hidden'" alt="">
+          <img src="${v.crop_url}${state.cropVer ? '?v=' + state.cropVer : ''}" loading="lazy" onerror="this.style.visibility='hidden'" alt="">
           <div class="info"><div class="t">${main ? "当前主车" : "同帧车辆"} · 置信度 ${Math.round((v.vehicle_det_score || 0) * 100)}%</div>
           <div class="s">${v.lpr_plate ? "车牌 " + esc(v.lpr_plate) + "<br>" : ""}${esc(COLOR_CN[v.vehicle_color] || v.vehicle_color || "色未知")} ${esc(TYPE_CN[v.vehicle_type] || v.vehicle_type || "")}</div></div>
           ${main ? "" : `<button class="rowbtn accent" onclick="event.stopPropagation();bxPromote(${id},${v.id})">设为主车</button>`}
@@ -1122,6 +1123,7 @@
         const res = await api("/api/boxedit/save", {
           method: "POST", headers: {"Content-Type": "application/json"},
           body: JSON.stringify({capture_id: id, box: s.draft})});
+        state.cropVer = Date.now();
         toast(res.message);
         bxClose(id);
         if (state.reload) await state.reload();
@@ -1134,6 +1136,7 @@
         const res = await api("/api/boxedit/promote", {
           method: "POST", headers: {"Content-Type": "application/json"},
           body: JSON.stringify({capture_id: id, instance_id: instId})});
+        state.cropVer = Date.now();
         toast(res.message);
         bxClose(id);
         if (state.tab === "vehicle" && res.vehicle_id) {

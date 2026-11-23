@@ -106,23 +106,75 @@ class PaddleVehicleCropper:
         return sorted(found, key=lambda item: item["score"], reverse=True)
 
     @staticmethod
-    def choose_main(detections: list[dict[str, Any]], width: int, height: int) -> dict[str, Any]:
-        """主体车辆选择：置信度 × 面积 × 中心度 加权。
+    def score_candidate(
+        det: dict[str, Any],
+        width: int,
+        height: int,
+        vtype: str = "",
+        stage: str = "",
+        has_large: bool = True,
+    ) -> float:
+        """单个检测框的主车几何+属性综合得分（越高越像前景主车）。
 
-        过磅场景主体车辆位于画面中心且占比较大。单纯取最高分会选到画面
-        边缘的部分/无关车辆（实测置信度 0.8 以下时尤甚），加入面积与
-        中心距离两项后，边缘小框几乎不可能胜出。
+        设计要点：
+        - 置信度温和饱和（<=0.85 开方）：避免车尾/大角度货车（0.50~0.65）
+          被远景停放小轿车（0.95）拉开近 2 倍差距；
+        - 面积权重 0.45（原 0.25 偏平）：前景大货车相对背景小车优势更明确；
+        - 中心锚点设在画幅中下偏中 (0.50, 0.55) 贴合地磅/车道位置；
+        - 贴左右边缘的小框（面积 <8% 且触边 2%）降权，过滤场边停放车；
+        - 过磅场景（入磅/出磅/质检）中，货车优先于小轿车/SUV（全帧仅有
+          小轿车时相对顺序不变）。
         """
         import math
 
+        x1, y1, x2, y2 = det["box"]
+        bx, by = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        area = max(0.0, (x2 - x1) * (y2 - y1)) / float(max(1, width * height))
+        score_term = min(max(float(det.get("score", 0.0)), 0.1), 0.85) ** 0.5
+        area_term = max(area, 1e-4) ** 0.45
+        dist = math.hypot((bx - width * 0.50) / max(1, width),
+                          (by - height * 0.55) / max(1, height))
+        center_term = (1.0 - min(dist, 0.75)) ** 1.25
+        edge_penalty = (
+            0.72 if (area < 0.08 and (x1 < width * 0.02 or x2 > width * 0.98))
+            else 1.0
+        )
+        tiny_penalty = 0.50 if (has_large and area < 0.02) else 1.0
+        type_mult = 1.0
+        vt = (vtype or "").lower()
+        if vt:
+            if stage in ("入磅", "出磅", "质检"):
+                if vt == "truck":
+                    type_mult = 1.35
+                elif vt in ("sedan", "suv", "hatchback", "mpv", "estate"):
+                    type_mult = 0.85
+            elif vt == "truck" and area >= 0.04:
+                type_mult = 1.15
+        return score_term * area_term * center_term * edge_penalty * tiny_penalty * type_mult
+
+    @classmethod
+    def choose_main(
+        cls,
+        detections: list[dict[str, Any]],
+        width: int,
+        height: int,
+        attrs: list[dict[str, Any] | None] | None = None,
+        stage: str = "",
+    ) -> dict[str, Any]:
+        """主体车辆选择：饱和置信度 × 面积^0.45 × 中心度 × 贴边过滤 × 过磅货车先验。"""
+        has_large = any(
+            max(0.0, (d["box"][2] - d["box"][0]) * (d["box"][3] - d["box"][1]))
+            >= width * height * 0.02
+            for d in detections
+        )
         best, best_score = detections[0], -1.0
-        cx, cy = width / 2.0, height / 2.0
-        for det in detections:
-            x1, y1, x2, y2 = det["box"]
-            bx, by = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-            dist = math.hypot((bx - cx) / width, (by - cy) / height)
-            area = max(0.0, (x2 - x1) * (y2 - y1)) / float(width * height)
-            s = det["score"] * (1.0 - min(dist, 0.7)) * (area ** 0.25)
+        for idx, det in enumerate(detections):
+            vtype = ""
+            if attrs and idx < len(attrs) and attrs[idx]:
+                vtype = str(attrs[idx].get("type") or "")
+            s = cls.score_candidate(
+                det, width, height, vtype=vtype, stage=stage, has_large=has_large
+            )
             if s > best_score:
                 best, best_score = det, s
         return best
@@ -362,7 +414,7 @@ def detect_pass(
         # 已有裁剪图的帧是早期版本的检测产物，不可能再产生实例记录；
         # 不排除会永久挂起在待处理队列里（每轮 GPU 都被重选又跳过）。
         where += " AND vehicle_crop_path IS NULL"
-    sql = (f"SELECT id, filepath FROM captures WHERE {where} "
+    sql = (f"SELECT id, filepath, coalesce(stage,'') AS stage FROM captures WHERE {where} "
            "ORDER BY date, order_id, stage_rank, filename")
     params: tuple[Any, ...] = (build_db.QUARANTINE_PARK_LIKE,)
     if limit:
@@ -407,17 +459,41 @@ def detect_pass(
                 )
                 no_vehicle += 1
                 continue
-            chosen = detector.choose_main(detections, image.size[0], image.size[1])
             width, height = image.size
-            crop, box = detector.crop(image, chosen)
+            stage = str(row["stage"] or "")
+            # 若存在多个候选框且启用属性模型：先对前 6 个有效框跑属性（后续建档直接复用，
+            # 零额外推理开销），让 choose_main 在过磅场景优先选中前景货车而非场边小轿车。
+            cand_cache: dict[int, tuple[Image.Image, list[int], dict[str, Any] | None]] = {}
+            cand_attrs: list[dict[str, Any] | None] = [None] * len(detections)
+            if attr is not None and len(detections) > 1:
+                eval_count = 0
+                for idx, det in enumerate(detections):
+                    x1, y1, x2, y2 = det["box"]
+                    if eval_count >= 6:
+                        break
+                    if idx > 0 and (det["score"] < 0.35 or (x2 - x1) * (y2 - y1) < width * height * 0.015):
+                        continue
+                    c_img, c_box = detector.crop(image, det)
+                    c_attr = attr.predict(c_img)
+                    cand_cache[idx] = (c_img, c_box, c_attr)
+                    cand_attrs[idx] = c_attr
+                    eval_count += 1
+            chosen = detector.choose_main(
+                detections, width, height, attrs=cand_attrs if cand_cache else None, stage=stage
+            )
+            chosen_idx = detections.index(chosen)
+            if chosen_idx in cand_cache:
+                crop, box, cached_attr = cand_cache[chosen_idx]
+            else:
+                crop, box = detector.crop(image, chosen)
+                cached_attr = attr.predict(crop) if attr is not None else None
             crop_path = output_dir / f"{capture_id:08d}.jpg"
             crop.save(crop_path, "JPEG", quality=94, optimize=True)
             attr_values: list[Any] = [None, None, None, None, None]
-            if attr is not None:
-                attr_result = attr.predict(crop)
+            if cached_attr is not None and attr is not None:
                 attr_values = [
-                    attr_result["color"] or None, attr_result["color_conf"],
-                    attr_result["type"] or None, attr_result["type_conf"],
+                    cached_attr["color"] or None, cached_attr["color_conf"],
+                    cached_attr["type"] or None, cached_attr["type_conf"],
                     attr.model_version,
                 ]
             # 记录相对于数据库目录的路径，便于把 app 目录整体复制到甲方环境。
@@ -443,7 +519,6 @@ def detect_pass(
             # ---- 每车一条记录：同帧其余检测目标各自建档（无关车辆由此分开）。
             # 主体车辆为 instance_index=0，其余按分数取至多 5 个
             # （分数 >=0.5 且面积 >=2%，过滤边缘碎片框）。
-            main_box = chosen["box"]
             instance_index = 0
             db.execute(
                 """INSERT INTO vehicle_instances
@@ -454,7 +529,7 @@ def detect_pass(
                 (capture_id, stored_crop_path, json.dumps(box), float(chosen["score"]),
                  *attr_values),
             )
-            for det in detections:
+            for idx, det in enumerate(detections):
                 if det is chosen:
                     continue
                 if det["score"] < 0.5:
@@ -465,18 +540,21 @@ def detect_pass(
                 if instance_index >= 5:
                     break
                 instance_index += 1
-                inst_crop, inst_box = detector.crop(image, det)
+                if idx in cand_cache:
+                    inst_crop, inst_box, inst_cached = cand_cache[idx]
+                else:
+                    inst_crop, inst_box = detector.crop(image, det)
+                    inst_cached = attr.predict(inst_crop) if attr is not None else None
                 inst_path = output_dir / f"{capture_id}_{instance_index:02d}.jpg"
                 inst_crop.save(inst_path, "JPEG", quality=94, optimize=True)
                 inst_stored = Path(
                     os.path.relpath(inst_path.resolve(), Path(db_path).resolve().parent)
                 ).as_posix()
                 inst_attr: list[Any] = [None, None, None, None, None]
-                if attr is not None:
-                    inst_result = attr.predict(inst_crop)
+                if inst_cached is not None and attr is not None:
                     inst_attr = [
-                        inst_result["color"] or None, inst_result["color_conf"],
-                        inst_result["type"] or None, inst_result["type_conf"],
+                        inst_cached["color"] or None, inst_cached["color_conf"],
+                        inst_cached["type"] or None, inst_cached["type_conf"],
                         attr.model_version,
                     ]
                 db.execute(
@@ -607,14 +685,39 @@ class PlateLPR:
         if not hasattr(np, "int"):
             np.int = int
 
+    @staticmethod
+    def _trim_osd_footer(bgr: "np.ndarray") -> "np.ndarray":
+        """若车辆裁剪图底部带入了 NVR 纯黑 OSD 叠字条（如 00002721.jpg），先裁掉
+        底条再做车牌检测，避免底条白字抢占检测框或被误识别成车牌。"""
+        import cv2
+
+        h = bgr.shape[0]
+        if h < 120:
+            return bgr
+        y_start = int(h * 0.72)
+        gray = cv2.cvtColor(bgr[y_start:, :], cv2.COLOR_BGR2GRAY)
+        black_frac = (gray < 20).mean(axis=1)
+        y_rel = gray.shape[0]
+        for r in range(gray.shape[0] - 1, -1, -1):
+            if black_frac[r] >= 0.45:
+                y_rel = r
+            else:
+                break
+        y_abs = y_start + y_rel
+        # 底条高度 >=25px 且裁剪后剩余车身仍 >=60% 高度时裁掉
+        if h - y_abs >= 25 and y_abs >= int(h * 0.60):
+            return bgr[:y_abs, :]
+        return bgr
+
     def recognize(self, bgr: "np.ndarray") -> dict[str, Any]:
         """识别一张车辆裁剪图中的车牌，返回最佳候选。"""
-        boxes_batch, _ = self.detector.predict_image([bgr])
+        clean_bgr = self._trim_osd_footer(bgr)
+        boxes_batch, _ = self.detector.predict_image([clean_bgr])
         boxes = boxes_batch[0] if boxes_batch else []
         candidates: list[tuple[str, float]] = []
         for box in boxes:
             try:
-                crop = self._get_rotate_crop_image(bgr, box)
+                crop = self._get_rotate_crop_image(clean_bgr, box)
                 rec_res, _ = self.recognizer.predict_text([crop])
                 for text, conf in rec_res:
                     text, conf = str(text), float(conf)
@@ -624,8 +727,17 @@ class PlateLPR:
                 continue
         if not candidates:
             return {"plate": "", "conf": 0.0, "n_boxes": len(boxes)}
-        # 优先 7 位标准车牌长度，其次置信度。
-        candidates.sort(key=lambda t: (len(t[0]) >= 7, t[1]), reverse=True)
+        # 优先完整合法车牌 -> 其次缺省份/少1位部分车牌 -> 其次长度与置信度，
+        # 避免非车牌文字（厂标/残留叠字）抢占候选后在 normalize_plate 被清空。
+        candidates.sort(
+            key=lambda t: (
+                bool(build_db.normalize_plate(t[0], allow_partial=False)),
+                bool(build_db.normalize_plate(t[0], allow_partial=True)),
+                len(t[0]) >= 7,
+                t[1],
+            ),
+            reverse=True,
+        )
         text, conf = candidates[0]
         return {"plate": text, "conf": round(conf, 4), "n_boxes": len(boxes)}
 
@@ -686,23 +798,41 @@ def plate_pass(
                 skipped += 1
                 continue
             result = lpr.recognize(bgr)
-            lpr_plate = build_db.normalize_plate(result["plate"])
+            raw_plate = result["plate"]
             lpr_conf = result["conf"]
-            # 质量闸：小图远距离车牌容易出碎片（如“皖25”）或低置信度噪声，
-            # 归一化后不足 5 位或置信度过低的不作为模型结果。
-            if len(lpr_plate) < 5 or lpr_conf < 0.55:
+            lpr_plate = build_db.normalize_plate(raw_plate, allow_partial=False)
+            # 完整标准车牌置信度 >=0.55 即采用；首字省份缺失或少 1 位的模糊读数
+            # 在较高置信度 (>=0.70) 下保留，交由无视首字+形近+缺位规则参与匹配。
+            if lpr_plate:
+                if len(lpr_plate) < 5 or lpr_conf < 0.55:
+                    lpr_plate, lpr_conf = "", 0.0
+            elif lpr_conf >= 0.70:
+                lpr_plate = build_db.normalize_plate(raw_plate, allow_partial=True)
+                if len(build_db._plate_body(lpr_plate)) < 5:
+                    lpr_plate, lpr_conf = "", 0.0
+            else:
                 lpr_plate, lpr_conf = "", 0.0
             osd_plate = str(row["osd"] or "")
             if lpr_plate:
-                if osd_plate and osd_plate == lpr_plate:
+                lpr_is_full = bool(build_db.normalize_plate(lpr_plate, allow_partial=False))
+                osd_is_full = bool(build_db.normalize_plate(osd_plate, allow_partial=False))
+                if osd_plate and build_db._plate_edit_distance(osd_plate, lpr_plate) <= 1.0:
                     source = "OSD+车牌模型一致"
                     lpr_conf = min(0.99, lpr_conf + 0.05)
+                    # 模型读数缺省份/少1位而 OSD 读数完整且一致时，展示完整版
+                    plate_final = osd_plate if (not lpr_is_full and osd_is_full) else lpr_plate
+                elif osd_plate and (lpr_conf < 0.80 or (not lpr_is_full and osd_is_full)):
+                    # 图像识别置信度偏低、或仅为残缺5位读数（易为车身贴字/型号）且与完整 OSD 冲突：
+                    # 不强覆盖，保留 lpr_plate 原值同时回退 OSD 参考
+                    source = "OSD文字"
+                    plate_final = osd_plate
                 else:
                     source = "车牌模型"
-                plate_final = lpr_plate
+                    plate_final = lpr_plate
             else:
                 plate_final = osd_plate
                 source = "OSD文字" if osd_plate else ""
+            now_ts = datetime.now().isoformat(timespec="seconds")
             db.execute(
                 """UPDATE captures SET lpr_plate=?, lpr_conf=?,
                           plate_final=?, plate_confidence=?,
@@ -712,8 +842,15 @@ def plate_pass(
                    WHERE id=?""",
                 (lpr_plate or None, lpr_conf, plate_final,
                  lpr_conf if lpr_plate else None,
-                 datetime.now().isoformat(timespec="seconds"),
+                 now_ts,
                  source, source, capture_id),
+            )
+            # 同步主车实例（instance_index=0）车牌，避免前端框选面板与主卡脱节
+            db.execute(
+                """UPDATE vehicle_instances
+                   SET lpr_plate=?, lpr_conf=?, lpr_attempted_at=?
+                   WHERE capture_id=? AND instance_index=0""",
+                (lpr_plate or None, lpr_conf, now_ts, capture_id),
             )
             processed += 1
             if processed % 200 == 0:
@@ -723,6 +860,237 @@ def plate_pass(
             print(f"[plate] 跳过抓拍 #{capture_id}: {exc}", flush=True)
     db.close()
     return {"selected": len(rows), "processed": processed, "skipped": skipped}
+
+
+def _box_iou(a: list[float], b: list[float]) -> float:
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    if inter <= 0.0:
+        return 0.0
+    area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+    area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+    return inter / max(1e-6, area_a + area_b - inter)
+
+
+def _swap_crop_files(main_path: Path, inst_path: Path) -> None:
+    """安全对调主车与实例的两张裁剪图，避免覆盖丢失原主车缩略图。"""
+    import shutil
+
+    main_path.parent.mkdir(parents=True, exist_ok=True)
+    inst_path.parent.mkdir(parents=True, exist_ok=True)
+    if main_path.resolve() == inst_path.resolve():
+        return
+    if main_path.is_file() and inst_path.is_file():
+        tmp_path = main_path.with_suffix(".swap.tmp")
+        shutil.copyfile(main_path, tmp_path)
+        shutil.copyfile(inst_path, main_path)
+        shutil.copyfile(tmp_path, inst_path)
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+    elif inst_path.is_file():
+        shutil.copyfile(inst_path, main_path)
+
+
+def _promote_instance_in_db(
+    db: sqlite3.Connection,
+    db_path: Path,
+    capture_id: int,
+    inst_id: int,
+    *,
+    reason: str = "",
+) -> bool:
+    """将指定同帧实例提升为主车（instance_index=0），对调两张裁剪图并同步 captures 与 vehicle_instances。"""
+    cap = db.execute(
+        "SELECT id, filepath, vehicle_crop_path, coalesce(osd_plate,'') AS osd FROM captures WHERE id=?",
+        (capture_id,),
+    ).fetchone()
+    main = db.execute(
+        """SELECT id, crop_path, vehicle_box, vehicle_det_score, vehicle_color,
+                  vehicle_color_conf, vehicle_type, vehicle_type_conf,
+                  attr_model_version, lpr_plate, lpr_conf, lpr_attempted_at,
+                  reid_embedding, reid_source, reid_model_version
+           FROM vehicle_instances WHERE capture_id=? AND instance_index=0""",
+        (capture_id,),
+    ).fetchone()
+    inst = db.execute(
+        """SELECT id, instance_index, crop_path, vehicle_box, vehicle_det_score,
+                  vehicle_color, vehicle_color_conf, vehicle_type, vehicle_type_conf,
+                  attr_model_version, lpr_plate, lpr_conf, lpr_attempted_at,
+                  reid_embedding, reid_source, reid_model_version
+           FROM vehicle_instances WHERE id=? AND capture_id=?""",
+        (inst_id, capture_id),
+    ).fetchone()
+    if not cap or not main or not inst or not inst["instance_index"]:
+        return False
+    main_rel = cap["vehicle_crop_path"] or main["crop_path"]
+    inst_rel = inst["crop_path"]
+    if not main_rel or not inst_rel:
+        return False
+    main_path = resolve_crop_path(db_path, main_rel)
+    inst_path = resolve_crop_path(db_path, inst_rel)
+    if not inst_path.is_file():
+        return False
+    _swap_crop_files(main_path, inst_path)
+
+    # 保持各自的 crop_path 文件名不变（0000xxxx.jpg 始终属于主车，xxxx_0k.jpg 属于实例），
+    # 仅对调两行除 crop_path 外的全部车辆字段（因为磁盘文件已对调）。
+    cols = (
+        "vehicle_box", "vehicle_det_score", "vehicle_color", "vehicle_color_conf",
+        "vehicle_type", "vehicle_type_conf", "attr_model_version",
+        "lpr_plate", "lpr_conf", "lpr_attempted_at",
+        "reid_embedding", "reid_source", "reid_model_version",
+    )
+    set_sql = ", ".join(f"{c}=?" for c in cols)
+    db.execute(
+        f"UPDATE vehicle_instances SET crop_path=?, {set_sql} WHERE id=?",
+        [main_rel, *[inst[c] for c in cols], main["id"]],
+    )
+    db.execute(
+        f"UPDATE vehicle_instances SET crop_path=?, {set_sql}, vehicle_id=NULL WHERE id=?",
+        [inst_rel, *[main[c] for c in cols], inst["id"]],
+    )
+    # 同步主记录 captures：融合新主车 lpr_plate 与 osd_plate
+    lpr_plate = inst["lpr_plate"] or ""
+    lpr_conf = float(inst["lpr_conf"] or 0.0)
+    osd_plate = cap["osd"] or ""
+    if lpr_plate:
+        lp_full = bool(build_db.normalize_plate(lpr_plate, allow_partial=False))
+        op_full = bool(build_db.normalize_plate(osd_plate, allow_partial=False))
+        if osd_plate and build_db._plate_edit_distance(osd_plate, lpr_plate) <= 1.0:
+            src = "OSD+车牌模型一致"
+            pf = osd_plate if (not lp_full and op_full) else lpr_plate
+        elif osd_plate and (lpr_conf < 0.80 or (not lp_full and op_full)):
+            src = "OSD文字"
+            pf = osd_plate
+        else:
+            src = "车牌模型"
+            pf = lpr_plate
+    else:
+        pf = osd_plate
+        src = "OSD文字" if osd_plate else ""
+    db.execute(
+        """UPDATE captures SET vehicle_crop_path=?, vehicle_box=?,
+                  vehicle_det_score=?, vehicle_color=?, vehicle_color_conf=?,
+                  vehicle_type=?, vehicle_type_conf=?, attr_model_version=?,
+                  lpr_plate=?, lpr_conf=?, lpr_attempted_at=?,
+                  plate_final=?, plate_confidence=?,
+                  recognition_source=CASE WHEN ?!='' THEN ? ELSE recognition_source END,
+                  reid_embedding=?, reid_source=?, reid_model_version=?,
+                  status_reason=CASE
+                    WHEN status_reason LIKE '%订单主车%' OR status_reason LIKE '%主体车型%'
+                    THEN ? ELSE status_reason END
+           WHERE id=?""",
+        (
+            main_rel, inst["vehicle_box"], inst["vehicle_det_score"],
+            inst["vehicle_color"], inst["vehicle_color_conf"],
+            inst["vehicle_type"], inst["vehicle_type_conf"], inst["attr_model_version"],
+            inst["lpr_plate"], inst["lpr_conf"], inst["lpr_attempted_at"],
+            pf, (lpr_conf if lpr_plate else None), src, src,
+            inst["reid_embedding"], inst["reid_source"], inst["reid_model_version"],
+            reason, capture_id,
+        ),
+    )
+    return True
+
+
+def promote_by_order_plate(db_path: Path) -> dict[str, int]:
+    """订单车牌锚定自动主车切换（在 plate_pass + instance_plate_pass 之后执行）。
+
+    同一帧检测到多辆车时，若当前主车（instance_index=0）未命中订单共识车牌，
+    而同帧某个候选实例（instance_index>0）的高置信车牌与订单共识车牌一致（<=1.0）
+    且车型不与订单主车型冲突，自动将其提升为主车并安全对调裁剪图。
+    """
+    db = sqlite3.connect(db_path, timeout=60)
+    db.isolation_level = None
+    db.row_factory = sqlite3.Row
+
+    order_plates: dict[tuple[str, str], Counter] = defaultdict(Counter)
+    order_types: dict[tuple[str, str], Counter] = defaultdict(Counter)
+    for park, oid, pf, vt in db.execute(
+        """SELECT coalesce(park,'') AS park, order_id, plate_final, vehicle_type
+           FROM captures
+           WHERE coalesce(order_id,'')!='' AND order_id!='未关联图片'
+             AND coalesce(capture_status,'vehicle')!='no_vehicle'
+             AND coalesce(park,'') NOT LIKE ?""",
+        (build_db.QUARANTINE_PARK_LIKE,),
+    ):
+        if pf:
+            order_plates[(park, oid)][pf] += 1
+        if vt:
+            order_types[(park, oid)][vt] += 1
+
+    consensus_plate: dict[tuple[str, str], str] = {}
+    consensus_type: dict[tuple[str, str], str] = {}
+    for key, cnt in order_plates.items():
+        cons, _ = build_db._order_plate_profile(cnt)
+        if cons:
+            consensus_plate[key] = cons
+    for key, cnt in order_types.items():
+        top_t, top_n = cnt.most_common(1)[0]
+        if top_n >= 2:
+            consensus_type[key] = top_t
+
+    candidates = db.execute(
+        """SELECT c.id, coalesce(c.park,'') AS park, c.order_id,
+                  coalesce(c.lpr_plate,'') AS cur_lpr, coalesce(c.plate_final,'') AS cur_pf
+           FROM captures c
+           WHERE coalesce(c.order_id,'')!='' AND c.order_id!='未关联图片'
+             AND coalesce(c.capture_status,'vehicle')!='no_vehicle'
+             AND coalesce(c.park,'') NOT LIKE ?
+             AND c.id NOT IN (SELECT capture_id FROM manual_box_edits)
+             AND EXISTS (SELECT 1 FROM vehicle_instances vi
+                         WHERE vi.capture_id=c.id AND vi.instance_index>0
+                           AND coalesce(vi.lpr_plate,'')!='')
+           ORDER BY c.id""",
+        (build_db.QUARANTINE_PARK_LIKE,),
+    ).fetchall()
+
+    promoted = 0
+    for row in candidates:
+        key = (row["park"], row["order_id"])
+        cons_p = consensus_plate.get(key)
+        if not cons_p:
+            continue
+        cur_p = row["cur_lpr"] or row["cur_pf"]
+        if cur_p and build_db._plate_edit_distance(cur_p, cons_p) <= 1.0:
+            continue  # 当前主车已命中订单车牌，无需切换
+        cons_t = consensus_type.get(key, "")
+        insts = db.execute(
+            """SELECT id, lpr_plate, coalesce(lpr_conf, 0.0) AS lpr_conf,
+                      coalesce(vehicle_type,'') AS vt, coalesce(vehicle_det_score, 0.0) AS det_score
+               FROM vehicle_instances
+               WHERE capture_id=? AND instance_index>0 AND coalesce(lpr_plate,'')!=''
+               ORDER BY instance_index""",
+            (row["id"],),
+        ).fetchall()
+        best_inst = None
+        best_rank = (99.0, 0.0)
+        for inst in insts:
+            if float(inst["lpr_conf"]) < 0.75:
+                continue
+            d = build_db._plate_edit_distance(inst["lpr_plate"], cons_p)
+            if d > 1.0:
+                continue
+            if cons_t and inst["vt"] and inst["vt"] != cons_t:
+                continue
+            rank = (d, -float(inst["lpr_conf"]), -float(inst["det_score"]))
+            if best_inst is None or rank < best_rank:
+                best_inst, best_rank = inst, rank
+        if best_inst is not None:
+            if _promote_instance_in_db(db, db_path, int(row["id"]), int(best_inst["id"]), reason=""):
+                promoted += 1
+                print(
+                    f"[plate-promote] 抓拍 #{row['id']} 订单{row['order_id']} 自动切换主车 -> "
+                    f"实例#{best_inst['id']} ({best_inst['lpr_plate']}, conf={best_inst['lpr_conf']:.2f})",
+                    flush=True,
+                )
+    if promoted:
+        aggregate_order_attributes(db)
+    db.close()
+    return {"checked": len(candidates), "promoted": promoted}
 
 
 def correct_pass(
@@ -793,7 +1161,8 @@ def correct_pass(
         order_group.setdefault((park, oid), vid)
     suspicious = []
     for row in db.execute(
-        """SELECT id, filepath, coalesce(park,'') AS park, order_id, vehicle_crop_path,
+        """SELECT id, filepath, coalesce(park,'') AS park, order_id, coalesce(stage,'') AS stage,
+                  vehicle_crop_path, vehicle_box, vehicle_det_score,
                   vehicle_color, vehicle_type, vehicle_type_conf, vehicle_id, status_reason
            FROM captures
            WHERE vehicle_crop_path IS NOT NULL
@@ -813,11 +1182,13 @@ def correct_pass(
         consensus = consensuses.get(vid) if vid else None
         if not consensus:
             continue
-        color_conflict = (row["vehicle_color"] and consensus["vehicle_color"]
-                          and row["vehicle_color"] != consensus["vehicle_color"])
+        type_conflict = (bool(consensus["vehicle_type"])
+                         and (not row["vehicle_type"] or row["vehicle_type"] != consensus["vehicle_type"]))
         type_suspect = (row["vehicle_type_conf"] is not None
                         and row["vehicle_type_conf"] < 0.7)
-        if color_conflict or type_suspect:
+        color_conflict = (row["vehicle_color"] and consensus["vehicle_color"]
+                          and row["vehicle_color"] != consensus["vehicle_color"])
+        if type_conflict or type_suspect or color_conflict:
             suspicious.append(row)
     rows = suspicious[::] if not limit else suspicious[:limit]
 
@@ -837,68 +1208,134 @@ def correct_pass(
             with Image.open(source) as opened:
                 image = ImageOps.exif_transpose(opened).convert("RGB")
             width, height = image.size
+            stage = str(row["stage"] or "")
+            current_box = json.loads(row["vehicle_box"]) if row["vehicle_box"] else None
+            if not current_box or len(current_box) != 4:
+                skipped += 1
+                continue
+            cur_area = max(0.0, (current_box[2] - current_box[0]) * (current_box[3] - current_box[1])) / float(max(1, width * height))
+            cur_det = {"box": current_box, "score": float(row["vehicle_det_score"] or 0.7)}
+            cur_geom = PaddleVehicleCropper.score_candidate(
+                cur_det, width, height, vtype=str(row["vehicle_type"] or ""), stage=stage
+            )
             detections = detector.detect(image)
-            best, best_score = None, -1.0
+            has_large = any(
+                max(0.0, (d["box"][2] - d["box"][0]) * (d["box"][3] - d["box"][1])) >= width * height * 0.02
+                for d in detections
+            )
+            best, best_score = None, -1e9
             for det in detections[:6]:
                 x1, y1, x2, y2 = det["box"]
-                if (x2 - x1) * (y2 - y1) < width * height * 0.02:
+                area = max(0.0, (x2 - x1) * (y2 - y1)) / float(max(1, width * height))
+                if area < 0.02:
                     continue  # 过小的碎片框不参与
-                crop_c, _ = detector.crop(image, det)
+                crop_c, crop_box = detector.crop(image, det)
                 a = attr.predict(crop_c)
-                match = 0.0
+                geom = PaddleVehicleCropper.score_candidate(
+                    det, width, height, vtype=str(a["type"] or ""), stage=stage, has_large=has_large
+                )
+                # 评分口径：车型一致为主 (+4.0，车型冲突重罚 -4.0)，几何主车度次之 (+3.0*geom)，
+                # 颜色仅作软加分 (+1.0)——绝不允许背景小轿车/SUV 靠颜色盖过地磅大货车。
+                score = geom * 3.0 + a["type_conf"] * 0.25
+                if consensus["vehicle_type"]:
+                    if a["type"] == consensus["vehicle_type"]:
+                        score += 4.0
+                    elif a["type"]:
+                        score -= 4.0
                 if consensus["vehicle_color"] and a["color"] == consensus["vehicle_color"]:
-                    match += 2.0
-                if consensus["vehicle_type"] and a["type"] == consensus["vehicle_type"]:
-                    match += 1.0
-                match += a["type_conf"] * 0.25
-                if match > best_score:
-                    best_score, best = match, (det, a, crop_c)
+                    score += 1.0
+                if score > best_score:
+                    best_score, best = score, (det, a, crop_c, crop_box, area, geom)
             if best is None:
                 skipped += 1
                 continue
-            det, a, crop_c = best
+            det, a, crop_c, crop_box, cand_area, cand_geom = best
             color_match = bool(consensus["vehicle_color"] and a["color"] == consensus["vehicle_color"])
             type_match = bool(consensus["vehicle_type"] and a["type"] == consensus["vehicle_type"])
-            current_box = json.loads(
-                db.execute("SELECT vehicle_box FROM captures WHERE id=?", (capture_id,)).fetchone()[0]
+            box_changed = _box_iou(current_box, crop_box) < 0.70
+            # 拆出与替换均以车型为首要依据（货车货箱/车尾常呈白/灰色，与车头颜色不同）：
+            # 1) 候选必须符合共识车型（共识有车型时，严禁换成异车型框如 SUV 替掉货车）；
+            # 2) 若当前框已符合共识车型且置信度 >=0.70：仅当当前框偏小(<5%)且候选几何明显更优，
+            #    或候选同色同型且尺度/中心度相当时才替换；绝不因颜色噪点丢弃前景大货车。
+            current_type_matches = (
+                bool(row["vehicle_type"])
+                and bool(consensus["vehicle_type"])
+                and consensus["vehicle_type"] == row["vehicle_type"]
             )
-            box_changed = max(abs(x - y) for x, y in zip(current_box, det["box"])) > 15
-            # 拆出判定看车型而非颜色：红色货车从车尾拍，货箱常被读成
-            # white/truck——车型与共识一致（truck）就保留在轨迹里；
-            # 车型不符（如 suv/sedan）且找不到更优候选的，拆出待人工复核。
-            current_type_matches = (row["vehicle_type"] is not None
-                                    and consensus["vehicle_type"] == row["vehicle_type"])
-            if color_match and box_changed:
-                # 更换选框：写新裁剪与属性，重置下游（车牌/特征）等待补算。
+            current_type_strong = current_type_matches and float(row["vehicle_type_conf"] or 0.0) >= 0.70
+            can_replace = False
+            if box_changed and (type_match or (not consensus["vehicle_type"] and color_match)):
+                if not current_type_strong:
+                    can_replace = True
+                elif cur_area < 0.05 and cand_geom >= cur_geom * 1.25:
+                    can_replace = True
+                elif color_match and cand_area >= cur_area * 0.65 and cand_geom >= cur_geom * 0.85:
+                    can_replace = True
+
+            if can_replace:
+                # 更换选框：若候选与同帧某 instance_index>0 高度重合，安全对调文件与记录；
+                # 否则同步写新裁剪并更新 captures + vehicle_instances(instance_index=0)，
+                # 严禁只改 captures 而遗留旧 instance_0 造成缩略图与框选脱节。
                 crop_path = resolve_crop_path(db_path, row["vehicle_crop_path"])
-                crop_c.save(crop_path, "JPEG", quality=94, optimize=True)
+                matched_inst = None
+                for inst_row in db.execute(
+                    """SELECT id, vehicle_box FROM vehicle_instances
+                       WHERE capture_id=? AND instance_index>0""",
+                    (capture_id,),
+                ).fetchall():
+                    try:
+                        ibox = json.loads(inst_row["vehicle_box"])
+                    except (TypeError, ValueError):
+                        continue
+                    if len(ibox) == 4 and _box_iou(ibox, crop_box) >= 0.60:
+                        matched_inst = int(inst_row["id"])
+                        break
                 sib = db.execute(
                     """SELECT vehicle_id FROM captures
                        WHERE coalesce(park,'')=? AND order_id=? AND vehicle_id IS NOT NULL
                        LIMIT 1""",
                     (row["park"], row["order_id"]),
                 ).fetchone()
-                db.execute(
-                    """UPDATE captures SET vehicle_box=?, vehicle_det_score=?,
-                              vehicle_color=?, vehicle_color_conf=?,
-                              vehicle_type=?, vehicle_type_conf=?,
-                              lpr_plate=NULL, lpr_conf=NULL, plate_final=NULL,
-                              plate_confidence=NULL, recognition_source='',
-                              lpr_attempted_at=NULL,
-                              reid_embedding=NULL, reid_source=NULL,
-                              vehicle_id=?,
-                          status_reason=CASE WHEN status_reason LIKE '%订单主车%'
-                                             THEN '' ELSE status_reason END
-                       WHERE id=?""",
-                    (json.dumps(det["box"]), float(det["score"]),
-                     a["color"] or None, a["color_conf"],
-                     a["type"] or None, a["type_conf"],
-                     sib["vehicle_id"] if sib else None, capture_id),
-                )
+                sib_vid = sib["vehicle_id"] if sib else None
+                if matched_inst is not None and _promote_instance_in_db(
+                    db, db_path, capture_id, matched_inst, reason=""
+                ):
+                    db.execute("UPDATE captures SET vehicle_id=? WHERE id=?", (sib_vid, capture_id))
+                else:
+                    crop_c.save(crop_path, "JPEG", quality=94, optimize=True)
+                    box_json = json.dumps(crop_box)
+                    db.execute(
+                        """UPDATE captures SET vehicle_box=?, vehicle_det_score=?,
+                                  vehicle_color=?, vehicle_color_conf=?,
+                                  vehicle_type=?, vehicle_type_conf=?,
+                                  lpr_plate=NULL, lpr_conf=NULL, plate_final=NULL,
+                                  plate_confidence=NULL, recognition_source='',
+                                  lpr_attempted_at=NULL,
+                                  reid_embedding=NULL, reid_source=NULL,
+                                  vehicle_id=?,
+                              status_reason=CASE WHEN status_reason LIKE '%订单主车%'
+                                                      OR status_reason LIKE '%主体车型%'
+                                                 THEN '' ELSE status_reason END
+                           WHERE id=?""",
+                        (box_json, float(det["score"]),
+                         a["color"] or None, a["color_conf"],
+                         a["type"] or None, a["type_conf"],
+                         sib_vid, capture_id),
+                    )
+                    db.execute(
+                        """UPDATE vehicle_instances SET vehicle_box=?, vehicle_det_score=?,
+                                  vehicle_color=?, vehicle_color_conf=?,
+                                  vehicle_type=?, vehicle_type_conf=?,
+                                  lpr_plate=NULL, lpr_conf=NULL, lpr_attempted_at=NULL,
+                                  reid_embedding=NULL, reid_source=NULL
+                           WHERE capture_id=? AND instance_index=0""",
+                        (box_json, float(det["score"]),
+                         a["color"] or None, a["color_conf"],
+                         a["type"] or None, a["type_conf"],
+                         capture_id),
+                    )
                 replaced += 1
-            elif color_match and not box_changed:
-                unchanged += 1  # 当前框已与共识一致，仅车型置信度低，无需换框
-            elif current_type_matches and not (a["type"] and type_match and box_changed):
+            elif current_type_matches:
                 unchanged += 1  # 当前框车型与共识一致（如白色货箱车尾帧），保留
                 # 此前被误拆/误标的帧：恢复订单车辆的归属并清除标记
                 if row["vehicle_id"] is None or (row["status_reason"] or "").find("订单主车") >= 0:
@@ -1143,6 +1580,7 @@ def main() -> None:
         result = plate_pass(args.db, lpr, args.limit, args.force)
         inst_result = instance_plate_pass(args.db, lpr, args.limit)
         result["instances"] = inst_result
+        result["plate_promote"] = promote_by_order_plate(args.db)
     elif args.stage == "correct":
         # 复核用更低阈值（0.2）重检原图，让被 0.35 挡掉的主体车辆有机会出现。
         detector = PaddleVehicleCropper(args.detector_model, args.paddle_device, 0.2)

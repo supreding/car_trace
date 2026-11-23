@@ -153,5 +153,25 @@ if (-not $gpuOk) { $pipelineArgs.PaddleDevice = "CPU"; $pipelineArgs.FastReIDDev
 if ($LASTEXITCODE -ne 0) {
     throw "识别流水线执行失败（退出码 $LASTEXITCODE）"
 }
+
+# ---- 7. 归类收尾（与服务器 daily_pipeline.sh 步骤对齐）----
+# 只跑同步+GPU 不会移动照片：归类依赖特征入库后显式执行，否则新散图永远
+# 停留在「未关联图片」。全部写 loose_assignments / gate_dedup_log 日志，
+# 可 --undo-loose-assign / --undo-dedup 撤销；单步失败只告警不阻断。
+$finishSteps = @(
+    @{ Name = "未关联货车归类"; Args = @("--assign-loose", "--apply") },
+    @{ Name = "大门照片重归类"; Args = @("--assign-gate", "--apply") },
+    @{ Name = "共用大门去重";   Args = @("--dedup-gate", "--apply") },
+    @{ Name = "车辆重聚";       Args = @("--associate-only") }
+)
+foreach ($step in $finishSteps) {
+    $stepArgs = @((Join-Path $appDir "build_db.py"), "--db", $dbPath) + $step.Args
+    if ($Park) { $stepArgs += @("--park", $Park) }
+    & $venvPython @stepArgs
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "$($step.Name)失败（不阻断，可手动重跑 build_db.py $($step.Args -join ' ')）"
+    }
+}
+
 Write-Host ""
-Write-Host "流水线执行完成。查询服务（启动查询服务.bat）会直接看到新数据。"
+Write-Host "流水线执行完成（含归类收尾）。查询服务（启动查询服务.bat）会直接看到新数据。"

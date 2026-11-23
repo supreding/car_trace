@@ -123,20 +123,45 @@ def project_file(path: str | Path) -> Path:
     path = Path(path)
     return path if path.is_absolute() else APP_DIR.parent / path
 
-# 摄像头叠字常把省份/字母认错，车牌只做归一化保存，匹配规则见实施文档 13.1。
+# 摄像头叠字与远距离图像识别常把省份汉字漏认/认错，或少认 1 位字符；
+# 完整标准车牌走 PLATE_RE，缺省份或少 1 位（5~7 位主体且含 >=2 个数字）在
+# allow_partial=True 时保留，供后续无视首字+形近+缺位匹配使用（实施文档 13.1）。
+_PROVINCE_CHARS = "京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼"
 PLATE_RE = re.compile(
-    r"[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼]"
-    r"[A-Z][A-Z0-9挂学警港澳使领]{5,6}"
+    rf"[{_PROVINCE_CHARS}][A-Z][A-Z0-9挂学警港澳使领]{{5,6}}"
 )
+_PLATE_PARTIAL_PROV_RE = re.compile(
+    rf"[{_PROVINCE_CHARS}][A-Z0-9][A-Z0-9挂学警港澳使领]{{4,6}}"
+)
+_PLATE_PARTIAL_NOPROV_RE = re.compile(
+    r"(?<![A-Z0-9])[A-Z][A-Z0-9挂学警港澳使领]{4,6}(?![A-Z0-9])"
+)
+# 常见非车牌设备编号/车型型号前缀（避免 allow_partial 误把 DMC01 / CA4250 当车牌）
+_NON_PLATE_NOISE_RE = re.compile(r"^(?:DMC|DMR|CAM|J6P|CA\d{4}|FAW)")
 
 
-def normalize_plate(value: str | None) -> str:
+def normalize_plate(value: str | None, allow_partial: bool = False) -> str:
     if not value:
         return ""
     value = value.upper().replace(" ", "").replace("·", "").replace("-", "")
     value = re.sub(r"[^\u4e00-\u9fffA-Z0-9挂学警港澳使领]", "", value)
     match = PLATE_RE.search(value)
-    return match.group(0) if match else ""
+    if match:
+        return match.group(0)
+    if not allow_partial:
+        return ""
+    for regex in (_PLATE_PARTIAL_PROV_RE, _PLATE_PARTIAL_NOPROV_RE):
+        for m in regex.finditer(value):
+            cand = m.group(0)
+            body = cand[1:] if ("\u4e00" <= cand[0] <= "\u9fff") else cand
+            if len(body) < 5 or len(body) > 7:
+                continue
+            if sum(ch.isdigit() for ch in body) < 2:
+                continue
+            if _NON_PLATE_NOISE_RE.match(body):
+                continue
+            return cand
+    return ""
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
@@ -602,17 +627,20 @@ _ocr_large = None
 
 
 def get_ocr(large: bool = False):
-    """RapidOCR 实例；large=True 使用更大检测边长，用于时间戳重试通道。
+    """RapidOCR 实例；large=True 使用更大检测边长（1280）且关闭 180° 方向分类，
+    用于时间戳重试通道与抓拍底部纯黑 OSD 条带（NVR 叠字永远正立，开 cls 反会
+    把超宽横条误翻 180° 导致整行乱码）。
 
     intra_op_num_threads 必须压到 2：默认 -1 会让进程池里每个 worker 的
     每个会话都开满全部核心，互相踩踏导致吞吐不升反降。
     """
     global _ocr, _ocr_large
-    if large and _ocr_large is None:
-        from rapidocr_onnxruntime import RapidOCR
+    if large:
+        if _ocr_large is None:
+            from rapidocr_onnxruntime import RapidOCR
 
-        _ocr_large = RapidOCR(det_limit_side_len=1280, det_limit_type="max",
-                              intra_op_num_threads=2)
+            _ocr_large = RapidOCR(det_limit_side_len=1280, det_limit_type="max",
+                                  use_cls=False, intra_op_num_threads=2)
         return _ocr_large
     if _ocr is None:
         try:
@@ -625,6 +653,79 @@ def get_ocr(large: bool = False):
         _ocr = RapidOCR(det_limit_side_len=736, det_limit_type="max",
                         intra_op_num_threads=2)
     return _ocr
+
+
+def _find_black_footer_y(bgr: np.ndarray) -> int:
+    """定位抓拍图底部纯黑 OSD 信息条的上边界像素行；不存在返回 -1。
+
+    1920x1264 等抓拍图由 1920x1080 画面 + 底部 ~184px 纯黑叠字条拼接而成。
+    旧逻辑从 y=0.72 裁剪会把上方 170px 明亮车头/路面一并送入检测器，导致
+    DBNet 在 35% 以上的图片里直接漏检中间一行（车牌号码+车身颜色）。
+    精确切出纯黑条带可彻底消除画面纹理干扰。
+    """
+    import cv2
+
+    height = bgr.shape[0]
+    y_start = int(height * 0.70)
+    gray = cv2.cvtColor(bgr[y_start:, :], cv2.COLOR_BGR2GRAY)
+    black_frac = (gray < 20).mean(axis=1)
+    y_rel = gray.shape[0]
+    for row_idx in range(gray.shape[0] - 1, -1, -1):
+        if black_frac[row_idx] >= 0.45:
+            y_rel = row_idx
+        else:
+            break
+    y_abs = y_start + y_rel
+    return y_abs if (height - y_abs) >= 60 else -1
+
+
+def _ocr_osd_footer(bgr: np.ndarray) -> tuple[str, list[float]]:
+    """精准识别抓拍图底部纯黑 OSD 条带（车牌/时间/颜色/车型/设备名）。
+
+    1) 仅截取纯黑条带并四周补 20px 黑边，避免文字贴边被裁切；
+    2) 关闭 cls（use_cls=False），避免超宽条带被误翻 180°；
+    3) 若整条一次识别漏掉第 2 行（"车牌"未命中），对 x=18%..100% 区域补扫
+       一次——车牌号码与车身颜色固定位于该区段，横纵比缩窄后召回率接近 100%。
+    """
+    import cv2
+
+    y0 = _find_black_footer_y(bgr)
+    if y0 < 0:
+        return "", []
+    footer = bgr[y0:, :]
+    fw = footer.shape[1]
+    scale = 0.5 if fw >= 1400 else 1.0
+    ocr = get_ocr(large=True)
+
+    def _run_strip(strip: np.ndarray, strip_scale: float) -> tuple[str, list[float]]:
+        if strip_scale != 1.0:
+            strip = cv2.resize(strip, None, fx=strip_scale, fy=strip_scale,
+                               interpolation=cv2.INTER_AREA)
+        padded = cv2.copyMakeBorder(
+            strip, 12, 12, 12, 12, cv2.BORDER_CONSTANT, value=(0, 0, 0))
+        res, _ = ocr(padded)
+        if not res:
+            return "", []
+        row_h = max(15, int(35 * strip_scale))
+        res.sort(key=lambda it: (int(min(p[1] for p in it[0]) // row_h),
+                                 min(p[0] for p in it[0])))
+        return (
+            re.sub(r"\s+", "", "".join(str(t) for _, t, _ in res)),
+            [float(c) for _, _, c in res],
+        )
+
+    joined, confs = _run_strip(footer, scale)
+    has_plate = any(
+        normalize_plate(m[1])
+        for pat in (r"车牌号码[:：]?([^\s:：]{6,12})", r"车牌号[:：]?([^\s:：]{6,12})")
+        if (m := re.search(pat, joined))
+    )
+    if not has_plate and "无车牌" not in joined and fw >= 600:
+        sub_joined, sub_confs = _run_strip(footer[:, int(fw * 0.18):], 1.0)
+        if sub_joined:
+            joined = sub_joined + joined
+            confs = sub_confs + confs
+    return joined, confs
 
 
 def run_ocr_text(image: np.ndarray, large: bool = False) -> list[tuple[str, float]]:
@@ -786,16 +887,24 @@ def ocr_capture(payload: dict) -> dict:
     plate = color = vehicle_type = camera = ""
     bottom_date = bottom_hms = ""
     if stage == "抓拍":
-        # 底部OSD字号大但条带很宽：0.75缩放+更大检测边长，车牌召回率
-        # 从约10%提升到90%+（0.5缩放时小字严重漏检）。
-        bottom_joined, bottom_confs, _ = ocr_region(0.72, 1.0, 1.0, 0.75, large=True)
+        # 优先精确切出底部纯黑 OSD 条带识别（规避画面车头/路面纹理干扰，
+        # 车牌召回率从 ~65% 提到 ~99%）；无纯黑底条的老相机图回退旧区域。
+        bottom_joined, bottom_confs = _ocr_osd_footer(rgb)
+        if not bottom_joined:
+            bottom_joined, bottom_confs, _ = ocr_region(
+                0.72, 1.0, 1.0, 0.75, large=True)
         confidence_values += list(bottom_confs)
         bottom_date, bottom_hms = parse_datetime(bottom_joined)
-        for pattern in (r"车牌号码[:：]?([^\s:：]{6,12})", r"车牌号[:：]?([^\s:：]{6,12})"):
-            if match := re.search(pattern, bottom_joined):
-                plate = normalize_plate(match[1])
+        for allow_partial in (False, True):
+            for pattern in (r"车牌号码[:：]?([^\s:：]{5,12})", r"车牌号[:：]?([^\s:：]{5,12})"):
+                for match in re.finditer(pattern, bottom_joined):
+                    plate = normalize_plate(match[1], allow_partial=allow_partial)
+                    if plate:
+                        break
                 if plate:
                     break
+            if plate:
+                break
         color_match = re.search(r"车身颜色[:：]?(.{0,12})", bottom_joined)
         if color_match:
             color_text = color_match.group(1)
@@ -869,13 +978,16 @@ def image_quality(image: Image.Image) -> float:
 
 
 def process_missing(conn: sqlite3.Connection, limit: int = 0, force: bool = False,
-                    retry_failed: bool = False, stage: str = "") -> int:
+                    retry_failed: bool = False, stage: str = "",
+                    retry_osd: bool = False) -> int:
     """补充 OCR：时间戳、底部OSD参考、质量分。失败时降级为阶段顺序，不伪造时间。
 
     OCR 在进程池中并行执行（每个 worker 独立加载 RapidOCR），主进程写库；
     结束后对仍无时间的帧做兄弟帧补时（fill_times_from_siblings）。
     retry_failed=True 只重跑 ocr_status='fallback' 的历史失败帧（启用时刻带
     抢救通道后再试一次），不动已成功的帧。
+    retry_osd=True 只重跑 stage='抓拍' 且 osd_plate 为空的历史帧（用纯黑底部
+    条带精准 OCR 补回遗漏的 OSD 车牌/颜色/方向）。
     stage 参数限定只处理指定环节（配合 force 做定向回填，如历史抓拍照片
     补中文设备名 osd_camera），空串=不限。
     """
@@ -885,6 +997,8 @@ def process_missing(conn: sqlite3.Connection, limit: int = 0, force: bool = Fals
     conn.isolation_level = None
     if force:
         where = "1=1"
+    elif retry_osd:
+        where = "stage='抓拍' AND coalesce(osd_plate,'')=''"
     elif retry_failed:
         where = "coalesce(ocr_status,'')='fallback'"
     else:
@@ -972,30 +1086,42 @@ def process_missing(conn: sqlite3.Connection, limit: int = 0, force: bool = Fals
                     status_reason = "人脸抓拍，非车辆图片"
                 elif ocr_status != "ok":
                     status_reason = "时间戳OCR不可用，时间不确定（按阶段顺序推断）"
-                # 车牌字段只在本次读到新 OSD 车牌时覆盖：重跑/重试的帧此前
-                # 可能已由 LPR/correct_pass 写入更可靠的车牌，空读数不得清掉；
-                # 人工已标车牌（capture_annotations.corrected_plate）更不得被
-                # 自动读数覆盖（统一标注面板保护）。
+                # 车牌字段只在本次读到新 OSD 车牌且尚无 LPR 模型结果时回填：
+                # 重跑/补扫 OSD 时不得覆盖已有 LPR 主证据（实施文档 13.1），若与
+                # LPR 读数一致则升级为"OSD+车牌模型一致"；人工已标车牌更不得覆盖。
                 conn.execute(
                     """UPDATE captures SET capture_time=?, hour=?, ocr_status=?, quality_score=?,
-                              osd_plate=?, osd_color=?, osd_type=?, osd_camera=?,
-                              plate_final=CASE WHEN ?!='' AND NOT EXISTS (
+                              osd_plate=CASE WHEN ?!='' THEN ? ELSE osd_plate END,
+                              osd_color=CASE WHEN ?!='' THEN ? ELSE osd_color END,
+                              osd_type=CASE WHEN ?!='' THEN ? ELSE osd_type END,
+                              osd_camera=CASE WHEN ?!='' THEN ? ELSE osd_camera END,
+                              plate_final=CASE WHEN ?!='' AND coalesce(lpr_plate,'')=''
+                                AND NOT EXISTS (
                                     SELECT 1 FROM capture_annotations ca
                                     WHERE ca.capture_id=captures.id
                                       AND coalesce(ca.corrected_plate,'')!='')
                                  THEN ? ELSE plate_final END,
-                              plate_observed=CASE WHEN ?!='' THEN ? ELSE plate_observed END,
-                              plate_confidence=CASE WHEN ?!='' THEN ? ELSE plate_confidence END,
-                              recognition_source=CASE WHEN ?!='' THEN ? ELSE recognition_source END,
+                              plate_observed=CASE WHEN ?!='' AND coalesce(plate_observed,'')=''
+                                 THEN ? ELSE plate_observed END,
+                              plate_confidence=CASE WHEN ?!='' AND coalesce(lpr_plate,'')=''
+                                 THEN ? ELSE plate_confidence END,
+                              recognition_source=CASE
+                                WHEN ?!='' AND coalesce(lpr_plate,'')!='' AND lpr_plate=?
+                                  THEN 'OSD+车牌模型一致'
+                                WHEN ?!='' AND coalesce(lpr_plate,'')='' THEN ?
+                                ELSE recognition_source END,
                               capture_status=CASE
                                 WHEN capture_status='no_vehicle' THEN capture_status ELSE 'vehicle' END,
                               status_reason=?
                        WHERE id=?""",
                     (capture_time, hour, ocr_status, osd["quality"],
-                     osd_plate, str(osd["osd_color"]), str(osd["osd_type"]),
-                     str(osd["osd_camera"]),
+                     osd_plate, osd_plate,
+                     str(osd["osd_color"]), str(osd["osd_color"]),
+                     str(osd["osd_type"]), str(osd["osd_type"]),
+                     str(osd["osd_camera"]), str(osd["osd_camera"]),
                      osd_plate, osd_plate, osd_plate, osd_plate,
-                     osd_plate, float(osd["ocr_conf"]), osd_plate, "OSD文字",
+                     osd_plate, float(osd["ocr_conf"]),
+                     osd_plate, osd_plate, osd_plate, "OSD文字",
                      status_reason, capture_id),
                 )
                 processed += 1
@@ -1098,13 +1224,201 @@ def cosine(left: np.ndarray, right: np.ndarray) -> float:
     return float(left @ right / (np.linalg.norm(left) * np.linalg.norm(right) + 1e-9))
 
 
-def _plate_edit_distance(left: str, right: str) -> int:
-    """车牌相似距离：车牌前省份汉字无视（实施文档 13.1 + 现场确认），
-    从发牌机关字母起逐字符比较；位数不同返回 99。"""
-    if len(left) != len(right):
-        return 99
-    tail_left, tail_right = left[1:], right[1:]
-    return sum(1 for x, y in zip(tail_left, tail_right) if x != y)
+# 车牌 OCR 易混淆字符对（实施文档 13.1，已在 test_nov.db + granary.db 标定零误并）：
+# - 硬等价（成本 0.0）：O<->0、I<->1（国标 GA 36-2018 民用车牌不含 O/I）
+# - 软形近（成本 0.5）：0<->D/Q、1<->L/T、2<->Z、5<->S、8<->B、6<->G、C<->G、
+#   U<->V、E<->F、M<->N。两处形近差异累计 1.0 仍判同牌；非形近差异成本 1.0；
+#   少/多 1 个字符（Levenshtein 插删）成本 1.0，同样匹配（<=1.0）。
+_CONFUSABLE_PAIRS: set[frozenset[str]] = {
+    frozenset(("0", "D")), frozenset(("0", "Q")), frozenset(("D", "Q")),
+    frozenset(("1", "L")), frozenset(("1", "T")),
+    frozenset(("2", "Z")),
+    frozenset(("5", "S")),
+    frozenset(("8", "B")),
+    frozenset(("6", "G")), frozenset(("C", "G")),
+    frozenset(("U", "V")),
+    frozenset(("E", "F")),
+    frozenset(("M", "N")),
+}
+
+
+def _plate_body(plate: str | None) -> str:
+    """提取车牌有效比对主体：无视开头省份汉字，保留后续字母数字及挂/学等后缀。
+
+    - '皖K5713A' -> 'K5713A'
+    - 'K5713A'（首字缺失/未识别）-> 'K5713A'（不会盲切掉发牌机关字母）
+    - 将民用车牌不存在的 O/I 统一归一为 0/1。
+    """
+    if not plate:
+        return ""
+    s = re.sub(r"[^\u4e00-\u9fffA-Z0-9挂学警港澳使领]", "", plate.strip().upper())
+    if s and "\u4e00" <= s[0] <= "\u9fff":
+        s = s[1:]
+    return s.replace("O", "0").replace("I", "1")
+
+
+def _plate_edit_distance(left: str, right: str) -> float:
+    """车牌加权编辑距离（实施文档 13.1）：
+    1) 首个省份汉字完全不参与比对（兼容首字错认或缺失）；
+    2) O<->0、I<->1 成本 0.0；形近混淆字符对（0/D/Q、1/L/T、2/Z、5/S、
+       8/B、6/G/C、U/V、E/F、M/N）替换成本 0.5；其他替换成本 1.0；
+    3) 允许少/多 1 个字符（插/删成本 1.0，如 皖K5713 vs 皖K5713A、鲁WL887 vs 鲁WYL887）；
+    4) 主体长度 <5 或长度差 >1 返回 99.0。
+    判定口径：<= 1.0 视为同一车牌，> 1.0 视为不同车牌。
+    """
+    a, b = _plate_body(left), _plate_body(right)
+    if not a or not b or min(len(a), len(b)) < 5 or abs(len(a) - len(b)) > 1:
+        return 99.0
+    if a == b:
+        return 0.0
+    m, n = len(a), len(b)
+    dp = [float(j) for j in range(n + 1)]
+    for i in range(1, m + 1):
+        prev = dp[0]
+        dp[0] = float(i)
+        ca = a[i - 1]
+        for j in range(1, n + 1):
+            cb = b[j - 1]
+            temp = dp[j]
+            if ca == cb:
+                sub = 0.0
+            elif frozenset((ca, cb)) in _CONFUSABLE_PAIRS:
+                sub = 0.5
+            else:
+                sub = 1.0
+            dp[j] = min(dp[j] + 1.0, dp[j - 1] + 1.0, prev + sub)
+            prev = temp
+    return dp[n]
+
+
+def _confusable_fuzzy_key(text: str) -> str:
+    """短片段检索用的粗粒度形近归一键（仅用于 Web 查询片段子串匹配）。"""
+    table = str.maketrans({
+        "O": "0", "D": "0", "Q": "0",
+        "I": "1", "L": "1", "T": "1",
+        "Z": "2", "S": "5", "B": "8",
+        "G": "6", "V": "U", "F": "E", "N": "M",
+    })
+    return _plate_body(text).translate(table)
+
+
+def plate_matches_query(candidate: str | None, query: str | None) -> bool:
+    """车牌检索模糊匹配（供 server.py /api/search 与 /api/track 复用）：
+    - 完整/近完整查询（去首字后 >=5 位）：走与归类完全一致的 _plate_edit_distance <= 1.0
+      （无视省份首字 + 形近字符 + 少/多 1 位）；
+    - 短片段查询（如 '5713'、'KM9'）：去首字后按形近归一做子串匹配；
+    - 仅输入单字省份（如 '皖'）：按原文前缀/子串匹配。
+    """
+    if not candidate or not query:
+        return False
+    q_raw = re.sub(r"[^\u4e00-\u9fffA-Z0-9挂学警港澳使领]", "", query.strip().upper())
+    c_raw = re.sub(r"[^\u4e00-\u9fffA-Z0-9挂学警港澳使领]", "", candidate.strip().upper())
+    if not q_raw or not c_raw:
+        return False
+    qb = _plate_body(q_raw)
+    cb = _plate_body(c_raw)
+    if not qb:
+        return q_raw in c_raw
+    if not cb:
+        return False
+    if qb in cb:
+        return True
+    if len(qb) >= 5:
+        return _plate_edit_distance(c_raw, q_raw) <= 1.0
+    return _confusable_fuzzy_key(qb) in _confusable_fuzzy_key(cb)
+
+
+def _loose_plate_match(loose: dict, order_consensus: str) -> tuple[str, float, str]:
+    """双源车牌匹配（图像 LPR + 底部 OSD 互证互补）：
+    返回 (状态, 距离, 来源说明)，状态为 'match' / 'conflict' / 'unplated'。
+
+    规则：
+    - 仅当图像 LPR、OSD、plate_final 全为空时返回 'unplated'；
+    - 只要任一来源有车牌，而目标订单无共识车牌 -> 返回 'conflict'（防黑洞订单）；
+    - LPR 与 OSD 同时命中（<=1.0）-> 'match'（双源一致，最强）；
+    - LPR 命中（<=1.0）且（置信度 >=0.80 或无 OSD）-> 'match'（不被误判 OSD 耽误）；
+    - OSD 命中（<=1.0）且（无 LPR 或 LPR 置信度 <0.85）-> 'match'（不被模糊低置信 LPR 耽误）；
+    - 若高置信 LPR（>=0.85）与目标订单明确冲突（>1.0）-> 'conflict'（绝不被误判 OSD 强拉）；
+    - 兼容单测仅传 loose['plate']（无 lpr_plate/osd_plate 键）的场景。
+    """
+    pf = loose.get("plate") or ""
+    lpr = loose.get("lpr_plate") or ""
+    lpr_conf = float(loose.get("lpr_conf") or 0.0)
+    osd = loose.get("osd_plate") or ""
+    guard = loose.get("guard_plate") or ""
+    if not (pf or lpr or osd or guard):
+        return "unplated", -1.0, ""
+    if not order_consensus:
+        return "conflict", 99.0, ""
+    d_lpr = _plate_edit_distance(lpr, order_consensus) if lpr else 99.0
+    d_osd = _plate_edit_distance(osd, order_consensus) if osd else 99.0
+    d_pf = _plate_edit_distance(pf, order_consensus) if pf else 99.0
+    d_guard = _plate_edit_distance(guard, order_consensus) if guard else 99.0
+    lpr_is_full = bool(normalize_plate(lpr, allow_partial=False)) if lpr else False
+    lpr_high_conflict = lpr_is_full and lpr_conf >= 0.85 and d_lpr > 1.0
+    if d_lpr <= 1.0 and d_osd <= 1.0:
+        return "match", min(d_lpr, d_osd), "双源车牌一致"
+    if d_lpr <= 1.0 and (lpr_conf >= 0.80 or not osd):
+        return "match", d_lpr, "图像车牌"
+    if d_osd <= 1.0 and not lpr_high_conflict:
+        return "match", d_osd, "OSD车牌"
+    if d_pf <= 1.0 and not lpr_high_conflict:
+        return "match", d_pf, "车牌"
+    if d_guard <= 1.0 and not lpr_high_conflict:
+        return "match", d_guard, "车牌"
+    return "conflict", 99.0, ""
+
+
+def _guard_plate(plate_final: str | None, lpr_plate: str | None = None,
+                 lpr_conf: float | None = None,
+                 osd_plate: str | None = None) -> str:
+    """防串单车牌：优先采用 plate_final；若被历史清洗清空，回溯高置信 LPR
+    (>=0.85) 或 OSD 车牌——避免真实车牌在归类环节被当成“无车牌”塞进异牌订单。"""
+    if plate_final:
+        return plate_final
+    if lpr_plate and float(lpr_conf or 0.0) >= 0.85:
+        return lpr_plate
+    if osd_plate:
+        return osd_plate
+    return ""
+
+
+def _order_plate_profile(plate_counts: Counter) -> tuple[str, set[str]]:
+    """计算订单的共识车牌与已知车牌集合（去省份 + 形近/缺位距离 <=1.0 归簇计票）。
+
+    返回 (consensus_plate, known_plates)：
+    - 先按去省份且加权距离 <=1.0 归簇计票（如 鲁WYL887+皖WYL887、皖K5713A+皖B5713A、
+      皖KM9U08+皖KM9V08 合并为同一簇），避免因省份/形近/单字误读落成无共识；
+    - 仅当整单只有 1 个簇、或最大簇票数 >=2 且严格领先次大簇时才输出唯一共识，
+      避免同单并存两辆不同车（如 2 vs 2）时强选或双向桥接；
+    - known_plates 始终保留订单内全部非空车牌，供冲突否决使用。
+    """
+    known = {p for p, c in plate_counts.items() if p and c > 0}
+    if not known:
+        return "", set()
+    # 优先频次更高、且带完整省份汉字的读数作簇代表
+    ordered = sorted(
+        known,
+        key=lambda p: (-plate_counts[p], -len(p), p),
+    )
+    clusters: list[list[str]] = []
+    for p in ordered:
+        for cl in clusters:
+            if _plate_edit_distance(p, cl[0]) <= 1.0:
+                cl.append(p)
+                break
+        else:
+            clusters.append([p])
+    scored = sorted(
+        ((sum(plate_counts[p] for p in cl), cl[0]) for cl in clusters),
+        key=lambda item: (-item[0], item[1]),
+    )
+    top_count, top_plate = scored[0]
+    if len(scored) == 1:
+        return top_plate, known
+    if top_count >= 2 and top_count > scored[1][0]:
+        return top_plate, known
+    return "", known
 
 
 def associate_orders(conn: sqlite3.Connection) -> dict[str, int]:
@@ -1228,19 +1542,31 @@ def associate_orders(conn: sqlite3.Connection) -> dict[str, int]:
                 norm = np.linalg.norm(f)
                 if norm > 0:
                     embs.append(f / norm)
-        # 组内车牌共识：订单内个别帧会幻觉出邻车/噪声车牌（实测一单 5 帧
-        # 读出 5 个不同车牌），聚类只用共识车牌，否则噪声车牌会成为跨组
-        # 合并的桥。共识 = 出现 >=2 次的车牌；整单只出现一次时取置信度
-        # 最高的那个（单帧订单即其本身）。
-        consensus = [p for p, c in plate_counts.items()
-                     if c >= 2 or len(plate_counts) == 1]
-        if not consensus and plate_counts:
-            consensus = [max(plate_counts, key=lambda p: plate_conf[p])]
-        # 可信车牌：共识中出现 >=2 次、或置信度 >=0.95。单帧低置信读数
+        # 组内车牌共识：订单内个别帧会幻觉出邻车/噪声车牌，或同框出现两辆车
+        # （实测一单 4 帧车A + 2 帧车B）。若同时把两辆不同车（去省份距离>=2）
+        # 都当共识，exact_union_pass 会借该订单把两条车队错误桥接成同一 vehicle_id。
+        # 因此订单组只取唯一主牌簇（距离<=1归簇计票的严格胜出者）；平票不桥接。
+        if g["kind"] == "order":
+            dom_plate, _ = _order_plate_profile(Counter(plate_counts))
+            if dom_plate:
+                consensus = [p for p in plate_counts
+                             if _plate_edit_distance(p, dom_plate) <= 1]
+                cluster_total = sum(plate_counts[p] for p in consensus)
+            else:
+                consensus = []
+                cluster_total = 0
+        else:
+            consensus = [p for p, c in plate_counts.items()
+                         if c >= 2 or len(plate_counts) == 1]
+            if not consensus and plate_counts:
+                consensus = [max(plate_counts, key=lambda p: plate_conf[p])]
+            cluster_total = sum(plate_counts[p] for p in consensus)
+        # 可信车牌：主簇总计出现 >=2 次、或置信度 >=0.95。单帧低置信读数
         # 不能参与跨组合并（否则按 ≤1 字符规则会把整个车队链式吞进来）。
         g["plates"] = {p: plate_conf[p] for p in consensus}
         g["plate_trusted"] = {
-            p: (plate_counts.get(p, 0) >= 2 or plate_conf[p] >= 0.95)
+            p: (plate_counts.get(p, 0) >= 2 or cluster_total >= 2
+                or plate_conf[p] >= 0.95)
             for p in consensus
         }
         g["emb"] = None
@@ -1291,7 +1617,10 @@ def associate_orders(conn: sqlite3.Connection) -> dict[str, int]:
     for gid, g in groups.items():
         park_key = g.get("park", "")
         for plate, trusted in g["plate_trusted"].items():
-            key = (park_key, plate[1:])
+            body = _plate_body(plate)
+            if len(body) < 5:
+                continue
+            key = (park_key, body)
             exact_index.setdefault(key, []).append(gid)
             if trusted:
                 near_index.setdefault(key, []).append(gid)
@@ -1345,22 +1674,20 @@ def associate_orders(conn: sqlite3.Connection) -> dict[str, int]:
         for plate, trusted in g["plate_trusted"].items():
             if not trusted:
                 continue
-            key = plate[1:]
+            key = _plate_body(plate)
             if len(key) < 5:
                 continue
-            best_root, best_d = None, 99
+            best_root, best_d = None, 99.0
             for root_anchor, anchor_plates in anchors.items():
                 if root_anchor == find(gid):
                     continue
                 if groups[root_anchor].get("park", "") != g.get("park", ""):
                     continue  # 只挂靠同园区的锚点
-                d = min((sum(1 for x, y in zip(key, a) if x != y)
-                         if len(key) == len(a) else 99) for a in anchor_plates)
+                d = min(_plate_edit_distance(key, a) for a in anchor_plates)
                 if d < best_d:
                     best_root, best_d = root_anchor, d
-            if best_root is not None and best_d <= 1:
+            if best_root is not None and best_d <= 1.0:
                 union(find(gid), best_root, "相近车牌挂靠")
-                anchors[find(best_root)].add(key)
                 near_merges += 1
             break  # 每组只用一个代表性车牌判定，避免多牌轮流试挂
 
@@ -1407,7 +1734,9 @@ def associate_orders(conn: sqlite3.Connection) -> dict[str, int]:
     group_families: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     order_dom: dict[tuple[int, str], str] = {}
     for (vid, oid), counter in per_order.items():
-        dom = max(counter, key=lambda k: counter[k])
+        dom, _ = _order_plate_profile(Counter(counter))
+        if not dom:
+            dom = max(counter, key=lambda k: counter[k])
         order_dom[(vid, oid)] = dom
         group_families[vid][dom] += 1
     split = 0
@@ -1430,7 +1759,13 @@ def associate_orders(conn: sqlite3.Connection) -> dict[str, int]:
 
     # ---- 6) 逐帧车牌清洗：与车辆主牌（去省份后）距离 >=2 的单帧读数
     # 判为误读——原始读数保留在 plate_observed 供审计，plate_final 清空，
-    # 不再污染车牌检索与轨迹展示。----
+    # 不再污染车牌检索与轨迹展示。
+    # 两类读数不清洗（它们是真实存在的车牌，常见于同框第二辆车/过路车，
+    # 清掉会让用户看到"识别成功却没车牌"）：
+    # - 双重印证：图像模型与 OSD 独立读出同一字符串（OSD+车牌模型一致）；
+    # - 组内重复出现：同一字符串在该车辆组 >=2 帧一致出现——噪声读数
+    #   表现为随机字符串（一单 5 帧读出 5 个乱牌），一致的少数派读数是
+    #   真实车辆，不是幻觉。----
     dominant: dict[int, str] = {}
     for vid in {v for v, _ in order_dom}:
         counter = Counter()
@@ -1440,23 +1775,138 @@ def associate_orders(conn: sqlite3.Connection) -> dict[str, int]:
         if counter:
             dominant[vid] = max(counter, key=lambda k: counter[k])
     cleaned = 0
-    for vid, cid, plate in conn.execute(
-        """SELECT vehicle_id, id, plate_final FROM captures
+    restored = 0
+    member_rows = conn.execute(
+        """SELECT vehicle_id, id, plate_final, coalesce(recognition_source,''),
+                  coalesce(order_id,''), coalesce(lpr_conf, 0.0)
+           FROM captures
            WHERE vehicle_id IS NOT NULL AND coalesce(plate_final,'')!=''"""
-    ).fetchall():
+    ).fetchall()
+    # 历史被清洗的行重新评估：旧规则清掉的真实车牌（双重印证 / 组内重复 /
+    # 高置信模型读数 / 未关联图片）按新规则恢复（幂等可重复跑；恢复后
+    # plate_final 还原，原文审计字段不变）。注意：旧库中部分被清洗行的
+    # plate_match_reason 后来被归类/撤销覆写，因此对未关联图片或高置信 LPR
+    # 即使 reason 已被覆写也要能按 lpr_plate/osd_plate/plate_observed 找回。
+    cleaned_reason = "单帧车牌与车辆主牌差异过大，判为误读"
+    restore_rows = conn.execute(
+        """SELECT vehicle_id, id,
+                  coalesce(lpr_plate,''), coalesce(plate_observed,''), coalesce(osd_plate,''),
+                  coalesce(recognition_source,''),
+                  coalesce(order_id,''), coalesce(lpr_conf, 0.0),
+                  coalesce(plate_match_reason,'')
+           FROM captures
+           WHERE coalesce(plate_final,'')=''
+             AND coalesce(capture_status,'vehicle')!='no_vehicle'
+             AND (plate_match_reason=?
+                  OR (order_id='未关联图片'
+                      AND (coalesce(lpr_plate,'')!='' OR coalesce(osd_plate,'')!=''))
+                  OR (vehicle_id IS NOT NULL
+                      AND (coalesce(lpr_plate,'')!='' OR coalesce(osd_plate,'')!=''))
+                  OR (coalesce(lpr_plate,'')!='' AND coalesce(lpr_conf, 0.0)>=0.95))
+             AND coalesce(nullif(lpr_plate,''), nullif(plate_observed,''),
+                          nullif(osd_plate,'')) IS NOT NULL
+             AND NOT EXISTS (
+                  SELECT 1 FROM capture_annotations ca
+                  WHERE ca.capture_id=captures.id
+                    AND coalesce(ca.corrected_plate,'')!='')""",
+        (cleaned_reason,),
+    ).fetchall()
+    group_plate_counts: Counter = Counter()
+    for vid, _cid, plate, _src, _oid, _conf in member_rows:
+        group_plate_counts[(vid, _plate_body(plate))] += 1
+    for vid, _cid, lp, obs, op, _src, _oid, _conf, _rsn in restore_rows:
+        plate = lp or obs or op
+        if vid is not None and plate:
+            group_plate_counts[(vid, _plate_body(plate))] += 1
+    for vid, cid, plate, src, oid, conf in member_rows:
+        if oid == "未关联图片":
+            continue  # 未关联散图绝不清洗车牌，防止后续归类盲视车牌冲突
         dom = dominant.get(vid)
         if not dom:
             continue
-        if _plate_edit_distance(plate, dom) >= 2:
+        if _plate_edit_distance(plate, dom) < 2:
+            continue
+        if (src == "OSD+车牌模型一致"
+                or group_plate_counts[(vid, _plate_body(plate))] >= 2
+                or float(conf or 0.0) >= 0.95):
+            continue  # 双重印证/组内重复/高置信真实车牌，不清洗（交 6.5 拆出）
+        conn.execute(
+            """UPDATE captures
+               SET plate_observed=coalesce(nullif(plate_observed,''), plate_final),
+                   plate_final='',
+                   plate_match_reason=?
+               WHERE id=?""",
+            (cleaned_reason, cid),
+        )
+        cleaned += 1
+    for vid, cid, lp, obs, op, src, oid, conf, rsn in restore_rows:
+        dom = dominant.get(vid) if vid is not None else None
+        # 若任一原始来源（lpr / osd / observed）与当前所属车辆组主牌一致（<=1.0），
+        # 优先恢复该一致来源（兼容大门重归类迁入正确订单后、或残缺LPR让位OSD后的恢复）。
+        plate = ""
+        if dom is not None:
+            for cand in (lp, op, obs):
+                if cand and _plate_edit_distance(cand, dom) <= 1.0:
+                    plate = cand
+                    break
+        if not plate:
+            lp_full = bool(normalize_plate(lp, allow_partial=False)) if lp else False
+            op_full = bool(normalize_plate(op, allow_partial=False)) if op else False
+            if op_full and not lp_full:
+                plate = op
+            else:
+                plate = lp or obs or op
+        # 未关联散图、与组主牌一致、双重印证、组内去省份重复、高置信模型读数
+        # (>=0.95)，任一成立即恢复——真实车牌不该因历史清洗而缺席。
+        if oid == "未关联图片":
+            restore = True
+        elif dom is not None and _plate_edit_distance(plate, dom) <= 1.0:
+            restore = True
+        elif (src == "OSD+车牌模型一致"
+              or (vid is not None and group_plate_counts[(vid, _plate_body(plate))] >= 2)
+              or float(conf or 0.0) >= 0.95):
+            restore = True
+        else:
+            restore = False
+        if restore and plate:
+            new_reason = "" if rsn == cleaned_reason else rsn
             conn.execute(
-                """UPDATE captures
-                   SET plate_observed=coalesce(nullif(plate_observed,''), plate_final),
-                       plate_final='',
-                       plate_match_reason='单帧车牌与车辆主牌差异过大，判为误读'
+                """UPDATE captures SET plate_final=?, plate_match_reason=?
+                   WHERE id=?""",
+                (plate, new_reason, cid),
+            )
+            restored += 1
+    conn.commit()
+
+    # ---- 6.5) 车牌一致性拆分：组内帧的车牌与组主牌（去省份后）距离 >=2，
+    # 且读数双重印证（OSD+模型一致）/ 组内去省份重复出现（>=2 帧）/ 高置信
+    # 模型读数（>=0.95）——这是同框或误选框的另一辆真实车辆，从主车轨迹拆出
+    # 待人工归组。保留在订单时间线、车牌照常展示；单帧低置信孤立读数不拆
+    # （误读噪声由第 6 步清洗处理）。每轮重算幂等（与车型拆分同机制）。
+    plate_split = 0
+    split_rows = conn.execute(
+        """SELECT vehicle_id, id, plate_final, coalesce(recognition_source,''),
+                  coalesce(lpr_conf, 0.0)
+           FROM captures
+           WHERE vehicle_id IS NOT NULL AND coalesce(plate_final,'')!=''"""
+    ).fetchall()
+    split_counts: Counter = Counter()
+    for vid, _cid, plate, _src, _conf in split_rows:
+        split_counts[(vid, _plate_body(plate))] += 1
+    for vid, cid, plate, src, conf in split_rows:
+        dom = dominant.get(vid)
+        if dom is None or _plate_edit_distance(plate, dom) < 2:
+            continue
+        if (src == "OSD+车牌模型一致"
+                or split_counts[(vid, _plate_body(plate))] >= 2
+                or float(conf or 0.0) >= 0.95):
+            conn.execute(
+                """UPDATE captures SET vehicle_id=NULL,
+                          plate_match_reason='车牌与车辆主牌不符，已拆出待人工归组'
                    WHERE id=?""",
                 (cid,),
             )
-            cleaned += 1
+            plate_split += 1
     conn.commit()
 
     # ---- 7) 车型一致性拆分：车辆组内车型与主体车型不符的帧拆出轨迹 ----
@@ -1570,6 +2020,8 @@ def associate_orders(conn: sqlite3.Connection) -> dict[str, int]:
     return {"orders": len(orders), "vehicle_groups": len(roots),
             "exact_plate_merges": exact_merges, "near_plate_merges": near_merges,
             "far_consensus_split": split, "frame_misread_cleaned": cleaned,
+            "frame_misread_restored": restored,
+            "plate_split": plate_split,
             "type_split": type_split, "manual_moves_applied": manual_applied,
             "linked_captures": linked}
 
@@ -1677,9 +2129,11 @@ def _match_loose_capture(loose: dict, orders: dict, window_seconds: int,
     """单张未关联抓拍的订单匹配。返回 (命中订单key或None, 证据dict, 跳过原因)。
 
     证据分两级：
-    - 车牌锚定（最强）：loose 读到车牌且订单共识车牌去省份差 <=1 -> 直接归入
-      时间差最小者（同一辆车多次进场时，时间窗负责挑出"这一次"）；
-    - 外观+时间（无车牌可用时）：与订单主车特征最大余弦 >= 阈值，且领先
+    - 车牌锚定（最强）：抓拍有明确车牌（plate 或防串单 guard_plate）时，只允许
+      匹配共识车牌去省份差 <=1 的订单，归入时间差最小者（同一辆车多次进场时，
+      时间窗负责挑出"这一次"）；绝不允许带牌过路车退化到无牌外观通道塞进
+      无共识/无车牌订单（黑洞订单防线）；
+    - 外观+时间（仅抓拍确实无车牌时）：与订单主车特征最大余弦 >= 阈值，且领先
       次优订单 >= margin 时外观定胜负；领先不足（园区同时在场货车常达
       7-10 单，同型同色货车外观本来就难分）按时间差就近归属——照片夹在
       两个订单之间时选时间更近的一单；两单时间差彼此 <300 秒仍是真歧义，
@@ -1691,6 +2145,10 @@ def _match_loose_capture(loose: dict, orders: dict, window_seconds: int,
     evidence = {"similarity": 0.0, "time_diff_seconds": -1, "plate_note": ""}
     candidates = []
     loose_dt = loose["dt"]
+    has_any_plate = bool(
+        (loose.get("plate") or "") or (loose.get("lpr_plate") or "")
+        or (loose.get("osd_plate") or "") or (loose.get("guard_plate") or "")
+    )
     for key, order in orders.items():
         if order["park"] != loose["park"] or not order["times"]:
             continue
@@ -1701,31 +2159,40 @@ def _match_loose_capture(loose: dict, orders: dict, window_seconds: int,
         if loose["vehicle_type"] and order["main_type"] and \
                 loose["vehicle_type"] != order["main_type"]:
             continue
-        plate_distance = -1
-        if loose["plate"] and order["consensus_plate"]:
-            plate_distance = _plate_edit_distance(loose["plate"],
-                                                  order["consensus_plate"])
-            if plate_distance >= 2:
-                continue  # 车牌明显不同：否决（宁可漏归类不可错归类）
+        plate_distance = -1.0
+        plate_source = ""
+        order_consensus = order.get("consensus_plate") or ""
+        if has_any_plate:
+            status, dist, src_note = _loose_plate_match(loose, order_consensus)
+            if status != "match":
+                continue  # 车牌冲突或目标订单无共识车牌：否决（防黑洞订单与异牌混入）
+            plate_distance = dist
+            plate_source = src_note
         sim = max((cosine(loose["emb"], emb) for emb in order["embs"]),
                   default=-1.0)
         candidates.append({"key": key, "sim": sim, "time_diff": time_diff,
-                           "plate_distance": plate_distance})
+                           "plate_distance": plate_distance,
+                           "plate_source": plate_source})
     if not candidates:
-        return None, evidence, "时间窗内无可兼容订单"
+        return (None, evidence,
+                "抓拍有车牌，时间窗内无匹配车牌的订单" if has_any_plate
+                else "时间窗内无可兼容订单")
 
     plate_matched = [c for c in candidates if c["plate_distance"] >= 0]
     if plate_matched:
-        plate_matched.sort(key=lambda c: (c["time_diff"], -c["sim"]))
+        plate_matched.sort(key=lambda c: (c["time_diff"], c["plate_distance"], -c["sim"]))
         best = plate_matched[0]
         # 两笔车牌一致的订单时间差彼此接近（<300秒）说明无法确定是哪一次
         # 进场（快速折返），不强行归类
         if len(plate_matched) > 1 and \
                 plate_matched[1]["time_diff"] - best["time_diff"] < 300:
             return None, evidence, "多笔车牌一致订单时间接近，待人工判断"
+        d_str = f"{best['plate_distance']:g}"
+        note = (f"车牌去省份差{d_str}（{best['plate_source']}）"
+                if best["plate_source"] else f"车牌去省份差{d_str}")
         evidence.update(similarity=best["sim"],
                         time_diff_seconds=int(best["time_diff"]),
-                        plate_note=f"车牌去省份差{best['plate_distance']}")
+                        plate_note=note)
         return best["key"], evidence, ""
 
     # 无车牌锚定：外观相似度阈值 + 对次优的领先幅度。外观分不出胜负时
@@ -1779,7 +2246,8 @@ def assign_loose_orders(conn: sqlite3.Connection, apply_changes: bool = False,
     type_list = tuple(t for t in types if t)
     loose_rows = conn.execute(
         """SELECT id, coalesce(park,''), date, capture_time, plate_final,
-                  reid_embedding, vehicle_type, filepath, filename
+                  reid_embedding, vehicle_type, filepath, filename,
+                  lpr_plate, lpr_conf, osd_plate
            FROM captures
            WHERE order_id='未关联图片' AND reid_embedding IS NOT NULL
              AND capture_time IS NOT NULL AND capture_time!=''
@@ -1797,9 +2265,11 @@ def assign_loose_orders(conn: sqlite3.Connection, apply_changes: bool = False,
 
     # 订单索引：只收有可靠时间的车辆帧（ok/兄弟帧；conflict 无时间不可作锚）
     orders: dict[tuple[str, str], dict] = {}
-    for park, order_id, capture_time, plate, blob, vtype, filepath in conn.execute(
+    for (park, order_id, capture_time, plate, blob, vtype, filepath,
+         lpr_plate, lpr_conf, osd_plate) in conn.execute(
         """SELECT coalesce(park,''), order_id, capture_time, plate_final,
-                  reid_embedding, vehicle_type, filepath
+                  reid_embedding, vehicle_type, filepath,
+                  lpr_plate, lpr_conf, osd_plate
            FROM captures
            WHERE coalesce(order_id,'')!='' AND order_id!='未关联图片'
              AND capture_time IS NOT NULL AND capture_time!=''
@@ -1810,8 +2280,9 @@ def assign_loose_orders(conn: sqlite3.Connection, apply_changes: bool = False,
             {"park": park, "times": [], "plates": Counter(), "embs": [],
              "types": Counter(), "dirs": {}, "nearest_anchor": {}})
         order["times"].append(datetime.strptime(capture_time, "%Y-%m-%d %H:%M:%S"))
-        if plate:
-            order["plates"][plate] += 1
+        eff_plate = _guard_plate(plate, lpr_plate, lpr_conf, osd_plate)
+        if eff_plate:
+            order["plates"][eff_plate] += 1
         if blob:
             feature = np.frombuffer(blob, np.float32)
             norm = np.linalg.norm(feature)
@@ -1825,19 +2296,16 @@ def assign_loose_orders(conn: sqlite3.Connection, apply_changes: bool = False,
             order["nearest_anchor"][parent] = capture_time
     for order in orders.values():
         order["main_type"] = order["types"].most_common(1)[0][0] if order["types"] else ""
-        # 共识车牌：出现>=2次；整单只读过一种车牌时取其本身（与
-        # associate_orders 的共识规则一致，单帧噪声车牌不当锚点）
-        if order["plates"]:
-            top_plate, top_count = order["plates"].most_common(1)[0]
-            order["consensus_plate"] = top_plate if (top_count >= 2 or len(order["plates"]) == 1) else ""
-        else:
-            order["consensus_plate"] = ""
+        # 共识车牌：去省份+距离<=1 归簇计票，避免因省份/单字误读落成无共识
+        order["consensus_plate"], order["known_plates"] = _order_plate_profile(
+            order["plates"])
 
     plan = []
     skips: dict[str, int] = {}
     for row in loose_rows:
         (capture_id, park, _date, capture_time, plate, blob,
-         vehicle_type, filepath, filename) = row
+         vehicle_type, filepath, filename,
+         lpr_plate, lpr_conf, osd_plate) = row
         feature = np.frombuffer(blob, np.float32)
         norm = np.linalg.norm(feature)
         if norm <= 0:
@@ -1850,6 +2318,9 @@ def assign_loose_orders(conn: sqlite3.Connection, apply_changes: bool = False,
                 skips.get("原始照片不在盘上（归档已清理）", 0) + 1
             continue
         loose = {"id": capture_id, "park": park, "plate": plate or "",
+                 "lpr_plate": lpr_plate or "", "lpr_conf": float(lpr_conf or 0.0),
+                 "osd_plate": osd_plate or "",
+                 "guard_plate": _guard_plate(plate, lpr_plate, lpr_conf, osd_plate),
                  "vehicle_type": vehicle_type, "filepath": filepath,
                  "filename": filename, "date": _date,
                  "dt": datetime.strptime(capture_time, "%Y-%m-%d %H:%M:%S"),
@@ -1986,12 +2457,14 @@ def assign_gate_orders(conn: sqlite3.Connection, apply_changes: bool = False,
     """
     ensure_loose_assignments_schema(conn)
 
-    # ---- 订单索引：members 保留每张照片（时间/车牌/特征/车型），评估时
+    # ---- 订单索引：members 保留每张照片（时间/阶段/车牌/特征/车型），评估时
     # 可剔除被评照片自身后重算时间锚与共识车牌 ----
     members: dict[tuple[str, str], list[dict]] = {}
-    for cid, park, order_id, capture_time, plate, blob, vtype in conn.execute(
-        """SELECT id, coalesce(park,''), order_id, capture_time, plate_final,
-                  reid_embedding, vehicle_type
+    for (cid, park, order_id, capture_time, stage, plate, blob, vtype,
+         lpr_plate, lpr_conf, osd_plate) in conn.execute(
+        """SELECT id, coalesce(park,''), order_id, capture_time, coalesce(stage,''),
+                  plate_final, reid_embedding, vehicle_type,
+                  lpr_plate, lpr_conf, osd_plate
            FROM captures
            WHERE coalesce(order_id,'')!='' AND order_id!='未关联图片'
              AND capture_time IS NOT NULL AND capture_time!=''
@@ -2002,9 +2475,11 @@ def assign_gate_orders(conn: sqlite3.Connection, apply_changes: bool = False,
             f = np.frombuffer(blob, np.float32)
             norm = float(np.linalg.norm(f))
             emb = f / norm if norm > 0 else None
+        gplate = _guard_plate(plate, lpr_plate, lpr_conf, osd_plate)
         members.setdefault((park, order_id), []).append(
             {"cid": cid, "dt": datetime.strptime(capture_time, "%Y-%m-%d %H:%M:%S"),
-             "plate": plate or "", "emb": emb, "vtype": vtype or ""})
+             "stage": stage, "plate": plate or "", "guard_plate": gplate,
+             "emb": emb, "vtype": vtype or ""})
     # 目标文件夹参照：订单已有照片所在目录 -> 日期（_pick_order_dir 用）
     dirs: dict[tuple[str, str], dict[str, str]] = {}
     nearest_anchor: dict[tuple[str, str], dict[str, str]] = {}
@@ -2024,12 +2499,8 @@ def assign_gate_orders(conn: sqlite3.Connection, apply_changes: bool = False,
         rows = members.get(key, [])
         if exclude_cid is not None:
             rows = [m for m in rows if m["cid"] != exclude_cid]
-        plates = Counter(m["plate"] for m in rows if m["plate"])
-        if plates:
-            top_plate, top_count = plates.most_common(1)[0]
-            consensus = top_plate if (top_count >= 2 or len(plates) == 1) else ""
-        else:
-            consensus = ""
+        plates = Counter(m["guard_plate"] for m in rows if m["guard_plate"])
+        consensus, _known = _order_plate_profile(plates)
         types_counter = Counter(m["vtype"] for m in rows if m["vtype"])
         main_type = types_counter.most_common(1)[0][0] if types_counter else ""
         times = [m["dt"] for m in rows]
@@ -2042,8 +2513,8 @@ def assign_gate_orders(conn: sqlite3.Connection, apply_changes: bool = False,
 
     def evaluate(row, cur_order: str):
         """评估一张大门照片：返回 (命中订单key或None=保留现归属, 证据, 原因)"""
-        (cid, park, _cur, _date, capture_time, plate, blob,
-         vtype, _filepath, _filename) = row
+        (cid, park, _cur, _date, capture_time, stage, plate, blob,
+         vtype, _filepath, _filename, lpr_plate, lpr_conf, osd_plate) = row
         f = np.frombuffer(blob, np.float32)
         norm = float(np.linalg.norm(f))
         if norm <= 0:
@@ -2053,18 +2524,38 @@ def assign_gate_orders(conn: sqlite3.Connection, apply_changes: bool = False,
         dt = datetime.strptime(capture_time, "%Y-%m-%d %H:%M:%S")
         evidence = {"similarity": 0.0, "time_diff_seconds": -1, "plate_note": ""}
         cur_key = (park, cur_order)
+        plate = plate or ""
+        guard_plate = _guard_plate(plate, lpr_plate, lpr_conf, osd_plate)
+        cur_anchors = order_anchors(cur_key, exclude_cid=cid)
+        cur_consensus = cur_anchors[2]
+
+        # 同秒多机位过磅连拍保护：地磅系统单次过磅同时触发多个机位（间隔 <=5s），
+        # 绝不能把同秒连拍中未拍到车牌的侧面/车尾镜头靠 ReID 外观单独扯去别的订单，
+        # 也不能把与现订单无车牌冲突的同秒连拍扯回 1 小时前的旧订单。
+        burst_siblings = [
+            m for m in members.get(cur_key, [])
+            if m["cid"] != cid and m["stage"] == stage
+            and abs((m["dt"] - dt).total_seconds()) <= 5
+        ]
+        burst_plates = {m["guard_plate"] for m in burst_siblings if m["guard_plate"]}
+        if burst_siblings:
+            if not guard_plate:
+                return None, evidence, "同秒过磅连拍保留现归属"
+            if not cur_consensus or _plate_edit_distance(guard_plate, cur_consensus) <= 1:
+                return None, evidence, "同秒过磅连拍保留现归属"
+
         # 现属订单车牌保护：照片车牌与现属订单任一成员车牌去省份差 <=1，
         # 即视为车牌锚定在现属订单（上游 NVR 正是按牌归档的）——外观证据
         # 不能把照片拉走，除非另一订单也车牌锚定且时间明显更近。
-        cur_plate_anchored = bool(plate) and any(
-            m["plate"] and _plate_edit_distance(plate, m["plate"]) <= 1
+        cur_plate_anchored = bool(guard_plate) and any(
+            m["guard_plate"] and _plate_edit_distance(guard_plate, m["guard_plate"]) <= 1
             for m in members.get(cur_key, []) if m["cid"] != cid)
         candidates = []
         for key in members:
             if key[0] != park:
                 continue
             if key == cur_key:
-                anchors = order_anchors(key, exclude_cid=cid)
+                anchors = cur_anchors
             else:
                 if key not in anchor_cache:
                     anchor_cache[key] = order_anchors(key)
@@ -2079,11 +2570,42 @@ def assign_gate_orders(conn: sqlite3.Connection, apply_changes: bool = False,
                 continue
             if vtype and main_type and vtype != main_type and key != cur_key:
                 continue  # 车型矛盾：不可能是该订单主车（现属订单不因此逐出）
-            plate_distance = -1
-            if plate and consensus:
-                plate_distance = _plate_edit_distance(plate, consensus)
-                if plate_distance >= 2 and key != cur_key:
-                    continue  # 车牌明显不同：否决（现属订单不否决，由车牌保护兜底）
+            if key != cur_key:
+                # 行程时序 sanity check：出磅不得早于目标订单最早的入磅，
+                # 入磅不得晚于目标订单最晚的出磅（避免相邻两单的过磅倒挂）。
+                target_rows = members.get(key, [])
+                if stage == "出磅":
+                    in_times = [m["dt"] for m in target_rows if m["stage"] == "入磅"]
+                    if in_times and dt < min(in_times):
+                        continue
+                elif stage == "入磅":
+                    out_times = [m["dt"] for m in target_rows if m["stage"] == "出磅"]
+                    if out_times and dt > max(out_times):
+                        continue
+            plate_distance = -1.0
+            if guard_plate:
+                if key != cur_key:
+                    # 照片有明确车牌：绝不移入无共识车牌或车牌冲突的异单
+                    if not consensus:
+                        continue
+                    guard_dist = _plate_edit_distance(guard_plate, consensus)
+                    if guard_dist > 1.0:
+                        continue
+                    plate_distance = (_plate_edit_distance(plate, consensus)
+                                      if plate else guard_dist)
+                    if plate_distance > 1.0:
+                        continue
+                elif consensus:
+                    plate_distance = _plate_edit_distance(guard_plate, consensus)
+                    if plate_distance > 1.0:
+                        plate_distance = -1.0
+            elif key != cur_key and consensus:
+                # 照片无车牌但现订单/同秒连拍已有明确车牌：绝不跨牌移入异牌订单
+                if cur_consensus and _plate_edit_distance(cur_consensus, consensus) > 1.0:
+                    continue
+                if burst_plates and all(
+                        _plate_edit_distance(bp, consensus) > 1.0 for bp in burst_plates):
+                    continue
             sim = max((cosine(emb, e) for e in embs), default=-1.0)
             candidates.append({"key": key, "sim": sim, "time_diff": time_diff,
                                "plate_distance": plate_distance})
@@ -2110,12 +2632,13 @@ def assign_gate_orders(conn: sqlite3.Connection, apply_changes: bool = False,
             cur_td = next((c["time_diff"] for c in candidates if c["key"] == cur_key),
                           None)
             better = [c for c in plate_matched
-                      if cur_td is None or c["time_diff"] < cur_td]
+                      if c["key"] != cur_key
+                      and (cur_td is None or c["time_diff"] < cur_td)]
             if not better:
                 return None, evidence, "车牌锚定现归属（保留）"
             better.sort(key=lambda c: (c["time_diff"], -c["sim"]))
             best_other = better[0]
-            if cur_td is not None and best_other["time_diff"] - cur_td < 300:
+            if cur_td is not None and cur_td - best_other["time_diff"] < 300:
                 return None, evidence, "两笔车牌一致订单时间接近，保留现归属"
             return keep(best_other["key"],
                         f"车牌去省份差{best_other['plate_distance']}（原订单同牌更远）")
@@ -2126,6 +2649,8 @@ def assign_gate_orders(conn: sqlite3.Connection, apply_changes: bool = False,
             if runner and runner["time_diff"] - best["time_diff"] < 300:
                 return None, evidence, "多笔车牌一致订单时间接近，保留现归属"
             return keep(best["key"], f"车牌去省份差{best['plate_distance']}")
+        if guard_plate:
+            return None, evidence, "照片有车牌但无匹配目标订单（保留现归属）"
         candidates.sort(key=lambda c: (-c["sim"], c["time_diff"]))
         best = candidates[0]
         second = candidates[1] if len(candidates) > 1 else None
@@ -2142,8 +2667,10 @@ def assign_gate_orders(conn: sqlite3.Connection, apply_changes: bool = False,
         return keep(nearest["key"], "外观难分，按时间就近归属")
 
     gate_rows = conn.execute(
-        """SELECT id, coalesce(park,''), order_id, date, capture_time, plate_final,
-                  reid_embedding, vehicle_type, filepath, filename
+        """SELECT id, coalesce(park,''), order_id, date, capture_time,
+                  coalesce(stage,''), plate_final, reid_embedding,
+                  vehicle_type, filepath, filename,
+                  lpr_plate, lpr_conf, osd_plate
            FROM captures
            WHERE stage IN ('入磅','出磅')
              AND coalesce(capture_status,'vehicle')!='no_vehicle'
@@ -2157,7 +2684,7 @@ def assign_gate_orders(conn: sqlite3.Connection, apply_changes: bool = False,
     if park_filter:
         gate_rows = [r for r in gate_rows if r[1] == park_filter]
     if types:
-        gate_rows = [r for r in gate_rows if r[7] in types or not r[7]]
+        gate_rows = [r for r in gate_rows if r[8] in types or not r[8]]
 
     now = datetime.now().isoformat(timespec="seconds")
     moved = planned = failed = 0
@@ -2167,8 +2694,8 @@ def assign_gate_orders(conn: sqlite3.Connection, apply_changes: bool = False,
     touched_orders: set[tuple[str, str]] = set()
     moved_cids: set[int] = set()
     # 现归属状态（apply 多轮迭代时 DB 行里的 order_id/filepath 会过期）
-    state = {row[0]: {"order": row[2], "date": row[3], "filepath": row[8],
-                      "filename": row[9]} for row in gate_rows}
+    state = {row[0]: {"order": row[2], "date": row[3], "filepath": row[9],
+                      "filename": row[10]} for row in gate_rows}
     for round_no in range(1, (max_rounds if apply_changes else 1) + 1):
         plan = []
         keep_count = 0
@@ -2572,10 +3099,12 @@ def dedup_gate_captures(conn: sqlite3.Connection, apply_changes: bool = False,
     """共用大门照片跨园区去重（默认试运行，--apply 落盘）。
 
     每个确认重复的组仲裁出唯一赢家留在其现属订单，落败副本移入扫描根下
-    的 重复抓拍隔离-<原园区> 园区（文件不在盘上的仅库内改 park）。整组都
-    挂在"未关联图片"时没有"正确订单"可归属，保留两边并计入待人工组数
-    （唯一不强制选边的情形）。阈值可环境变量覆盖：GATE_DEDUP_SIM_MARGIN、
-    GATE_DEDUP_TIME_MARGIN、GATE_DEDUP_SEQ_MAX_HOURS。
+    的 重复抓拍隔离-<原园区> 园区（文件不在盘上的仅库内改 park）。两种
+    情形不强制选边、原样保留待人工：整组都挂在"未关联图片"（没有"正确
+    订单"可归属）；整组都属同一园区（同园区重复说明是上游把同一张过磅
+    照片写进了两个订单，自动选边会把照片从订单里拉走，伤害订单归属）。
+    阈值可环境变量覆盖：GATE_DEDUP_SIM_MARGIN、GATE_DEDUP_TIME_MARGIN、
+    GATE_DEDUP_SEQ_MAX_HOURS。
     """
     ensure_gate_dedup_log_schema(conn)
     sim_margin = float(os.environ.get("GATE_DEDUP_SIM_MARGIN", sim_margin))
@@ -2668,6 +3197,7 @@ def dedup_gate_captures(conn: sqlite3.Connection, apply_changes: bool = False,
         return [c for c in clusters.values() if len(c) >= 2]
 
     dup_groups = needs_review = skip_md5_mismatch = skip_no_file = 0
+    same_park_review = 0
     plan: list[tuple[dict, dict, str, str, str]] = []  # (落败副本, 赢家, confirm, 理由, 组键)
     for candidate_key in sorted(candidates):
         items = candidates[candidate_key]
@@ -2691,6 +3221,12 @@ def dedup_gate_captures(conn: sqlite3.Connection, apply_changes: bool = False,
                                                      seq_max_seconds)))
             if not any(ev["real_order"] for _, ev in scored):
                 needs_review += 1  # 全是未关联图片：无"正确订单"可归属，保留两边
+                continue
+            if len({item["park"] for item, _ev in scored}) == 1:
+                # 同园区内出现同文件名副本（上游把同一张过磅照片写进同园区
+                # 两个订单）：强制选边会把照片从订单里拉走，直接伤害订单
+                # 归属与归类覆盖——保留两边待人工，绝不自动隔离。
+                same_park_review += 1
                 continue
             scored.sort(key=lambda pair: pair[0]["cid"])
             winner = scored[0]
@@ -2782,6 +3318,7 @@ def dedup_gate_captures(conn: sqlite3.Connection, apply_changes: bool = False,
         "gate_captures": len(rows), "duplicates": len(plan),
         "dup_groups": dup_groups, "moved": moved, "db_only": db_only_moves,
         "failed": failed, "needs_review_groups": needs_review,
+        "same_park_review_groups": same_park_review,
         "skipped_md5_mismatch": skip_md5_mismatch,
         "skipped_no_file": skip_no_file, "unparseable": unparseable,
     }
@@ -2789,7 +3326,8 @@ def dedup_gate_captures(conn: sqlite3.Connection, apply_changes: bool = False,
     stat = (f"隔离{moved}张（其中仅库内改园区{db_only_moves}张），失败{failed}张"
             if apply_changes else f"计划隔离{len(plan)}张")
     print(f"共用大门照片去重{mode}：入磅/出磅 {len(rows)}张，确认重复组{dup_groups}个，"
-          f"{stat}；全未关联待人工{needs_review}组，内容不一致跳过{skip_md5_mismatch}组，"
+          f"{stat}；全未关联待人工{needs_review}组，同园区重复保留待人工{same_park_review}组，"
+          f"内容不一致跳过{skip_md5_mismatch}组，"
           f"文件不在盘跳过{skip_no_file}组，文件名不可解析{unparseable}张")
     return result
 
@@ -2890,6 +3428,8 @@ def main() -> None:
                              "（如 --stage 抓拍 定向回填中文设备名）")
     parser.add_argument("--retry-failed", action="store_true",
                         help="只重跑 ocr_status=fallback 的帧（启用时刻带抢救通道）")
+    parser.add_argument("--retry-osd", action="store_true",
+                        help="只重跑抓拍阶段 osd_plate 为空的帧（纯黑底部条带精准补扫车牌）")
     parser.add_argument("--replay-manual", action="store_true",
                         help="全库重建后从人工表恢复写回字段（环节/方向/颜色/车型/"
                              "车牌/时间/误检标记），幂等可重复执行")
@@ -2929,7 +3469,7 @@ def main() -> None:
         print(f"人工标注回放完成：{replay_manual(conn)}")
         return
     standalone = (args.assign_loose or args.assign_gate or args.undo_loose_assign
-                  or args.dedup_gate or args.undo_dedup)
+                  or args.dedup_gate or args.undo_dedup or args.retry_osd)
     # 默认流程始终全盘同步：每日流水线靠它发现新园区/新照片（库非空也必须
     # 扫描，否则新数据永远进不了库——金冠库上线时踩过这个坑）。sync_files
     # 对已有文件只做路径刷新，不会重复入库。
@@ -2940,6 +3480,8 @@ def main() -> None:
         print(f"目录同步完成：{summary}")
     if args.retry_failed:
         process_missing(conn, args.limit, retry_failed=True)
+    if args.retry_osd:
+        process_missing(conn, args.limit, retry_osd=True)
     if args.process_missing or args.force_process or not (
         args.sync_only or args.associate_only or standalone or args.retry_failed
     ):

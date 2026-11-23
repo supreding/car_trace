@@ -17,10 +17,13 @@ models/
 data/
 
 # 运行时产生的数据
-app/reid_crops/
-app/reid_crops_nongyixing/
+app/reid_crops*/
 app/*.db
 app/*.db.bak-*
+
+# 本地工具会话目录
+.zcode/
+.zcode-docx-work/
 
 # 日志与系统垃圾文件
 bash.exe.stackdump
