@@ -57,7 +57,11 @@ detect = conn.execute(
          AND id NOT IN (SELECT DISTINCT capture_id FROM vehicle_instances)""").fetchone()[0]
 embed = conn.execute(
     """SELECT COUNT(*) FROM captures
-       WHERE coalesce(vehicle_crop_path,'')!='' AND reid_embedding IS NULL""").fetchone()[0]
+       WHERE coalesce(capture_status,'vehicle')!='no_vehicle'
+         AND coalesce(vehicle_crop_path,'')!=''
+         AND (reid_embedding IS NULL
+              OR attr_model_version IS NULL
+              OR lpr_attempted_at IS NULL)""").fetchone()[0]
 conn.close()
 print(detect + embed)
 PYEOF

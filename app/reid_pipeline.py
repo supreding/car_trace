@@ -269,12 +269,34 @@ class VehicleAttrClassifier:
         }
 
 
+def resolve_active_reid_weights(requested: Path) -> tuple[Path, str]:
+    """解析实际启用的 FastReID 权重路径与版本标识。
+
+    若命令行指向默认基线权重（veri_sbs_R50-ibn.pth），且同目录下存在由
+    finetune_reid.py 验证并激活的 active_reid.json，则自动切换至微调权重。
+    """
+    req = Path(requested).resolve()
+    active_meta = req.parent / "active_reid.json"
+    if req.name == "veri_sbs_R50-ibn.pth" and active_meta.is_file():
+        try:
+            meta = json.loads(active_meta.read_text(encoding="utf-8"))
+            cand = Path(meta.get("weights", ""))
+            if not cand.is_absolute():
+                cand = (req.parent / cand).resolve()
+            if cand.is_file():
+                ver = str(meta.get("model_version") or f"fastreid:{cand.name}")
+                return cand, ver
+        except Exception:
+            pass
+    return req, f"fastreid:{req.name}"
+
+
 class FastReIDExtractor:
     """使用 FastReID DefaultPredictor 生成归一化 embedding。"""
 
     def __init__(self, config_file: Path, weights: Path, device: str = "cuda:0"):
         self.config_file = Path(config_file).resolve()
-        self.weights = Path(weights).resolve()
+        self.weights, self.model_version = resolve_active_reid_weights(weights)
         if not self.config_file.is_file():
             raise FileNotFoundError(f"FastReID 配置不存在：{self.config_file}")
         if not self.weights.is_file():
@@ -293,7 +315,6 @@ class FastReIDExtractor:
         cfg.freeze()
         self.cfg = cfg
         self.predictor = DefaultPredictor(cfg)
-        self.model_version = f"fastreid:{self.weights.name}"
 
     def extract(self, image: Image.Image) -> np.ndarray:
         import cv2
@@ -594,10 +615,17 @@ def attr_pass(
     db.isolation_level = None
     db.row_factory = sqlite3.Row
     where = ("vehicle_crop_path IS NOT NULL "
+             "AND coalesce(capture_status,'vehicle')!='no_vehicle' "
              "AND coalesce(park,'') NOT LIKE :qpark")
     if not force:
         where += " AND attr_model_version IS NULL"
-    sql = f"SELECT id, vehicle_crop_path FROM captures WHERE {where} ORDER BY id"
+    sql = (f"SELECT c.id, c.vehicle_crop_path, "
+           f"coalesce(ca.corrected_color,'') AS man_color, "
+           f"coalesce(ca.corrected_type,'') AS man_type "
+           f"FROM captures c "
+           f"LEFT JOIN capture_annotations ca ON ca.capture_id=c.id "
+           f"WHERE {where.replace('vehicle_crop_path', 'c.vehicle_crop_path').replace('capture_status', 'c.capture_status').replace('park', 'c.park').replace('attr_model_version', 'c.attr_model_version')} "
+           f"ORDER BY c.id")
     params: dict[str, Any] = {"qpark": build_db.QUARANTINE_PARK_LIKE}
     if limit:
         sql += " LIMIT :limit"
@@ -615,12 +643,27 @@ def attr_pass(
             with Image.open(crop_path) as opened:
                 crop = ImageOps.exif_transpose(opened).convert("RGB")
             result = attr.predict(crop)
+            # 人工已标的颜色/车型不被自动属性覆盖
+            man_color = build_db.normalize_color(row["man_color"])
+            man_type = build_db.normalize_type(row["man_type"])
+            final_color = man_color or (result["color"] or None)
+            final_color_conf = 1.0 if man_color else result["color_conf"]
+            final_type = man_type or (result["type"] or None)
+            final_type_conf = 1.0 if man_type else result["type_conf"]
             db.execute(
                 """UPDATE captures SET vehicle_color=?, vehicle_color_conf=?,
                           vehicle_type=?, vehicle_type_conf=?, attr_model_version=?
                    WHERE id=?""",
-                (result["color"] or None, result["color_conf"],
-                 result["type"] or None, result["type_conf"],
+                (final_color, final_color_conf,
+                 final_type, final_type_conf,
+                 attr.model_version, capture_id),
+            )
+            db.execute(
+                """UPDATE vehicle_instances SET vehicle_color=?, vehicle_color_conf=?,
+                          vehicle_type=?, vehicle_type_conf=?, attr_model_version=?
+                   WHERE capture_id=? AND instance_index=0""",
+                (final_color, final_color_conf,
+                 final_type, final_type_conf,
                  attr.model_version, capture_id),
             )
             processed += 1
@@ -1424,23 +1467,33 @@ def embed_pass(
     extractor: "FastReIDExtractor",
     limit: int = 0,
     force: bool = False,
+    refresh_stale: bool = True,
 ) -> dict[str, int]:
-    """阶段二（FastReID）：对已有裁剪图提取 embedding。本阶段不 import paddle。"""
+    """阶段二（FastReID）：对已有裁剪图提取 embedding。本阶段不 import paddle。
+
+    当激活了微调后的新权重（reid_model_version 变化）时，refresh_stale=True 会自动
+    把旧版本特征一并升级到新模型特征。
+    """
     db = sqlite3.connect(db_path, timeout=60)
     db.isolation_level = None
     db.row_factory = sqlite3.Row
     where = ("coalesce(capture_status,'vehicle')!='no_vehicle' "
              "AND vehicle_crop_path IS NOT NULL "
              "AND coalesce(park,'') NOT LIKE ?")
-    where += " AND reid_embedding IS NULL" if not force else ""
+    params_list: list[Any] = [build_db.QUARANTINE_PARK_LIKE]
+    if not force:
+        if refresh_stale:
+            where += " AND (reid_embedding IS NULL OR coalesce(reid_model_version,'')!=?)"
+            params_list.append(extractor.model_version)
+        else:
+            where += " AND reid_embedding IS NULL"
     sql = f"SELECT id, vehicle_crop_path FROM captures WHERE {where} ORDER BY id"
-    params: tuple[Any, ...] = (build_db.QUARANTINE_PARK_LIKE,)
     if limit:
         sql += " LIMIT ?"
-        params = (limit,)
-    rows = db.execute(sql, params).fetchall()
+        params_list.append(limit)
+    rows = db.execute(sql, tuple(params_list)).fetchall()
     processed = skipped = 0
-    print(f"[embed] 开始处理 {len(rows)} 张裁剪：FastReID 提取归一化特征。", flush=True)
+    print(f"[embed] 开始处理 {len(rows)} 张裁剪：FastReID ({extractor.model_version}) 提取归一化特征。", flush=True)
     for row in rows:
         capture_id = int(row["id"])
         crop_path = resolve_crop_path(db_path, row["vehicle_crop_path"])
@@ -1467,13 +1520,22 @@ def embed_pass(
             print(f"[embed] 跳过抓拍 #{capture_id}: {exc}", flush=True)
 
     # ---- 同帧其他车辆实例的特征（每车一条记录）----
+    if force:
+        inst_cond = "1=1"
+        inst_params: tuple[Any, ...] = (build_db.QUARANTINE_PARK_LIKE,)
+    elif refresh_stale:
+        inst_cond = "(reid_embedding IS NULL OR coalesce(reid_model_version,'')!=?)"
+        inst_params = (extractor.model_version, build_db.QUARANTINE_PARK_LIKE)
+    else:
+        inst_cond = "reid_embedding IS NULL"
+        inst_params = (build_db.QUARANTINE_PARK_LIKE,)
     inst_rows = db.execute(
-        """SELECT id, crop_path FROM vehicle_instances
-           WHERE reid_embedding IS NULL
+        f"""SELECT id, crop_path FROM vehicle_instances
+           WHERE {inst_cond}
              AND capture_id NOT IN (SELECT id FROM captures
                                     WHERE coalesce(park,'') LIKE ?)
            ORDER BY id""",
-        (build_db.QUARANTINE_PARK_LIKE,),
+        inst_params,
     ).fetchall()
     inst_processed = 0
     if inst_rows:
@@ -1557,7 +1619,8 @@ def main() -> None:
         forward = [arg for arg in sys.argv[1:] if not arg.startswith("--stage")]
         stages = ["detect", "plate", "embed"]
         if not any(a == "--no-attr" for a in forward):
-            stages.insert(1, "correct")  # 属性复核依赖 detect 产出的共识
+            # attr 增量补算人工重框后清空属性的帧（无待补帧时 0 耗时），再跑 correct 复核
+            stages = ["detect", "attr", "correct", "plate", "embed"]
         for stage in stages:
             result = subprocess.run(
                 [sys.executable, str(Path(__file__).resolve()), "--stage", stage, *forward],

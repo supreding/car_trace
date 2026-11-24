@@ -2,543 +2,1271 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<title>标注工作台</title>
+<title>统一人工标注工作台 · 车辆聚类纠偏与模型微调</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   :root {
     --bg: #0f172a; --panel: #1e293b; --panel2: #172033; --line: #334155;
     --text: #e2e8f0; --muted: #94a3b8; --blue: #3b82f6; --blue-soft: #1e3a5f;
-    --green: #16a34a; --amber: #d97706; --red: #dc2626; --purple: #7c3aed;
+    --green: #16a34a; --teal: #0f766e; --amber: #d97706; --red: #dc2626; --purple: #7c3aed;
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--text);
-         font: 14px/1.5 "Microsoft YaHei", system-ui, sans-serif; }
-  header { display: flex; align-items: center; gap: 10px; padding: 10px 16px;
-           background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5; }
-  header h1 { font-size: 16px; margin: 0; }
+         font: 13px/1.45 "Microsoft YaHei", system-ui, sans-serif; }
+  header { display: flex; align-items: center; gap: 10px; padding: 7px 14px; flex-wrap: wrap;
+           background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 10; }
+  header h1 { font-size: 15px; margin: 0; white-space: nowrap; }
+  .tabs { display: flex; gap: 4px; background: var(--panel2); padding: 3px; border-radius: 8px; border: 1px solid var(--line); }
+  .tab-btn { background: transparent; border: 0; color: var(--muted); padding: 4px 12px; border-radius: 6px;
+             cursor: pointer; font-weight: 600; }
+  .tab-btn:hover { color: var(--text); }
+  .tab-btn.active { background: var(--blue); color: #fff; }
   header .spacer { flex: 1; }
   input, select, textarea, button {
     background: var(--panel2); color: var(--text); border: 1px solid var(--line);
     border-radius: 6px; padding: 4px 8px; font: inherit;
   }
   button { cursor: pointer; }
+  button:hover:not(:disabled) { filter: brightness(1.12); }
+  button:disabled { opacity: .4; cursor: not-allowed; }
   button.primary { background: var(--blue); border-color: var(--blue); color: #fff; }
-  button.warn { background: var(--red); border-color: var(--red); color: #fff; }
-  .badge { display: inline-block; font-size: 11px; border-radius: 9px; padding: 1px 8px;
-           background: var(--panel2); border: 1px solid var(--line); color: var(--muted); }
-  .badge.green { color: var(--green); border-color: #bbf7d0; background: #f0fdf4; }
-  .badge.amber { color: var(--amber); border-color: #fde68a; background: #fffbeb; }
-  .badge.red { color: var(--red); border-color: #fecaca; background: #fef2f2; }
-  .badge.blue { color: #60a5fa; border-color: #bfdbfe; background: #eff6ff; }
-  .badge.purple { color: #a78bfa; border-color: #ddd6fe; background: #f5f3ff; }
-  .badge.manual { color: #facc15; border-color: #facc15; }
-
-  .layout { display: grid; grid-template-columns: 300px 1fr 340px; gap: 10px; padding: 10px; }
-  .col { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
-         overflow: auto; max-height: calc(100vh - 120px); }
-  .col h3 { margin: 0; padding: 8px 10px; font-size: 13px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--panel); }
-  .qitem { padding: 8px 10px; border-bottom: 1px solid var(--line); cursor: pointer; }
-  .qitem:hover { background: var(--panel2); }
-  .qitem.active { background: var(--blue-soft); }
-  .qitem .t { font-weight: 600; }
-  .qitem .s { font-size: 12px; color: var(--muted); }
-
-  .order-head { padding: 10px; border-bottom: 1px solid var(--line); }
-  .order-head .sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
-  .film { display: flex; gap: 6px; overflow-x: auto; padding: 8px 10px; border-bottom: 1px solid var(--line); }
-  .film .frame { position: relative; flex: 0 0 auto; cursor: pointer; border: 2px solid transparent; border-radius: 6px; }
-  .film .frame.active { border-color: var(--blue); }
-  .film img { height: 72px; display: block; border-radius: 4px; }
-  .film .mark { position: absolute; top: 2px; left: 2px; }
-  .stagebox { position: relative; text-align: center; }
-  .stagebox img { max-width: 100%; max-height: 52vh; display: block; margin: 0 auto; border-radius: 6px; }
-  .stagebox canvas { position: absolute; inset: 0; margin: auto; cursor: crosshair; }
-  .stage-meta { font-size: 12px; color: var(--muted); padding: 6px 10px; }
-  .sec { border-bottom: 1px solid var(--line); padding: 8px 10px; }
-  .sec h4 { margin: 0 0 6px; font-size: 12px; color: var(--muted); }
-  .sec label { display: block; font-size: 12px; color: var(--muted); margin: 4px 0 2px; }
-  .sec .row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
-  .sec input[type=text], .sec input[type=time], .sec select, .sec textarea { width: 100%; }
-  .sec .half { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
-  .radios { display: grid; grid-template-columns: 1fr 1fr; gap: 2px; font-size: 13px; }
-  .radios label { display: flex; gap: 4px; align-items: center; margin: 0; color: var(--text); }
+  button.same { background: var(--teal); border-color: var(--teal); color: #fff; font-weight: 600; }
+  button.diff { background: var(--red); border-color: var(--red); color: #fff; font-weight: 600; }
+  button.uncertain { background: var(--amber); border-color: var(--amber); color: #fff; }
+  button.success { background: var(--green); border-color: var(--green); color: #fff; font-weight: 600; }
+  .badge { display: inline-block; font-size: 11px; border-radius: 9px; padding: 1px 7px;
+           background: var(--panel2); border: 1px solid var(--line); color: var(--muted); white-space: nowrap; }
+  .badge.green { color: #86efac; border-color: #166534; background: #052e16; }
+  .badge.amber { color: #fcd34d; border-color: #92400e; background: #451a03; }
+  .badge.red { color: #fca5a5; border-color: #991b1b; background: #450a0a; }
+  .badge.blue { color: #93c5fd; border-color: #1d4ed8; background: #172554; }
+  .badge.purple { color: #c4b5fd; border-color: #6d28d9; background: #2e1065; }
+  .badge.manual { color: #fde047; border-color: #ca8a04; background: #422006; }
   .kbd { color: var(--muted); font-size: 11px; }
-  .toast { position: fixed; left: 50%; bottom: 30px; transform: translateX(-50%);
-           background: var(--panel); border: 1px solid var(--line); padding: 8px 16px;
-           border-radius: 8px; display: none; z-index: 50; }
-  .empty { padding: 20px; color: var(--muted); text-align: center; }
-  .anchors .a { display: flex; gap: 6px; align-items: center; font-size: 12px; padding: 2px 0; }
+  .empty { padding: 22px 12px; color: var(--muted); text-align: center; }
+
+  .tab-pane { display: none; }
+  .tab-pane.active { display: block; }
+
+  /* 顶部精简状态条 */
+  .subbar { display: flex; gap: 10px; padding: 6px 12px; align-items: center; flex-wrap: wrap;
+            border-bottom: 1px solid var(--line); background: #131c2e; }
+
+  /* 核心单页工作区：左队列 + 右视觉对比工作区 */
+  .work-grid { display: grid; grid-template-columns: 268px 1fr; gap: 10px; padding: 10px;
+               height: calc(100vh - 96px); }
+  .pane { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+          display: flex; flex-direction: column; overflow: hidden; min-width: 0; }
+  .pane-head { padding: 7px 10px; border-bottom: 1px solid var(--line); display: flex;
+               align-items: center; gap: 6px; font-weight: 600; font-size: 13px; background: var(--panel); }
+
+  /* 左侧待标注队列 */
+  .q-filters { padding: 8px; border-bottom: 1px solid var(--line); display: flex; flex-direction: column; gap: 6px; }
+  .q-filters select { width: 100%; }
+  .q-list { overflow: auto; flex: 1; padding: 4px; }
+  .q-card { display: grid; grid-template-columns: 72px 1fr; gap: 7px; padding: 6px; border: 1px solid transparent;
+            border-radius: 7px; cursor: pointer; border-bottom: 1px solid rgba(51,65,85,.5); }
+  .q-card:hover { background: var(--panel2); }
+  .q-card.active { border-color: var(--blue); background: var(--blue-soft); }
+  .q-card img { width: 72px; height: 54px; object-fit: cover; border-radius: 5px; background: #070c16; }
+  .q-card.order-only { grid-template-columns: 1fr; }
+
+  /* 右侧视觉主区：同单胶片条 + 顶部50/50双图对比 + 底部全宽候选画廊 */
+  .right-stack { display: flex; flex-direction: column; gap: 8px; min-width: 0; overflow: hidden; }
+  .film-strip { display: none; gap: 6px; overflow-x: auto; padding: 6px 8px;
+                background: var(--panel); border: 1px solid var(--line); border-radius: 8px; align-items: center; }
+  .film-strip.show { display: flex; }
+  .film-item { position: relative; flex: 0 0 auto; cursor: pointer; border: 2px solid transparent; border-radius: 6px; }
+  .film-item.active { border-color: var(--blue); }
+  .film-item img { height: 54px; display: block; border-radius: 4px; background: #070c16; }
+  .film-item .mark { position: absolute; top: 2px; left: 2px; font-size: 10px; padding: 0 4px; }
+
+  /* 顶部 50/50 双图并排对比舞台 */
+  .stage-card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+                display: flex; flex-direction: column; flex: 0 0 auto; overflow: hidden; }
+  .pair-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 8px 10px; }
+  .side-box { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
+              padding: 7px 9px; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+  .side-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 12px; }
+  .img-wrap { position: relative; background: #070c16; border-radius: 6px; overflow: hidden;
+              height: 30vh; min-height: 205px; max-height: 360px; display: flex; align-items: center; justify-content: center; }
+  .img-wrap img { max-width: 100%; max-height: 100%; object-fit: contain; display: block; cursor: zoom-in; }
+  .img-wrap canvas { position: absolute; cursor: crosshair; }
+
+  /* 精简核心提准表单行 */
+  .core-form { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .core-form input[type=text] { width: 112px; font-weight: 600; }
+  .core-form select { padding: 4px 6px; }
+  .inst-strip { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; font-size: 12px;
+                padding: 4px 6px; background: rgba(30,58,95,.35); border-radius: 6px; border: 1px dashed var(--blue); }
+  .inst-pill { display: inline-flex; align-items: center; gap: 5px; background: var(--panel);
+               border: 1px solid var(--line); border-radius: 6px; padding: 2px 6px; }
+  .inst-pill img { width: 42px; height: 30px; object-fit: cover; border-radius: 3px; }
+
+  /* 对比操作栏 */
+  .pair-actions { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .stage-footer { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 6px 10px;
+                  border-top: 1px solid var(--line); background: var(--panel2); font-size: 12px; }
+
+  /* 底部全宽大卡片相似候选画廊 */
+  .gallery-card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+                  display: flex; flex-direction: column; flex: 1; min-height: 210px; overflow: hidden; }
+  .cand-grid { overflow: auto; flex: 1; padding: 10px; display: grid;
+               grid-template-columns: repeat(auto-fill, minmax(var(--cand-w, 240px), 1fr));
+               gap: 10px; align-content: start; }
+  .cand-card { border: 2px solid var(--line); border-radius: 8px; overflow: hidden; cursor: pointer;
+               background: var(--panel2); position: relative; transition: border-color .12s, transform .12s; }
+  .cand-card:hover { border-color: #60a5fa; transform: translateY(-1px); }
+  .cand-card.selected { border-color: #3b82f6; box-shadow: 0 0 0 2px rgba(59,130,246,.38); }
+  .cand-card img { width: 100%; height: var(--cand-h, 168px); object-fit: var(--cand-fit, contain);
+                   display: block; background: #070c16; }
+  .cand-score { position: absolute; right: 6px; top: 6px; background: rgba(15,23,42,.88); color: #fff;
+                padding: 2px 7px; border-radius: 9px; font-size: 12px; font-weight: 700; border: 1px solid rgba(148,163,184,.35); }
+  .cand-rel { position: absolute; left: 6px; top: 6px; color: #fff; padding: 2px 7px; border-radius: 9px; font-size: 11px; font-weight: 600; }
+  .cand-rel.same { background: var(--teal); }
+  .cand-rel.different { background: var(--red); }
+  .cand-rel.uncertain { background: var(--amber); }
+
+  /* 训练与微调面板 */
+  .train-wrap { max-width: 1200px; margin: 14px auto; padding: 0 14px 24px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; margin-bottom: 12px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
+  .card h4 { margin: 0 0 8px; font-size: 14px; color: #f8fafc; display: flex; justify-content: space-between; align-items: center; }
+  .metric-big { font-size: 22px; font-weight: 700; color: #60a5fa; }
+  .tbl { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 12px; }
+  .tbl th, .tbl td { border: 1px solid var(--line); padding: 6px 8px; text-align: left; }
+  .tbl th { background: var(--panel2); color: var(--muted); }
+  .logbox { background: #090e1a; border: 1px solid var(--line); border-radius: 6px; padding: 10px;
+            font-family: Consolas, monospace; font-size: 12px; max-height: 260px; overflow: auto; white-space: pre-wrap; color: #cbd5e1; }
+
+  /* 弹窗（订单进度高级抽屉 / 标注记录 / 原图放大） */
+  .overlay { display: none; position: fixed; inset: 0; background: rgba(2,6,23,.82); z-index: 45;
+             overflow: auto; padding: 24px; align-items: center; justify-content: center; }
+  .overlay.show { display: flex; }
+  .dialog { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+            width: 100%; max-width: 720px; padding: 16px; max-height: 90vh; overflow: auto; }
+  .dialog.wide { max-width: 1120px; }
+  .sec { border-top: 1px solid var(--line); padding-top: 10px; margin-top: 10px; }
+  .sec h4 { margin: 0 0 6px; font-size: 13px; color: #cbd5e1; }
+  .half { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .radios { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; }
+  .radios label { display: flex; gap: 4px; align-items: center; }
+
+  .modal { display: none; position: fixed; inset: 0; background: rgba(2,6,23,.9); z-index: 55;
+           align-items: center; justify-content: center; padding: 20px; }
+  .modal.show { display: flex; }
+  .modal img { max-width: 94vw; max-height: 92vh; object-fit: contain; border-radius: 6px; }
+  .modal .close-x { position: absolute; right: 20px; top: 14px; border: 0; background: none; color: #fff; font-size: 28px; cursor: pointer; }
+
+  .toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);
+           background: #1e3a5f; border: 1px solid #60a5fa; color: #fff; padding: 8px 16px;
+           border-radius: 8px; display: none; z-index: 70; box-shadow: 0 6px 20px rgba(0,0,0,.5); }
+  @media (max-width: 1120px) {
+    .work-grid { grid-template-columns: 1fr; height: auto; }
+    .pair-grid { grid-template-columns: 1fr; }
+  }
 </style>
 </head>
 <body>
 <header>
-  <h1>标注工作台</h1>
-  <span class="kbd">←/→ 切换订单 · 1-6 状态 · S 保存标注 · B 开始框选 · 回车 应用框选 · R 标记复核</span>
+  <h1>统一人工标注工作台</h1>
+  <div class="tabs">
+    <button class="tab-btn" id="tabBtn-work" onclick="switchTab('work')">① 标注与同车对比</button>
+    <button class="tab-btn" id="tabBtn-train" onclick="switchTab('train')">② 模型微调与训练导出</button>
+  </div>
   <div class="spacer"></div>
+  <button onclick="openAdvDialog()" id="advBtn" disabled title="展开订单进度状态/抓拍时间/锚点/机位/手动移车等辅助项">订单进度与高级选项</button>
+  <button onclick="runRecluster()" title="按最新人工车牌/车型/配对约束立即重聚全库车辆">立即全库重聚</button>
+  <button onclick="showRecords()">标注记录</button>
   <label class="kbd">标注人</label>
-  <input id="annotator" style="width:110px" placeholder="必填">
-  <a href="/" style="color:var(--muted)">返回轨迹页</a>
+  <input id="annotator" style="width:105px" placeholder="必填">
+  <a href="/" style="color:var(--muted);text-decoration:none">返回轨迹页</a>
 </header>
 
-<div class="toolbar" style="display:flex; gap:8px; padding:8px 10px; align-items:center;">
-  <span class="kbd">队列：</span>
-  <select id="qtype" onchange="loadQueue()">
-    <option value="assumed">订单：推定状态（待确认）</option>
-    <option value="empty">订单：无有效事件</option>
-    <option value="all">订单：全部</option>
-    <option value="reviewed">订单：已复核</option>
-    <option value="direction_unknown">照片：大门方向未知</option>
-    <option value="plate_missing">照片：车牌未识别</option>
-    <option value="attr_low">照片：颜色/车型低置信</option>
-    <option value="attr_review">照片：属性冲突待复核</option>
-    <option value="time_missing">照片：时间缺失/不确定</option>
-  </select>
-  <select id="parkSel" style="width:auto" onchange="loadQueue()"></select>
-  <button onclick="loadQueue()">刷新队列</button>
-  <button onclick="showRecords()">标注记录</button>
-  <span id="qcount" class="kbd"></span>
-</div>
-
-<div class="layout">
-  <div class="col" id="queueCol"><h3>待标注队列</h3><div id="queue"><div class="empty">加载中…</div></div></div>
-
-  <div class="col" id="workCol">
-    <div id="orderHead" class="order-head"><div class="empty">从左侧选择订单</div></div>
-    <div id="film" class="film"></div>
-    <div id="stageArea" class="stagebox"><div class="empty">选择一张照片</div></div>
-    <div id="stageMeta" class="stage-meta"></div>
-    <div style="padding:6px 10px">
-      <button onclick="startBox()" id="boxStartBtn">① 开始框选（点击此按钮，或按下键盘 B 键）</button>
-      <button class="primary" onclick="saveBox()" id="boxApplyBtn" disabled>② 应用框选（点击此按钮，或按下键盘 回车键）</button>
-      <button onclick="cancelBox()">取消（按下键盘 Esc 键）</button>
-      <div><span id="boxHint" class="kbd"></span></div>
-    </div>
+<!-- ======================== TAB 1: 一体化标注与同车对比 ======================== -->
+<div id="tab-work" class="tab-pane">
+  <div class="subbar">
+    <span id="reidStats" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap"></span>
+    <div style="flex:1"></div>
+    <label style="display:flex;align-items:center;gap:4px;cursor:pointer">
+      <input type="checkbox" id="reidFullImg" onchange="toggleImgMode()">
+      <span>对比切完整原图 (F)</span>
+    </label>
+    <label style="display:flex;align-items:center;gap:4px;cursor:pointer">
+      <input type="checkbox" id="reidSyncCluster" checked>
+      <span>同车/异车实时联动聚类</span>
+    </label>
+    <a class="badge blue" href="/api/annotations/export.csv" style="text-decoration:none;padding:3px 9px">导出 ReID CSV</a>
   </div>
 
-  <div class="col" id="panelCol">
-    <h3>标注面板 · <span id="capId" class="kbd"></span></h3>
-    <div id="panel">
-      <div class="sec">
-        <h4>进度状态（按键盘数字 1-6 直接选择；保存后标"人工"）</h4>
-        <div class="radios" id="statusRadios"></div>
-        <div class="row" style="margin-top:4px">
-          <button onclick="setStatus('')">清除人工状态</button>
-          <span id="statusNow" class="kbd"></span>
+  <div class="work-grid">
+    <!-- 左侧统一队列 -->
+    <section class="pane">
+      <div class="pane-head">
+        <span>待标注队列</span>
+        <span class="badge blue" id="qCount">0</span>
+        <div style="flex:1"></div>
+        <button onclick="loadQueue()" style="padding:2px 7px;font-size:12px">刷新</button>
+      </div>
+      <div class="q-filters">
+        <select id="qtype" onchange="loadQueue()">
+          <optgroup label="★ 提准确率优先（最影响聚类与 ReID 微调）">
+            <option value="cluster_split">聚类冲突 / 待人工归组</option>
+            <option value="loose">未关联散图（无订单归属）</option>
+            <option value="plate_missing">车牌未识别</option>
+            <option value="no_plate_order">无车牌孤立订单</option>
+            <option value="reid_unlabeled">待做同车对比（ReID 未标）</option>
+            <option value="reid_assigned">已分组真值车辆（ReID）</option>
+            <option value="reid_all">全部有效抓拍（ReID）</option>
+          </optgroup>
+          <optgroup label="属性与订单进度辅助复核">
+            <option value="attr_low">颜色/车型低置信</option>
+            <option value="attr_review">属性冲突待复核</option>
+            <option value="assumed">订单：推定状态</option>
+            <option value="direction_unknown">大门方向未知</option>
+            <option value="time_missing">时间缺失/不确定</option>
+            <option value="all">订单：全部</option>
+          </optgroup>
+        </select>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:5px">
+          <select id="parkSel" onchange="loadQueue()"></select>
+          <select id="stageSel" onchange="loadQueue()"></select>
         </div>
       </div>
-      <div class="sec">
-        <h4>车辆属性 / 车牌 / 有无车 / 时间</h4>
-        <div class="half">
-          <div><label>颜色</label><select id="f_color"></select></div>
-          <div><label>车型</label><select id="f_type"></select>
+      <div class="q-list" id="queueList"><div class="empty">加载中…</div></div>
+    </section>
+
+    <!-- 右侧一体化视觉对比 + 核心修正工作区 -->
+    <div class="right-stack">
+      <!-- 同订单胶片条（所属真实订单多张照片时显示，便于一眼确认同单其他视角） -->
+      <div class="film-strip" id="orderFilm"></div>
+
+      <!-- 顶部 50/50 双图等大并排对比区 -->
+      <section class="stage-card">
+        <div class="pair-grid">
+          <!-- 左半屏：当前抓拍 + 核心提准修正（框选 / 切主车 / 车牌 / 车型 / 误检） -->
+          <div class="side-box">
+            <div class="side-head">
+              <span class="badge blue" id="curIdBadge">未选择</span>
+              <b id="curPlateTitle">—</b>
+              <span class="badge" id="curVehBadge">未归组</span>
+              <span class="badge green" id="curIdentityBadge">未分组</span>
+              <div style="flex:1"></div>
+              <button onclick="startBox()" id="boxStartBtn" disabled style="padding:2px 7px">画框重裁 (B)</button>
+              <button class="primary" onclick="saveBox()" id="boxApplyBtn" style="display:none;padding:2px 7px">应用框选 (回车)</button>
+              <button onclick="cancelBox()" id="boxCancelBtn" style="display:none;padding:2px 7px">取消</button>
+              <button onclick="if(S.cur)openImgModal(S.cur.id)" id="curZoomBtn" disabled style="padding:2px 7px">放大</button>
+            </div>
+            <div class="img-wrap" id="curImgWrap">
+              <div class="empty">从左侧选择一张抓拍开始</div>
+            </div>
+            <div id="curMetaLine" class="kbd" style="min-height:16px"></div>
+            <div id="curInstStrip" class="inst-strip" style="display:none"></div>
+            <div class="core-form">
+              <input type="text" id="f_plate" placeholder="确认车牌 (皖K...)">
+              <select id="f_type" title="车型（标准码，防误拆聚类）"></select>
+              <select id="f_color" title="颜色（标准码）"></select>
+              <label style="display:flex;align-items:center;gap:3px;cursor:pointer;white-space:nowrap">
+                <input type="checkbox" id="f_noveh"> 误检无车
+              </label>
+              <button class="primary" onclick="saveCoreFields()" id="saveCoreBtn" disabled>保存修正 (W)</button>
+            </div>
+          </div>
+
+          <!-- 右半屏：当前选中相似候选（等大并排） + 高频同车/不同车判定 -->
+          <div class="side-box">
+            <div class="side-head">
+              <span class="badge purple" id="candRankBadge">候选对比</span>
+              <b id="candPlateTitle">—</b>
+              <span class="badge" id="candVehBadge" style="display:none"></span>
+              <span class="badge" id="candRelBadge" style="display:none"></span>
+              <div style="flex:1"></div>
+              <button onclick="if(S.sel)openImgModal(S.sel.id)" id="candZoomBtn" disabled style="padding:2px 7px">放大</button>
+            </div>
+            <div class="img-wrap" id="candImgWrap">
+              <div class="empty">点击下方候选卡片，与左图等大并排对比</div>
+            </div>
+            <div id="candMetaLine" class="kbd" style="min-height:16px">提示：细看车头贴字、保险杠、栏板、挂车细节；标「不同车」沉淀高价值硬负样本</div>
+            <div class="pair-actions">
+              <button class="same" id="rSameBtn" onclick="savePair('same')" disabled>同一辆车 (S)</button>
+              <button class="diff" id="rDiffBtn" onclick="savePair('different')" disabled>不同车辆 (D)</button>
+              <button class="uncertain" id="rUncBtn" onclick="savePair('uncertain')" disabled>不确定 (U)</button>
+              <button class="primary" id="rNewBtn" onclick="saveReidAction('new_identity')" disabled>新建独立车 (N)</button>
+              <button id="rInvBtn" onclick="saveReidAction('clear_identity','invalid')" disabled title="图糊/遮挡不可用于训练">不可用 (X)</button>
+            </div>
           </div>
         </div>
-        <label>车牌（保存即写回 plate_final）</label>
-        <div class="row"><input type="text" id="f_plate" style="flex:1">
-          <select id="f_usability"><option value="valid">有效</option><option value="invalid">无效</option><option value="uncertain">存疑</option></select></div>
-        <label>有无车辆</label>
-        <div class="radios">
-          <label><input type="radio" name="nv" value="0"> 有车</label>
-          <label><input type="radio" name="nv" value="1"> 误检（无车）</label>
+
+        <div class="stage-footer">
+          <button onclick="stepCand(-1)" id="rPrevCand" disabled>← 上一候选</button>
+          <button onclick="stepCand(1)" id="rNextCand" disabled>下一候选 →</button>
+          <button class="success" onclick="nextQueueItem()" id="rNextCapBtn" disabled>完成本张，下一抓拍 (Enter)</button>
+          <span class="kbd" id="boxHint">快捷键：S 同车 · D 不同车 · U 不确定 · ←/→ 切候选 · ↑/↓ 切队列 · W 保存车牌车型 · B 画框 · F 切原图 · Enter 下一抓拍</span>
         </div>
-        <label>抓拍时间（仅时刻，日期不变）</label>
-        <input type="text" id="f_time" placeholder="HH:MM:SS">
-      </div>
-      <div class="sec">
-        <h4>关键时刻确认（可选：整单没问题就跳过这步）</h4>
-        <div class="kbd" style="margin-bottom:6px">用途：系统标了"(推定)"、或照片缺得厉害时间对不上时，你从照片里看明白了实际时刻，就在这里钉下来——保存后系统立刻按它重算这一单的状态。</div>
-        <div class="half">
-          <div><label>确认什么</label><select id="a_kind">
-            <option value="skip" selected>看不出 / 没问题（跳过）</option>
-            <option value="gate_in">车辆几点进的园区</option>
-            <option value="weigh_in">车辆几点上的地磅</option>
-            <option value="unload_done">货几点卸完的</option>
-            <option value="gate_out">车辆几点离园区</option>
-          </select></div>
-          <div><label>时刻（时:分:秒，留空默认取当前选中照片的时间）</label><input type="text" id="a_time"></div>
+      </section>
+
+      <!-- 底部全宽大卡片相似候选画廊 -->
+      <section class="gallery-card">
+        <div class="pane-head">
+          <span>相似候选画廊（FastReID 外观排序）</span>
+          <span class="badge blue" id="candCountBadge">0</span>
+          <span class="kbd">点击任意卡片即刻到右上方等大对比 · S/D/U 自动切下一未标候选</span>
+          <div style="flex:1"></div>
+          <span class="kbd">卡片尺寸：</span>
+          <select id="rCandSize" onchange="applyCandSize(this.value)" style="padding:2px 6px">
+            <option value="md">中图</option>
+            <option value="lg" selected>大图（推荐）</option>
+            <option value="xl">超大对比</option>
+          </select>
+          <select id="rCandFit" onchange="applyCandFit(this.value)" style="padding:2px 6px">
+            <option value="contain" selected>完整显示整车</option>
+            <option value="cover">铺满裁剪</option>
+          </select>
         </div>
-        <div class="row" style="margin-top:4px">
-          <button class="primary" onclick="addAnchor()">保存这条确认</button>
-          <button onclick="markReviewed()">R 整单没问题，标记已复核并下一单</button>
-        </div>
-        <div class="anchors" id="anchorList"></div>
-      </div>
-      <div class="sec">
-        <h4>机位字典（每台设备标一次：Camera 01 这类无名设备归位）</h4>
-        <label>设备名（默认取本张 OSD/相机）</label>
-        <input type="text" id="d_device">
-        <div class="half">
-          <div><label>机位</label><select id="d_location">
-            <option>大门</option><option>入磅地磅</option><option>出磅地磅</option>
-            <option>卸货区</option><option>场院</option><option>其他</option>
-          </select></div>
-          <div><label>固定方向</label><select id="d_direction">
-            <option value="">无/双向</option><option value="in">进</option><option value="out">出</option>
-          </select></div>
-        </div>
-        <div class="row" style="margin-top:4px"><button onclick="saveDevice()">登记机位</button></div>
-        <div id="deviceList" class="anchors"></div>
-      </div>
-      <div class="sec">
-        <h4>备注</h4>
-        <textarea id="f_notes" rows="2"></textarea>
-        <div class="row" style="margin-top:6px">
-          <button class="primary" onclick="savePanel()">S 保存全部标注</button>
-          <span id="savedBy" class="kbd"></span>
-        </div>
-      </div>
+        <div class="cand-grid" id="candGrid"><div class="empty" style="grid-column:1/-1">尚未选择抓拍</div></div>
+      </section>
     </div>
   </div>
 </div>
-<div id="recordsOverlay" style="display:none; position:fixed; inset:0; background:rgba(2,6,23,.78); z-index:40; overflow:auto; padding:24px">
-  <div style="background:var(--panel); border:1px solid var(--line); border-radius:10px; max-width:1150px; margin:0 auto; padding:14px">
-    <div style="display:flex; gap:8px; align-items:center; margin-bottom:10px">
-      <h2 style="font-size:16px; margin:0">人工标注记录（全部，最新在前）</h2>
+
+<!-- ======================== TAB 2: 模型微调与训练导出 ======================== -->
+<div id="tab-train" class="tab-pane">
+  <div class="train-wrap">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap">
+      <h2 style="margin:0;font-size:17px">标注沉淀 → 留出集对比验证 → FastReID 一键微调与训练集导出</h2>
+      <div style="flex:1"></div>
+      <button onclick="loadTrainingSummary()">刷新状态</button>
+    </div>
+
+    <div class="cards" id="trainCards"><div class="card">加载中…</div></div>
+
+    <div class="card" style="margin-bottom:12px">
+      <h4>
+        <span>FastReID 外观模型原地微调（PyTorch · 验证通过自动上线）</span>
+        <span id="activeModelBadge" class="badge blue">加载中</span>
+      </h4>
+      <div class="kbd" style="margin-bottom:8px">
+        微调自动融合：<b>人工车牌 + 人工合并 + 干净框选 + 同车正样本(S) + 2.5× 异车硬负样本(D)</b> + 可选高置信车牌底盘。
+        按车辆身份严格切分 8:2 留出集，只有验证集 <code>ROC-AUC</code> 与 <code>Margin</code> 严格高于基线才写入 <code>active_reid.json</code> 自动生效。
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+        <label style="display:flex;align-items:center;gap:4px">轮数 Epochs
+          <input type="number" id="ftEpochs" value="10" min="2" max="40" style="width:64px">
+        </label>
+        <label style="display:flex;align-items:center;gap:4px;cursor:pointer">
+          <input type="checkbox" id="ftManualOnly"> 纯人工标注（不混高置信车牌底盘）
+        </label>
+        <label style="display:flex;align-items:center;gap:4px;cursor:pointer">
+          <input type="checkbox" id="ftReembed" checked> 达标激活后自动重刷全库特征并重聚
+        </label>
+        <button onclick="triggerFinetune(true)" id="btnEvalOnly">仅评估基线指标</button>
+        <button class="primary" onclick="triggerFinetune(false)" id="btnFinetune">启动 FastReID 微调</button>
+        <button onclick="rollbackReID()">回退基线权重</button>
+      </div>
+      <div id="reportTable"></div>
+      <div style="margin-top:10px">
+        <div class="kbd" id="jobStatusLine">后台任务：空闲</div>
+        <div class="logbox" id="jobLogs">暂无任务日志。</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h4>导出标准训练数据集（对接 PaddleDetection / PaddleClas / PP-OCR / FastReID）</h4>
+      <div class="kbd" style="margin-bottom:8px">
+        检测（PPYOLOE）、属性（PPLCNet）、车牌（PP-OCRv3）现存为静态推理图（*.pdmodel），攒够 200~300 张标注后点击下方一键导出标准数据集，微调完替换 <code>models/paddledetection/</code> 目录即可。
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <select id="expKind" style="width:auto">
+          <option value="all">全部导出（ReID + 检测 + 属性 + 车牌）</option>
+          <option value="reid">仅 ReID（VeRi 格式 + 人工配对）</option>
+          <option value="detection">仅检测框（COCO JSON）</option>
+          <option value="attr">仅颜色/车型（PPLCNet 19维）</option>
+          <option value="lpr">仅车牌（PP-OCR rec 清单）</option>
+        </select>
+        <button class="success" onclick="exportDataset()">一键导出训练集</button>
+      </div>
+      <div id="exportResult" class="kbd" style="margin-top:8px"></div>
+    </div>
+  </div>
+</div>
+
+<!-- 辅助抽屉弹窗：订单进度状态 / 抓拍时间 / 环节方向 / 关键时刻锚点 / 机位字典 / 手动移车合并 -->
+<div class="overlay" id="advOverlay" onclick="if(event.target===this)closeAdvDialog()">
+  <div class="dialog">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+      <h3 style="margin:0;font-size:15px">订单进度与高级选项 · <span id="advTitle" class="kbd"></span></h3>
+      <div style="flex:1"></div>
+      <button onclick="closeAdvDialog()">关闭 (Esc)</button>
+    </div>
+
+    <div class="sec" style="border-top:0;margin-top:0;padding-top:0">
+      <h4>手动移动 / 合并车辆归属（持久化重放）</h4>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px">
+        <input type="text" id="mv_plate" style="flex:1" placeholder="移入目标车牌（留空=拆为独立车）">
+        <button onclick="doVehicleMove('capture')">移动本张</button>
+        <button onclick="doVehicleMove('order')">移动整单</button>
+      </div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        <input type="text" id="merge_vids" style="flex:1" placeholder="合并多个车辆编号，如 12,18">
+        <button onclick="doVehicleMerge()">人工合并</button>
+      </div>
+    </div>
+
+    <div class="sec">
+      <h4>抓拍时间 / 环节方向 / 进度状态 / 备注</h4>
+      <div class="half" style="margin-bottom:6px">
+        <div>
+          <label class="kbd">环节 / 大门方向</label>
+          <select id="adv_stage" style="width:100%">
+            <option value="">(不改)</option>
+            <option value="入磅">入磅</option><option value="质检">质检</option>
+            <option value="出磅">出磅</option><option value="抓拍">抓拍</option>
+            <option value="人脸">人脸</option>
+            <option value="进大门">进大门（标方向=进）</option>
+            <option value="出大门">出大门（标方向=出）</option>
+          </select>
+        </div>
+        <div>
+          <label class="kbd">抓拍时间（HH:MM:SS）</label>
+          <input type="text" id="adv_time" style="width:100%" placeholder="HH:MM:SS">
+        </div>
+      </div>
+      <div class="radios" id="advStatusRadios" style="margin-bottom:6px"></div>
+      <div style="display:flex;gap:6px;align-items:center;margin-bottom:6px">
+        <select id="adv_usability" style="width:110px">
+          <option value="valid">车牌有效</option><option value="invalid">车牌无效</option><option value="uncertain">车牌存疑</option>
+        </select>
+        <input type="text" id="adv_notes" style="flex:1" placeholder="备注说明">
+        <button onclick="clearAdvStatus()">清人工状态</button>
+        <button class="primary" onclick="saveAdvFields()">保存高级项</button>
+      </div>
+    </div>
+
+    <div class="sec">
+      <h4>订单关键时刻锚点 & 复核标记</h4>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px">
+        <select id="a_kind">
+          <option value="skip">选择锚点类型…</option>
+          <option value="gate_in">进园确认</option><option value="weigh_in">入磅确认</option>
+          <option value="unload_done">卸货完成</option><option value="gate_out">离场确认</option>
+        </select>
+        <input type="text" id="a_time" style="width:120px" placeholder="HH:MM:SS">
+        <button class="primary" onclick="addAnchor()">保存锚点</button>
+        <button onclick="markReviewed()">标记整单已复核</button>
+      </div>
+      <div id="anchorList" class="kbd"></div>
+    </div>
+
+    <div class="sec">
+      <h4>设备机位字典（每台设备标一次）</h4>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px">
+        <input type="text" id="d_device" style="flex:1" placeholder="设备名">
+        <select id="d_location">
+          <option>大门</option><option>入磅地磅</option><option>出磅地磅</option>
+          <option>卸货区</option><option>场院</option><option>其他</option>
+        </select>
+        <select id="d_direction"><option value="">双向/无</option><option value="in">进</option><option value="out">出</option></select>
+        <button onclick="saveDevice()">登记机位</button>
+      </div>
+      <div id="deviceList" class="kbd"></div>
+    </div>
+  </div>
+</div>
+
+<!-- 标注记录弹窗 -->
+<div class="overlay" id="recordsOverlay" onclick="if(event.target===this)closeRecords()">
+  <div class="dialog wide">
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
+      <h2 style="font-size:16px;margin:0">人工标注记录（全部，最新在前）</h2>
       <input id="recAnnotator" placeholder="按标注人过滤" style="width:150px">
       <button onclick="loadRecords()">查询</button>
-      <a id="recCsv" class="badge blue" href="/api/label/records.csv" target="_blank">导出 CSV</a>
+      <a id="recCsv" class="badge blue" href="/api/label/records.csv" target="_blank" style="text-decoration:none">导出 CSV</a>
       <div style="flex:1"></div>
-      <button onclick="closeRecords()">关闭（Esc）</button>
+      <button onclick="closeRecords()">关闭 (Esc)</button>
     </div>
     <div id="recordsBody" style="font-size:13px"></div>
   </div>
 </div>
+
+<!-- 全屏原图放大弹窗 -->
+<div class="modal" id="imgModal" onclick="if(event.target===this||event.target.classList.contains('close-x'))closeImgModal()">
+  <button class="close-x" aria-label="关闭">×</button>
+  <img id="modalImg" alt="原图">
+</div>
+
 <div id="toast" class="toast"></div>
 
 <script>
 "use strict";
+const INITIAL_TAB = {{ (initial_tab or "work") | tojson }};
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const STATUS = ["大门进","等待入磅","入磅中","卸货","出磅中","大门出"];
-const COLORS = ["黄色","橙色","绿色","灰色","红色","蓝色","白色","金色","棕色","黑色"];
-const TYPES = ["轿车","SUV","MPV","面包车","皮卡","货车","客车","罐车","挂车","工程机械"];
-const statusColor = {"大门进":"blue","等待入磅":"amber","入磅中":"green","卸货":"purple","出磅中":"green","大门出":""};
-const ANCHOR_CN = {gate_in: "进园确认", weigh_in: "入磅确认", unload_done: "卸货完成",
-                   gate_out: "离场确认", reviewed: "已复核"};
-const state = { queue: [], qi: -1, type: "assumed", park: "", order: null, items: [], ci: -1,
-                boxMode: false, boxPts: [], imgW: 0, imgH: 0 };
+const ANCHOR_CN = {gate_in:"进园确认",weigh_in:"入磅确认",unload_done:"卸货完成",gate_out:"离场确认",reviewed:"已复核"};
+let COLOR_MAP = {yellow:"黄色",orange:"橙色",green:"绿色",gray:"灰色",red:"红色",blue:"蓝色",white:"白色",golden:"金色",brown:"棕色",black:"黑色"};
+let TYPE_MAP = {sedan:"轿车",suv:"SUV",van:"厢式车",hatchback:"两厢车",mpv:"MPV",pickup:"皮卡",bus:"客车",truck:"货车",estate:"旅行车"};
+const cnColor = v => COLOR_MAP[v] || v || "";
+const cnType = v => TYPE_MAP[v] || v || "";
+const timeOnly = v => v && v.includes(" ") ? v.split(" ")[1] : (v || "时间未知");
 
-function toast(msg) { const t = $("toast"); t.textContent = msg; t.style.display = "block";
-  clearTimeout(t._h); t._h = setTimeout(() => t.style.display = "none", 2600); }
-async function api(url, opts) { const r = await fetch(url, opts); if (!r.ok) {
-  let m; try { m = (await r.json()).error } catch (e) { m = r.statusText } throw new Error(m || r.statusText); }
-  return r.json(); }
-function annotator() { const v = $("annotator").value.trim();
-  if (!v) { toast("请先在右上角填写标注人"); throw new Error("no annotator"); } return v; }
+const S = {
+  tab: "work",
+  qtype: "cluster_split", park: "", stage: "",
+  queue: [], qi: -1, qLevel: "photo",
+  orderItems: [],
+  cur: null,         // 当前抓拍（合并 label state + reid item）
+  labelMeta: null,   // {item, anchors, devices, instances}
+  candidates: [],    // FastReID 相似候选
+  sel: null,         // 当前选中候选
+  boxMode: false, boxPts: [], imgW: 0, imgH: 0,
+  trainTimer: null,
+};
 
-function fillSelect(sel, list, current) {
-  sel.innerHTML = '<option value="">(不改/清空)</option>' +
-    list.map(x => `<option value="${esc(x)}"${x === current ? " selected" : ""}>${esc(x)}</option>`).join("");
+function toast(msg) {
+  const t = $("toast"); t.textContent = msg; t.style.display = "block";
+  clearTimeout(t._h); t._h = setTimeout(() => t.style.display = "none", 2600);
+}
+async function api(url, opts) {
+  const r = await fetch(url, opts);
+  let d = {};
+  try { d = await r.json(); } catch (e) {}
+  if (!r.ok) { const err = new Error(d.error || r.statusText); err.status = r.status; err.data = d; throw err; }
+  return d;
+}
+const post = (url, body) => api(url, { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body) });
+function annotator(required = true) {
+  const v = $("annotator").value.trim();
+  if (required && !v) { toast("请先在右上角填写标注人"); throw new Error("no annotator"); }
+  return v;
+}
+function openImgModal(id) { $("modalImg").src = `/api/image/${id}`; $("imgModal").classList.add("show"); }
+function closeImgModal() { $("imgModal").classList.remove("show"); $("modalImg").src = ""; }
+function fillCodeSelect(sel, mapObj, current, placeholder) {
+  sel.innerHTML = `<option value="">${placeholder}</option>` +
+    Object.entries(mapObj).map(([code, cn]) =>
+      `<option value="${esc(code)}"${code === current ? " selected" : ""}>${esc(cn)}</option>`
+    ).join("");
 }
 
-/* ---------------- 队列 ---------------- */
-async function loadQueue(keepIndex) {
-  state.type = $("qtype").value; state.park = $("parkSel").value;
-  const q = await api(`/api/label/queue?type=${state.type}${state.park ? `&park=${encodeURIComponent(state.park)}` : ""}`);
-  state.queue = q.items; state.level = q.level || "order";
-  state.qi = keepIndex ? Math.min(state.qi, state.queue.length - 1) : -1;
-  const unit = state.level === "photo" ? "张" : "单";
-  $("qcount").textContent = `共 ${q.total} ${unit}${state.type === "reviewed" ? "（已复核）" : ""}`;
-  if (state.level === "photo") {
-    $("queue").innerHTML = state.queue.length ? state.queue.map((it, i) => `
-      <div class="qitem ${i === state.qi ? "active" : ""}" onclick="selectOrder(${i})">
-        <div class="t">#${it.capture_id} <span class="badge">${esc(it.stage || "—")}</span>
-          ${it.plate ? `<span class="badge blue">${esc(it.plate)}</span>` : ""}</div>
-        <div class="s">${esc(it.order_id || "未关联订单")} · ${esc((it.capture_time || it.date || "").slice(0, 16))}</div>
-        <div class="s">${esc(it.reason)}</div>
-      </div>`).join("") : '<div class="empty">队列空 🎉</div>';
-    if (state.qi >= 0) selectOrder(state.qi);
+/* ---------------- 标签切换（仅 2 个：标注与同车对比 / 微调与导出） ---------------- */
+function switchTab(tab) {
+  const normalized = tab === "train" ? "train" : "work";
+  S.tab = normalized;
+  ["work", "train"].forEach(t => {
+    $(`tab-${t}`).classList.toggle("active", t === normalized);
+    $(`tabBtn-${t}`).classList.toggle("active", t === normalized);
+  });
+  if (normalized === "train") loadTrainingSummary().catch(e => toast(e.message));
+}
+
+async function runRecluster() {
+  try {
+    const r = await post("/api/label/recluster", {});
+    const st = r.stats || {};
+    toast(`重聚完成：${st.vehicle_groups || 0} 辆车（同车配对 ${st.pair_same_applied || 0} / 异车拆出 ${st.pair_diff_split || 0}）`);
+    if (S.cur) await loadCaptureWorkspace(S.cur.id, S.sel ? S.sel.id : 0);
+  } catch (e) { toast(e.message); }
+}
+
+async function loadReidStats() {
+  try {
+    const s = await api("/api/annotations/stats");
+    $("reidStats").innerHTML = [
+      ["有效车辆图", s.total], ["已复核", s.reviewed], ["真值车辆", s.identities],
+      ["同车对(S)", s.same_pairs], ["异车硬负对(D)", s.different_pairs],
+    ].map(([k, v]) => `<span><span class="kbd">${k}</span> <b>${v}</b></span>`).join("");
+  } catch (e) {}
+}
+
+/* ======================== 统一队列加载 ======================== */
+async function loadQueue(keepIndex = false) {
+  S.qtype = $("qtype").value;
+  S.park = $("parkSel").value;
+  S.stage = $("stageSel").value;
+  $("queueList").innerHTML = '<div class="empty">加载中…</div>';
+
+  if (S.qtype.startsWith("reid_")) {
+    const stMap = { reid_unlabeled: "unlabeled", reid_assigned: "assigned", reid_all: "all" };
+    const url = `/api/annotations/queue?state=${stMap[S.qtype]}&park=${encodeURIComponent(S.park)}&stage=${encodeURIComponent(S.stage)}&limit=500`;
+    const rows = await api(url);
+    S.qLevel = "reid";
+    S.queue = rows.map(x => ({
+      capture_id: x.id, order_id: x.order_id, park: x.park || S.park,
+      plate: x.corrected_plate || x.plate_final || "", stage: x.stage,
+      capture_time: x.capture_time, vehicle_id: x.vehicle_id,
+      identity_id: x.identity_id, vehicle_crop_path: x.vehicle_crop_path,
+      reason: x.identity_id ? `真值#${x.identity_id}` : "待同车对比",
+    }));
+    $("qCount").textContent = `${S.queue.length} 张`;
+  } else {
+    const url = `/api/label/queue?type=${S.qtype}${S.park ? `&park=${encodeURIComponent(S.park)}` : ""}`;
+    const q = await api(url);
+    S.qLevel = q.level || "order";
+    S.queue = q.items || [];
+    if (S.stage && S.qLevel === "photo") S.queue = S.queue.filter(x => x.stage === S.stage);
+    $("qCount").textContent = `${S.queue.length}${q.total > S.queue.length ? "/" + q.total : ""} ${S.qLevel === "photo" ? "张" : "单"}`;
+  }
+
+  renderQueue();
+  if (!S.queue.length) {
+    S.qi = -1; S.cur = null; S.sel = null; S.candidates = [];
+    $("curImgWrap").innerHTML = '<div class="empty">当前队列已清空</div>';
+    $("candImgWrap").innerHTML = '<div class="empty">无待对比候选</div>';
+    $("candGrid").innerHTML = '<div class="empty" style="grid-column:1/-1">当前队列为空</div>';
+    $("orderFilm").classList.remove("show");
+    setWorkButtons(false);
     return;
   }
-  $("queue").innerHTML = state.queue.length ? state.queue.map((it, i) => `
-    <div class="qitem ${i === state.qi ? "active" : ""}" onclick="selectOrder(${i})">
-      <div class="t">${esc(it.order_id)} ${it.reviewed ? '<span class="badge manual">已复核</span>' : ""}
-        <span class="badge ${statusColor[it.progress_status] || ""}">${esc(it.progress_status || "无状态")}</span></div>
-      <div class="s">${it.plate ? "车牌 " + esc(it.plate) : "无牌"} · ${it.capture_count}张 · 最后 ${esc((it.last_event_time || "").slice(5, 16))}</div>
-      <div class="s">${esc(it.reason || "")}${it.progress_note ? " · " + esc(it.progress_note) : ""}</div>
-    </div>`).join("") : '<div class="empty">队列空 🎉</div>';
-  if (state.qi >= 0) selectOrder(state.qi);
+  const nextIdx = keepIndex && S.qi >= 0 ? Math.min(S.qi, S.queue.length - 1) : 0;
+  await selectQueueItem(nextIdx);
 }
 
-async function selectOrder(i) {
-  state.qi = i;
-  document.querySelectorAll(".qitem").forEach((el, idx) => el.classList.toggle("active", idx === i));
-  const it = state.queue[i]; if (!it) return;
-  state.order = await api(`/api/label/order?order_id=${encodeURIComponent(it.order_id)}&park=${encodeURIComponent(it.park)}`);
-  // 照片级队列：载入订单后直接定位到该张照片
-  const targetCi = it.capture_id
-    ? state.order.items.findIndex(x => x.id === it.capture_id) : -1;
-  renderOrder(targetCi);
+function renderQueue() {
+  if (!S.queue.length) { $("queueList").innerHTML = '<div class="empty">当前筛选下没有待标项</div>'; return; }
+  $("queueList").innerHTML = S.queue.map((it, i) => {
+    const active = i === S.qi ? "active" : "";
+    if (S.qLevel === "order") {
+      return `<div class="q-card order-only ${active}" onclick="selectQueueItem(${i})">
+        <div>
+          <div style="font-weight:600">${esc(it.order_id)} <span class="badge blue">${esc(it.plate || "无牌")}</span></div>
+          <div class="kbd">${it.capture_count || 0}张 · ${esc((it.last_event_time || "").slice(5, 16))} · ${esc(it.reason || "")}</div>
+        </div></div>`;
+    }
+    const cid = it.capture_id;
+    const img = `/api/crop/${cid}`;
+    return `<div class="q-card ${active}" onclick="selectQueueItem(${i})">
+      <img src="${img}" onerror="this.onerror=null;this.src='/api/thumb/${cid}'" loading="lazy">
+      <div style="min-width:0">
+        <div style="font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(it.plate || `抓拍 #${cid}`)}</div>
+        <div class="kbd">${esc(it.stage || "")} · ${esc(timeOnly(it.capture_time))}</div>
+        <div>
+          ${it.vehicle_id ? `<span class="badge blue">车#${it.vehicle_id}</span>` : '<span class="badge red">未归组</span>'}
+          ${it.identity_id ? `<span class="badge green">真值#${it.identity_id}</span>` : ""}
+        </div>
+      </div></div>`;
+  }).join("");
 }
 
-function renderOrder(targetCi) {
-  const o = state.order;
-  const st = o.progress_status;
-  $("orderHead").innerHTML = `
-    <div class="t" style="font-weight:600">订单 ${esc(o.order_id)} · ${esc(o.park)}
-      <span class="badge ${statusColor[st] || ""}">${esc(st || "无状态")}${o.progress_assumed ? "(推定)" : ""}</span></div>
-    <div class="sub">${o.items.length} 张 · 车牌 ${esc(o.plate || "—")} · 最后事件 ${esc((o.last_event_time || "—").slice(0, 19))}${o.progress_note ? " · " + esc(o.progress_note) : ""}
-      · 阈值 ${esc(JSON.stringify(o.flow_thresholds))} 分钟</div>
-    <div class="sub">已确认的时刻：${o.anchors.length ? o.anchors.map(a => `<span class="badge manual">${esc(ANCHOR_CN[a.kind] || a.kind)} ${esc(a.anchor_time.slice(11))}</span>`).join(" ") : "无（整单状态正常时可不用填）"}</div>`;
-  $("film").innerHTML = o.items.map((it, idx) => `
-    <div class="frame ${idx === state.ci ? "active" : ""}" onclick="selectCapture(${idx})">
-      <img src="/api/crop/${it.id}" onerror="this.onerror=null;this.src='/api/thumb/${it.id}'" loading="lazy">
-      <span class="mark badge ${statusColor[it.progress_status] || ""}"
-        title="${esc(it.progress_status)}${it.progress_source === "manual" ? " · 人工" : ""}">${esc(it.progress_status ? it.progress_status.slice(0, 3) : "—")}</span>
-    </div>`).join("");
-  state.ci = (targetCi >= 0 && targetCi < o.items.length) ? targetCi : 0;
-  selectCapture(state.ci, true);
+async function selectQueueItem(idx) {
+  if (idx < 0 || idx >= S.queue.length) return;
+  S.qi = idx;
+  document.querySelectorAll("#queueList .q-card").forEach((el, i) => el.classList.toggle("active", i === idx));
+  const it = S.queue[idx];
+  S.orderItems = [];
+  let targetCid = it.capture_id || 0;
+
+  // 若有真实订单号（非散图），加载同单胶片条便于扫一眼前后帧
+  if (it.order_id && it.order_id !== "未关联图片") {
+    try {
+      const ord = await api(`/api/label/order?order_id=${encodeURIComponent(it.order_id)}&park=${encodeURIComponent(it.park || "")}`);
+      S.orderItems = (ord.items || []).filter(x => (x.capture_status || "vehicle") !== "no_vehicle");
+      if (!targetCid && S.orderItems.length) targetCid = S.orderItems[0].id;
+    } catch (e) {}
+  }
+  renderOrderFilm(targetCid);
+  if (targetCid) await loadCaptureWorkspace(targetCid);
 }
 
-async function selectCapture(idx, force) {
-  if (!force && state.ci === idx) return;
-  state.ci = idx;
-  document.querySelectorAll(".frame").forEach((el, i) => el.classList.toggle("active", i === idx));
-  const it = state.order.items[idx]; if (!it) return;
-  const st = await api(`/api/label/capture?capture_id=${it.id}`);
-  $("capId").textContent = "#" + it.id;
-  // 大图 + 框选画布
-  $("stageArea").innerHTML = `<img id="bigimg" src="/api/image/${it.id}" onload="initCanvas()">`;
-  $("stageMeta").textContent =
-    `${it.stage} · ${it.camera_key || ""} · OSD方向=${it.osd_direction || "无"} · 时间 ${it.capture_time || "无"} · 车牌 ${it.plate_final || "—"}`;
-  fillSelect($("f_color"), COLORS, (st.item.corrected_color || "") || it.vehicle_color || "");
-  fillSelect($("f_type"), TYPES, (st.item.corrected_type || "") || it.vehicle_type || "");
-  $("f_plate").value = st.item.corrected_plate || it.plate_final || "";
-  $("f_usability").value = st.item.usability || "valid";
-  document.querySelectorAll('input[name=nv]').forEach(r => r.checked = (r.value === "1") === !!(st.item.capture_status === "no_vehicle"));
-  $("f_time").value = st.item.corrected_time || (it.capture_time || "").slice(11) || "";
-  $("f_notes").value = st.item.notes || "";
-  $("d_device").value = it.osd_camera || it.camera_key || "";
-  $("savedBy").textContent = st.item.annotation_updated_at ? `上次标注: ${st.item.annotator} @ ${st.item.annotation_updated_at}` : "";
-  renderStatusRadios(st.item.corrected_status || "");
-  renderAnchors(st.anchors, st.devices);
+function renderOrderFilm(activeCid) {
+  const strip = $("orderFilm");
+  if (S.orderItems.length <= 1) { strip.classList.remove("show"); strip.innerHTML = ""; return; }
+  strip.classList.add("show");
+  strip.innerHTML = `<span class="kbd" style="white-space:nowrap">同单 ${S.orderItems.length} 张：</span>` +
+    S.orderItems.map(x => `
+      <div class="film-item ${x.id === activeCid ? "active" : ""}" onclick="pickOrderFrame(${x.id})">
+        <img src="/api/crop/${x.id}" onerror="this.onerror=null;this.src='/api/thumb/${x.id}'" loading="lazy">
+        <span class="mark badge ${x.vehicle_id ? "blue" : "red"}">${x.vehicle_id ? "#" + x.vehicle_id : "拆出"}</span>
+      </div>`).join("");
 }
 
-function renderStatusRadios(current) {
-  const derived = state.order && state.order.items[state.ci];
-  $("statusNow").textContent = current ? `人工值: ${current}` :
-    `自动推导: ${(derived && derived.progress_status) || "无"}${derived && derived.progress_assumed ? "(推定)" : ""}`;
-  $("statusRadios").innerHTML = STATUS.map((s, i) => `
-    <label><input type="radio" name="pst" value="${esc(s)}" ${s === current ? "checked" : ""}>
-      <span class="kbd">${i + 1}</span> ${esc(s)}</label>`).join("");
-}
-function setStatus(v) {
-  const radio = document.querySelector(`input[name=pst][value="${v}"]`);
-  if (radio) radio.checked = true; else renderStatusRadios("");
+async function pickOrderFrame(cid) {
+  renderOrderFilm(cid);
+  await loadCaptureWorkspace(cid);
 }
 
-/* ---------------- 锚点 / 机位 ---------------- */
-function renderAnchors(anchors, devices) {
-  $("anchorList").innerHTML = anchors.length ? anchors.map(a => `
-    <div class="a"><span class="badge manual">${esc(ANCHOR_CN[a.kind] || a.kind)}</span>
-      ${esc(a.anchor_time.slice(0, 19))} · ${esc(a.annotator || "")}
-      <button style="padding:0 6px" onclick="delAnchor(${a.id})">删</button></div>`).join("")
-    : '<span class="kbd">暂无已确认的时刻</span>';
-  $("deviceList").innerHTML = devices.length ? devices.map(d => `
-    <div class="a"><span class="badge">${esc(d.device)}</span> ${esc(d.location)}${d.direction ? " · " + esc(d.direction) : ""}</div>`).join("")
-    : '<span class="kbd">本园区暂无机位登记</span>';
+/* ======================== 加载单张抓拍 + 相似候选（一体化核心） ======================== */
+async function loadCaptureWorkspace(captureId, keepCandId = 0) {
+  cancelBox(true);
+  $("curImgWrap").innerHTML = '<div class="empty">加载当前抓拍…</div>';
+  $("candImgWrap").innerHTML = '<div class="empty">检索相似候选…</div>';
+  $("candGrid").innerHTML = '<div class="empty" style="grid-column:1/-1">检索中…</div>';
+
+  const [labelRes, reidRes] = await Promise.all([
+    api(`/api/label/capture?capture_id=${captureId}`),
+    api(`/api/annotations/item/${captureId}?limit=30`),
+  ]);
+  S.labelMeta = labelRes;
+  S.cur = { ...labelRes.item, ...reidRes.item, vehicle_size: labelRes.item.vehicle_size,
+            corrected_color: labelRes.item.corrected_color, corrected_type: labelRes.item.corrected_type,
+            corrected_status: labelRes.item.corrected_status, corrected_stage: labelRes.item.corrected_stage,
+            corrected_direction: labelRes.item.corrected_direction, corrected_time: labelRes.item.corrected_time,
+            no_vehicle_manual: labelRes.item.no_vehicle_manual, notes: labelRes.item.notes || reidRes.item.annotation_notes || "" };
+  S.candidates = reidRes.candidates || [];
+  if (S.candidates.length) {
+    if (keepCandId && S.candidates.some(c => c.id === keepCandId)) {
+      S.sel = S.candidates.find(c => c.id === keepCandId);
+    } else {
+      S.sel = S.candidates.find(c => !c.pair_relation) || S.candidates[0];
+    }
+  } else {
+    S.sel = null;
+  }
+  renderCurrentSide();
+  renderCandidateSide();
+  renderCandidateGallery();
+  setWorkButtons(true);
 }
-async function addAnchor() {
-  if ($("a_kind").value === "skip") {
-    toast("当前是跳过状态：整单没问题就点【R 标记已复核】；要确认时刻请先在下拉里选类型");
+
+function stageImgUrl(x, forceFull = false) {
+  if (forceFull || $("reidFullImg")?.checked) return `/api/image/${x.id}`;
+  return x.vehicle_crop_path ? `/api/crop/${x.id}` : `/api/image/${x.id}`;
+}
+function toggleImgMode() {
+  if (S.cur && !S.boxMode) renderCurrentImg();
+  if (S.sel) renderCandidateSide();
+}
+
+function renderCurrentImg() {
+  const x = S.cur; if (!x) return;
+  const forceFull = S.boxMode;
+  $("curImgWrap").innerHTML = `<img id="curStageImg" src="${stageImgUrl(x, forceFull)}" onload="if(S.boxMode)initBoxCanvas()" onclick="if(!S.boxMode)openImgModal(${x.id})" title="${S.boxMode ? '点击左上角与右下角画框' : '点击放大原图'}">`;
+}
+
+function renderCurrentSide() {
+  const x = S.cur; if (!x) return;
+  $("curIdBadge").textContent = `#${x.id}`;
+  $("curPlateTitle").textContent = x.corrected_plate || x.plate_final || "无车牌";
+  $("curVehBadge").textContent = x.vehicle_id ? `聚类车 #${x.vehicle_id} (${x.vehicle_size || 1}张)` : "未归组/已拆出";
+  $("curVehBadge").className = "badge " + (x.vehicle_id ? "blue" : "red");
+  $("curIdentityBadge").textContent = x.identity_id ? `真值 #${x.identity_id} (${x.identity_size}张)` : "尚未分真值组";
+  $("curIdentityBadge").className = "badge " + (x.identity_id ? "green" : "");
+  renderCurrentImg();
+
+  const reasons = [x.plate_match_reason, x.status_reason].filter(Boolean).join(" | ");
+  $("curMetaLine").textContent =
+    `${x.park || "未标园"} · 订单 ${x.order_id || "—"} · ${x.stage || ""} · ${x.capture_time || "时间未知"} · ${x.recognition_source || "未识牌"}${reasons ? " · " + reasons : ""}`;
+
+  // 同帧多车实例一键切主车
+  const extraInsts = (S.labelMeta?.instances || []).filter(i => i.instance_index > 0);
+  const strip = $("curInstStrip");
+  if (extraInsts.length) {
+    strip.style.display = "flex";
+    strip.innerHTML = `<span class="kbd">同帧多车：</span>` + extraInsts.map(inst => `
+      <span class="inst-pill">
+        <img src="/api/instance_crop/${inst.id}" loading="lazy">
+        <span>${esc(inst.lpr_plate || "无牌")} ${esc(cnType(inst.vehicle_type))}</span>
+        <button class="primary" style="padding:1px 6px;font-size:11px" onclick="promoteInstance(${x.id},${inst.id})">切为主车</button>
+      </span>`).join("");
+  } else {
+    strip.style.display = "none"; strip.innerHTML = "";
+  }
+
+  $("f_plate").value = x.corrected_plate || x.plate_final || "";
+  fillCodeSelect($("f_type"), TYPE_MAP, x.corrected_type || x.vehicle_type || "", "车型(不改)");
+  fillCodeSelect($("f_color"), COLOR_MAP, x.corrected_color || x.vehicle_color || "", "颜色(不改)");
+  $("f_noveh").checked = (x.capture_status === "no_vehicle");
+}
+
+function renderCandidateSide() {
+  const x = S.sel;
+  if (!x) {
+    $("candRankBadge").textContent = "无候选";
+    $("candPlateTitle").textContent = "—";
+    $("candVehBadge").style.display = "none";
+    $("candRelBadge").style.display = "none";
+    $("candImgWrap").innerHTML = '<div class="empty">当前抓拍尚无 FastReID 相似候选</div>';
+    $("candMetaLine").textContent = "若刚完成人工画框，下轮流水线补算特征后即会生成候选。";
     return;
   }
-  const it = state.order.items[state.ci];
-  const hms = $("a_time").value.trim() || (it.capture_time || "").slice(11);
-  if (!/^\d{2}:\d{2}:\d{2}$/.test(hms)) {
-    toast("请填写时刻（时:分:秒），或先选中一张有时间照片再保存"); return;
+  const idx = S.candidates.findIndex(c => c.id === x.id) + 1;
+  $("candRankBadge").textContent = `候选 #${idx}/${S.candidates.length} · 相似度 ${Math.round(x.similarity * 100)}%`;
+  $("candPlateTitle").textContent = x.corrected_plate || x.plate_final || `抓拍 #${x.id}`;
+  $("candVehBadge").style.display = "inline-block";
+  $("candVehBadge").textContent = x.vehicle_id ? `聚类车 #${x.vehicle_id}` : "未归组";
+  $("candVehBadge").className = "badge " + (x.vehicle_id ? "blue" : "red");
+  if (x.pair_relation) {
+    $("candRelBadge").style.display = "inline-block";
+    $("candRelBadge").textContent = x.pair_relation === "same" ? "已标：同车" : x.pair_relation === "different" ? "已标：不同车" : "已标：不确定";
+    $("candRelBadge").className = "badge " + (x.pair_relation === "same" ? "green" : x.pair_relation === "different" ? "red" : "amber");
+  } else {
+    $("candRelBadge").style.display = "none";
   }
-  await api("/api/label/anchor", { method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ park: state.order.park, order_id: state.order.order_id,
-      kind: $("a_kind").value, anchor_time: `${(it.capture_time || "").slice(0, 10)} ${hms}`,
-      annotator: annotator() }) });
-  toast("已保存：系统按你确认的时刻重算了这单的状态"); await selectOrder(state.qi);
-}
-async function delAnchor(id) {
-  await api(`/api/label/anchor/${id}`, { method: "DELETE", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ annotator: annotator() }) });
-  await selectOrder(state.qi);
-}
-async function markReviewed() {
-  const it = state.order.items[state.ci];
-  await api("/api/label/anchor", { method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ park: state.order.park, order_id: state.order.order_id,
-      kind: "reviewed", anchor_time: (it.capture_time || "").slice(0, 19) || new Date().toISOString().slice(0, 19).replace("T", " "),
-      annotator: annotator() }) });
-  toast("已标记复核，自动切下一单"); nextOrder();
-}
-async function saveDevice() {
-  await api("/api/label/device", { method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ park: state.order.park, device: $("d_device").value.trim(),
-      location: $("d_location").value, direction: $("d_direction").value, annotator: annotator() }) });
-  toast("机位已登记"); await selectCapture(state.ci, true);
+  $("candImgWrap").innerHTML = `<img src="${stageImgUrl(x)}" onclick="openImgModal(${x.id})" title="点击放大原图">`;
+  $("candMetaLine").textContent =
+    `#${x.id} · 订单 ${x.order_id || "—"} · ${x.stage || ""} · ${x.capture_time || "时间未知"} · ${cnColor(x.vehicle_color) || "色未知"}/${cnType(x.vehicle_type) || "型未知"}${x.identity_id ? ` · 真值#${x.identity_id}(${x.identity_size}张)` : ""}`;
 }
 
-/* ---------------- 保存面板 ---------------- */
-async function savePanel() {
-  const it = state.order.items[state.ci];
-  const st = await api(`/api/label/capture?capture_id=${it.id}`);
-  const cur = st.item;
-  const pst = document.querySelector('input[name=pst]:checked');
+function renderCandidateGallery() {
+  $("candCountBadge").textContent = S.candidates.length;
+  const relText = v => v === "same" ? "同车" : v === "different" ? "不同" : "不确定";
+  $("candGrid").innerHTML = S.candidates.length ? S.candidates.map((x, idx) => `
+    <div class="cand-card ${S.sel?.id === x.id ? "selected" : ""}" data-cid="${x.id}" onclick="pickCand(${x.id})">
+      <img src="${x.vehicle_crop_path ? `/api/crop/${x.id}` : `/api/thumb/${x.id}`}" loading="lazy">
+      <span class="cand-score">#${idx + 1} · ${Math.round(x.similarity * 100)}%</span>
+      ${x.pair_relation ? `<span class="cand-rel ${x.pair_relation}">${relText(x.pair_relation)}</span>` : ""}
+      <div style="padding:6px 8px">
+        <div style="font-weight:600;font-size:13px;display:flex;justify-content:space-between;gap:4px">
+          <span>${esc(x.corrected_plate || x.plate_final || `抓拍 #${x.id}`)}</span>
+          ${x.vehicle_id ? `<span class="badge blue">车#${x.vehicle_id}</span>` : ""}
+        </div>
+        <div class="kbd">${esc(x.stage || "")} · ${esc(x.capture_time || "时间未知")}</div>
+        <div class="kbd">${esc(cnColor(x.vehicle_color) || "色未知")} · ${esc(cnType(x.vehicle_type) || "型未知")} ${x.identity_id ? `· 真值#${x.identity_id}` : ""}</div>
+      </div>
+    </div>`).join("") : '<div class="empty" style="grid-column:1/-1">没有可比较的外观候选（需先提取 FastReID 特征）</div>';
+}
+
+function pickCand(id) {
+  S.sel = S.candidates.find(c => c.id === id) || null;
+  renderCandidateSide(); renderCandidateGallery(); setWorkButtons(true);
+}
+
+function stepCand(delta) {
+  if (!S.candidates.length) return;
+  const curIdx = S.sel ? S.candidates.findIndex(c => c.id === S.sel.id) : -1;
+  const nextIdx = (curIdx + delta + S.candidates.length) % S.candidates.length;
+  pickCand(S.candidates[nextIdx].id);
+  const el = document.querySelector(`.cand-card[data-cid="${S.candidates[nextIdx].id}"]`);
+  if (el) el.scrollIntoView({ block: "nearest", behavior: "smooth" });
+}
+
+function applyCandSize(sz) {
+  const map = { md: ["180px", "126px"], lg: ["240px", "168px"], xl: ["320px", "220px"] };
+  const [w, h] = map[sz] || map.lg;
+  $("candGrid").style.setProperty("--cand-w", w);
+  $("candGrid").style.setProperty("--cand-h", h);
+  localStorage.setItem("reid_cand_size", sz);
+}
+function applyCandFit(fit) {
+  $("candGrid").style.setProperty("--cand-fit", fit === "cover" ? "cover" : "contain");
+  localStorage.setItem("reid_cand_fit", fit);
+}
+
+function setWorkButtons(enabled) {
+  const hasCur = enabled && !!S.cur;
+  const hasCand = hasCur && !!S.sel;
+  ["boxStartBtn", "curZoomBtn", "saveCoreBtn", "rNewBtn", "rInvBtn", "rNextCapBtn", "advBtn"].forEach(id => { if ($(id)) $(id).disabled = !hasCur; });
+  ["rSameBtn", "rDiffBtn", "rUncBtn", "candZoomBtn"].forEach(id => { if ($(id)) $(id).disabled = !hasCand; });
+  const multi = hasCur && S.candidates.length > 1;
+  $("rPrevCand").disabled = !multi;
+  $("rNextCand").disabled = !multi;
+}
+
+/* ======================== 核心提准动作（写回 + 重聚 + 同车判定） ======================== */
+async function saveCoreFields() {
+  if (!S.cur) return;
   const fields = {
-    corrected_status: pst ? pst.value : (cur.corrected_status || ""),
-    corrected_color: $("f_color").value,
-    corrected_type: $("f_type").value,
     corrected_plate: $("f_plate").value.trim(),
-    usability: $("f_usability").value,
-    corrected_time: $("f_time").value.trim(),
-    no_vehicle_manual: document.querySelector('input[name=nv]:checked').value,
-    notes: $("f_notes").value.trim(),
+    corrected_type: $("f_type").value,
+    corrected_color: $("f_color").value,
+    no_vehicle_manual: $("f_noveh").checked ? 1 : 0,
+    usability: S.cur.usability || "valid",
+    corrected_status: S.cur.corrected_status || "",
   };
-  await api("/api/label/capture", { method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ capture_id: it.id, annotator: annotator(), fields }) });
-  toast("已保存并写回；时间/环节/方向/车牌/属性实时生效");
-  await selectOrder(state.qi);   // 重取整单（状态/锚点/逐张全部刷新）
+  const r = await post("/api/label/capture", {
+    capture_id: S.cur.id, annotator: annotator(true), fields,
+  });
+  toast(r.message || "已保存并重聚");
+  await loadReidStats();
+  if ($("f_noveh").checked) {
+    await nextQueueItem();
+  } else {
+    await loadCaptureWorkspace(S.cur.id, S.sel ? S.sel.id : 0);
+  }
 }
 
-/* ---------------- 框选（两次点击） ---------------- */
-function initCanvas() {
-  const img = $("bigimg"), box = $("stageArea");
-  state.imgW = img.naturalWidth; state.imgH = img.naturalHeight;
+async function promoteInstance(captureId, instanceId) {
+  try {
+    const r = await post("/api/boxedit/promote", { capture_id: captureId, instance_id: instanceId });
+    toast(r.message || "已切为主车并重聚");
+    await loadCaptureWorkspace(captureId, S.sel ? S.sel.id : 0);
+  } catch (e) { toast(e.message); }
+}
+
+async function savePair(relation, confirmMerge = false) {
+  if (!S.cur || !S.sel) return;
+  try {
+    const d = await post("/api/annotations/pair", {
+      capture_id: S.cur.id, candidate_id: S.sel.id, relation,
+      confirm_merge: confirmMerge, sync_cluster: $("reidSyncCluster").checked,
+      annotator: annotator(false), corrected_plate: $("f_plate").value.trim(),
+    });
+    const baseMsg = d.message || ({same: "已确认同车", different: "已标不同车（硬负样本）", uncertain: "已标不确定"}[relation]);
+    toast(baseMsg + (d.cluster_synced ? " · 已联动聚类" : ""));
+    // 始终留在当前抓拍，自动切到下一个未标候选
+    const curIdx = S.candidates.findIndex(c => c.id === S.sel.id);
+    const nextCand = S.candidates.slice(curIdx + 1).find(c => !c.pair_relation)
+      || S.candidates[curIdx + 1]
+      || S.candidates.find(c => !c.pair_relation && c.id !== S.sel.id);
+    await loadCaptureWorkspace(S.cur.id, nextCand ? nextCand.id : 0);
+    if (nextCand) {
+      const card = document.querySelector(`.cand-card[data-cid="${nextCand.id}"]`);
+      if (card) card.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }
+    await loadReidStats();
+  } catch (e) {
+    if (e.status === 409 && e.data?.requires_confirmation && confirm(`两张抓拍已分别属于真值车辆 ${e.data.identity_ids.join(" 和 ")}。\n确认合并这两个真值车辆组吗？`)) {
+      return savePair(relation, true);
+    }
+    toast(e.message);
+  }
+}
+
+async function saveReidAction(action, usability = "valid") {
+  if (!S.cur) return;
+  await post("/api/annotations/capture", {
+    capture_id: S.cur.id, annotator: annotator(false),
+    corrected_plate: $("f_plate").value.trim(), action, usability,
+  });
+  toast(action === "new_identity" ? "已新建独立真值车" : "已标记不可用");
+  await loadReidStats();
+  await nextQueueItem();
+}
+
+async function nextQueueItem() {
+  if (!S.queue.length) return;
+  if (S.qi + 1 < S.queue.length) {
+    await selectQueueItem(S.qi + 1);
+  } else {
+    toast("已到当前队列末尾，重新刷新队列…");
+    await loadQueue(false);
+  }
+}
+async function prevQueueItem() {
+  if (S.qi > 0) await selectQueueItem(S.qi - 1);
+}
+
+/* ======================== 左图直接画框重裁 ======================== */
+function startBox() {
+  if (!S.cur) return;
+  S.boxMode = true; S.boxPts = [];
+  $("boxApplyBtn").style.display = "inline-block"; $("boxApplyBtn").disabled = true;
+  $("boxCancelBtn").style.display = "inline-block";
+  $("boxHint").textContent = "画框模式：在左图点击车辆左上角，再点右下角（Enter 应用，Esc 取消）";
+  renderCurrentImg();
+}
+function cancelBox(silent = false) {
+  const was = S.boxMode;
+  S.boxMode = false; S.boxPts = [];
+  $("boxApplyBtn").style.display = "none"; $("boxCancelBtn").style.display = "none";
+  if (!silent && was) {
+    $("boxHint").textContent = "已取消画框";
+    renderCurrentImg();
+  }
+}
+function initBoxCanvas() {
+  const img = $("curStageImg"), wrap = $("curImgWrap");
+  if (!img || !wrap) return;
+  S.imgW = img.naturalWidth; S.imgH = img.naturalHeight;
   let c = $("boxCanvas");
-  if (!c) { c = document.createElement("canvas"); c.id = "boxCanvas"; box.appendChild(c); }
+  if (!c) { c = document.createElement("canvas"); c.id = "boxCanvas"; wrap.appendChild(c); }
   c.width = img.clientWidth; c.height = img.clientHeight;
   c.style.width = img.clientWidth + "px"; c.style.height = img.clientHeight + "px";
-  c.onclick = canvasClick;
-  drawBox();
+  c.onclick = ev => {
+    if (!S.boxMode) return;
+    const r = c.getBoundingClientRect();
+    S.boxPts.push([(ev.clientX - r.left) * S.imgW / c.width, (ev.clientY - r.top) * S.imgH / c.height]);
+    if (S.boxPts.length === 2) {
+      $("boxApplyBtn").disabled = false;
+      $("boxHint").textContent = "框选就绪：按 Enter 或点【应用框选】保存";
+    } else if (S.boxPts.length > 2) {
+      S.boxPts = [S.boxPts[S.boxPts.length - 1]];
+      $("boxApplyBtn").disabled = true;
+      $("boxHint").textContent = "已重选左上角，请点右下角";
+    } else {
+      $("boxHint").textContent = "已选左上角，请点车辆右下角";
+    }
+    drawBoxCanvas();
+  };
+  drawBoxCanvas();
 }
-function startBox() {
-  state.boxMode = true; state.boxPts = [];
-  $("boxApplyBtn").disabled = true;
-  $("boxHint").textContent = "框选模式已开启：在大图上点击车辆左上角，再点击车辆右下角；按键盘 Esc 键取消";
-}
-function cancelBox() {
-  state.boxMode = false; state.boxPts = [];
-  $("boxApplyBtn").disabled = true;
-  $("boxHint").textContent = "已取消框选";
-  drawBox();
-}
-function canvasClick(ev) {
-  if (!state.boxMode) return;
-  const img = $("bigimg"), c = $("boxCanvas"), r = c.getBoundingClientRect();
-  const x = (ev.clientX - r.left) * state.imgW / c.width;
-  const y = (ev.clientY - r.top) * state.imgH / c.height;
-  state.boxPts.push([x, y]);
-  if (state.boxPts.length === 2) {
-    state.boxMode = false;
-    $("boxApplyBtn").disabled = false;
-    $("boxHint").textContent = "矩形已就绪：按下键盘 回车键 或点击【② 应用框选】保存；按 Esc 键重新开始";
-  } else {
-    $("boxHint").textContent = "已记录左上角，再点击车辆右下角";
-  }
-  drawBox();
-}
-function drawBox(temp) {
+function drawBoxCanvas() {
   const c = $("boxCanvas"); if (!c) return;
   const ctx = c.getContext("2d"); ctx.clearRect(0, 0, c.width, c.height);
-  const sx = c.width / state.imgW, sy = c.height / state.imgH;
-  const cur = getBox();
-  if (cur) { ctx.strokeStyle = "#facc15"; ctx.lineWidth = 2;
-    const p = state.boxPts.map(pt => [pt[0] * sx, pt[1] * sy]);
-    ctx.strokeRect(Math.min(p[0][0], p[1][0]), Math.min(p[0][1], p[1][1]),
-                   Math.abs(p[1][0] - p[0][0]), Math.abs(p[1][1] - p[0][1])); }
-  else if (temp && state.boxPts.length === 1) {
+  const sx = c.width / S.imgW, sy = c.height / S.imgH;
+  if (S.boxPts.length === 2) {
+    ctx.strokeStyle = "#facc15"; ctx.lineWidth = 2;
+    const p = S.boxPts.map(pt => [pt[0] * sx, pt[1] * sy]);
+    ctx.strokeRect(Math.min(p[0][0], p[1][0]), Math.min(p[0][1], p[1][1]), Math.abs(p[1][0] - p[0][0]), Math.abs(p[1][1] - p[0][1]));
+  } else if (S.boxPts.length === 1) {
     ctx.fillStyle = "#facc15";
-    ctx.fillRect(state.boxPts[0][0] * sx - 3, state.boxPts[0][1] * sy - 3, 6, 6); }
+    ctx.fillRect(S.boxPts[0][0] * sx - 3, S.boxPts[0][1] * sy - 3, 6, 6);
+  }
 }
-function getBox() {
-  if (state.boxPts.length !== 2) return null;
-  const [[x1, y1], [x2, y2]] = state.boxPts;
-  return [Math.round(Math.min(x1, x2)), Math.round(Math.min(y1, y2)),
-          Math.round(Math.max(x1, x2)), Math.round(Math.max(y1, y2))];
+function getBoxRect() {
+  if (S.boxPts.length !== 2) return null;
+  const [[x1, y1], [x2, y2]] = S.boxPts;
+  return [Math.round(Math.min(x1, x2)), Math.round(Math.min(y1, y2)), Math.round(Math.max(x1, x2)), Math.round(Math.max(y1, y2))];
 }
 async function saveBox() {
-  const box = getBox();
-  if (!box || state.boxPts.length !== 2) { toast("请先开始框选：点击【① 开始框选】按钮或按下键盘 B 键"); return; }
-  const it = state.order.items[state.ci];
-  await api("/api/boxedit/save", { method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ capture_id: it.id, box }) });
-  toast("框选已保存：裁剪图已更新，车牌/特征下轮补算");
-  state.boxPts = []; state.boxMode = false;
-  $("boxApplyBtn").disabled = true;
-  $("boxHint").textContent = "框选已应用";
-  await selectCapture(state.ci, true);
+  const box = getBoxRect(); if (!box || !S.cur) { toast("请先在左图点选左上角与右下角"); return; }
+  const r = await post("/api/boxedit/save", { capture_id: S.cur.id, box });
+  toast(r.message || "框选已更新");
+  cancelBox(true);
+  await loadCaptureWorkspace(S.cur.id, S.sel ? S.sel.id : 0);
 }
 
-/* ---------------- 标注记录 ---------------- */
+/* ======================== 折叠辅助弹窗：订单进度与高级选项 ======================== */
+function openAdvDialog() {
+  if (!S.cur || !S.labelMeta) return;
+  const cur = S.cur;
+  $("advTitle").textContent = `抓拍 #${cur.id} · 订单 ${cur.order_id || "—"}`;
+  $("adv_stage").value = cur.corrected_direction === "in" ? "进大门" : (cur.corrected_direction === "out" ? "出大门" : (cur.corrected_stage || ""));
+  $("adv_time").value = cur.corrected_time || (cur.capture_time || "").slice(11) || "";
+  $("adv_usability").value = cur.usability || "valid";
+  $("adv_notes").value = cur.notes || "";
+  $("d_device").value = cur.osd_camera || cur.camera_key || "";
+  $("advStatusRadios").innerHTML = STATUS.map((st, i) => `
+    <label><input type="radio" name="adv_pst" value="${esc(st)}" ${st === (cur.corrected_status || "") ? "checked" : ""}> ${i + 1} ${esc(st)}</label>`).join("");
+  const anchors = S.labelMeta.anchors || [];
+  $("anchorList").innerHTML = anchors.length ? anchors.map(a =>
+    `<span class="badge manual" style="margin-right:4px">${esc(ANCHOR_CN[a.kind] || a.kind)} ${esc(a.anchor_time.slice(11))} <a href="javascript:void(0)" style="color:#fca5a5" onclick="delAnchor(${a.id})">×</a></span>`
+  ).join("") : "暂无锚点";
+  const devs = S.labelMeta.devices || [];
+  $("deviceList").innerHTML = devs.length ? devs.map(d =>
+    `<span class="badge" style="margin-right:4px">${esc(d.device)} → ${esc(d.location)}${d.direction ? "(" + esc(d.direction) + ")" : ""}</span>`
+  ).join("") : "暂无机位登记";
+  $("advOverlay").classList.add("show");
+}
+function closeAdvDialog() { $("advOverlay").classList.remove("show"); }
+function clearAdvStatus() { document.querySelectorAll('input[name=adv_pst]').forEach(r => r.checked = false); }
+
+async function saveAdvFields() {
+  if (!S.cur) return;
+  const pst = document.querySelector('input[name=adv_pst]:checked');
+  const fields = {
+    corrected_plate: $("f_plate").value.trim(),
+    corrected_type: $("f_type").value,
+    corrected_color: $("f_color").value,
+    no_vehicle_manual: $("f_noveh").checked ? 1 : 0,
+    corrected_status: pst ? pst.value : "",
+    corrected_time: $("adv_time").value.trim(),
+    usability: $("adv_usability").value,
+    notes: $("adv_notes").value.trim(),
+  };
+  if ($("adv_stage").value) fields.corrected_stage = $("adv_stage").value;
+  const r = await post("/api/label/capture", { capture_id: S.cur.id, annotator: annotator(true), notes: fields.notes, fields });
+  toast(r.message || "高级项已保存");
+  closeAdvDialog();
+  await loadCaptureWorkspace(S.cur.id, S.sel ? S.sel.id : 0);
+}
+async function doVehicleMove(scope) {
+  if (!S.cur) return;
+  try {
+    const r = await post("/api/vehicle_move", { capture_id: S.cur.id, target_plate: $("mv_plate").value.trim(), scope });
+    toast(`已移动 ${r.moved} 张至「${r.target}」`); $("mv_plate").value = "";
+    await loadCaptureWorkspace(S.cur.id, S.sel ? S.sel.id : 0);
+  } catch (e) { toast(e.message); }
+}
+async function doVehicleMerge() {
+  const raw = $("merge_vids").value.trim(); if (!raw) { toast("请输入车辆编号如 12,18"); return; }
+  try {
+    const r = await post("/api/vehicle-merge", { vehicle_ids: raw });
+    toast(`已合并 → 主车 #${r.target_vehicle_id}`); $("merge_vids").value = "";
+    await loadCaptureWorkspace(S.cur.id, S.sel ? S.sel.id : 0);
+  } catch (e) { toast(e.message); }
+}
+async function addAnchor() {
+  if (!S.cur || $("a_kind").value === "skip") { toast("请选择锚点类型"); return; }
+  const hms = $("a_time").value.trim() || (S.cur.capture_time || "").slice(11);
+  if (!/^\d{2}:\d{2}:\d{2}$/.test(hms)) { toast("请填写时刻 HH:MM:SS"); return; }
+  await post("/api/label/anchor", {
+    park: S.cur.park, order_id: S.cur.order_id, kind: $("a_kind").value,
+    anchor_time: `${(S.cur.capture_time || S.cur.date || "").slice(0, 10)} ${hms}`, annotator: annotator(true),
+  });
+  toast("锚点已保存"); await loadCaptureWorkspace(S.cur.id, S.sel ? S.sel.id : 0); openAdvDialog();
+}
+async function delAnchor(id) {
+  await api(`/api/label/anchor/${id}`, { method: "DELETE", headers: {"Content-Type": "application/json"}, body: JSON.stringify({ annotator: annotator(true) }) });
+  await loadCaptureWorkspace(S.cur.id, S.sel ? S.sel.id : 0); openAdvDialog();
+}
+async function markReviewed() {
+  if (!S.cur) return;
+  await post("/api/label/anchor", {
+    park: S.cur.park, order_id: S.cur.order_id, kind: "reviewed",
+    anchor_time: (S.cur.capture_time || "").slice(0, 19) || new Date().toISOString().slice(0, 19).replace("T", " "),
+    annotator: annotator(true),
+  });
+  toast("已标记订单已复核"); closeAdvDialog();
+}
+async function saveDevice() {
+  if (!S.cur) return;
+  await post("/api/label/device", {
+    park: S.cur.park, device: $("d_device").value.trim(),
+    location: $("d_location").value, direction: $("d_direction").value, annotator: annotator(true),
+  });
+  toast("机位已登记"); await loadCaptureWorkspace(S.cur.id, S.sel ? S.sel.id : 0); openAdvDialog();
+}
+
+/* ======================== TAB 2: 模型微调与训练导出 ======================== */
+async function loadTrainingSummary() {
+  const d = await api("/api/training/summary");
+  const r = d.reid, det = d.detection, at = d.attr, lpr = d.lpr;
+  $("trainCards").innerHTML = `
+    <div class="card">
+      <h4>FastReID 车辆外观 <span class="badge ${r.ready_with_bootstrap ? "green" : "amber"}">${r.ready_with_bootstrap ? "可微调" : "待积累"}</span></h4>
+      <div class="metric-big">${r.manual_identities} 辆真值 / ${r.same_pairs + r.different_pairs} 配对</div>
+      <div class="kbd">同车对(S) ${r.same_pairs} · 异车硬负对(D) ${r.different_pairs} · 合并对 ${r.merge_pairs} · 车牌引导车 ${r.verified_plate_vehicles} 辆</div>
+    </div>
+    <div class="card">
+      <h4>车辆检测框（COCO） <span class="badge ${det.ready ? "green" : "amber"}">${det.ready ? "就绪" : "攒数据"}</span></h4>
+      <div class="metric-big">${det.manual_boxes} / ${det.recommended_min}</div>
+      <div class="kbd">人工重框数（另含误检无车 ${det.manual_no_vehicle} 张）</div>
+    </div>
+    <div class="card">
+      <h4>颜色 / 车型属性 <span class="badge ${at.ready ? "green" : "amber"}">${at.ready ? "就绪" : "攒数据"}</span></h4>
+      <div class="metric-big">${at.manual_attrs} / ${at.recommended_min}</div>
+      <div class="kbd">已统一英文标准码，导出即匹配 PPLCNet</div>
+    </div>
+    <div class="card">
+      <h4>车牌识别（LPR） <span class="badge ${lpr.ready ? "green" : "amber"}">${lpr.ready ? "就绪" : "攒数据"}</span></h4>
+      <div class="metric-big">${lpr.manual_plates} / ${lpr.recommended_min}</div>
+      <div class="kbd">人工确认车牌（同时直供 FastReID 微调与聚类）</div>
+    </div>`;
+
+  const act = d.active_reid || {};
+  $("activeModelBadge").textContent = act.active ? `已激活微调权重：${act.model_version}` : `基线权重：${act.model_version}`;
+  $("activeModelBadge").className = "badge " + (act.active ? "green" : "blue");
+
+  const rep = d.last_report;
+  if (rep && rep.baseline) {
+    const b = rep.baseline, f = rep.finetuned || {};
+    const row = (name, bv, fv) => `<tr><td>${name}</td><td>${bv ?? "—"}</td><td><b>${fv ?? "—"}</b></td></tr>`;
+    $("reportTable").innerHTML = `
+      <div class="kbd">最近报告（${esc(rep.finished_at || "")} · 耗时 ${rep.elapsed_sec ?? "—"}s · ${rep.activated ? "已自动激活新权重" : "保留基线权重"}）</div>
+      <table class="tbl">
+        <tr><th>留出验证集指标（未见车辆）</th><th>基线模型 (VeRi)</th><th>微调后模型</th></tr>
+        ${row("ROC-AUC（越高越好）", b.roc_auc, f.roc_auc)}
+        ${row("同车均值余弦（越高越好）", b.same_mean, f.same_mean)}
+        ${row("异车 P90 余弦（越低越好）", b.diff_p90, f.diff_p90)}
+        ${row("区分间隔 Margin = 同车均值 - 异车P90", b.margin, f.margin)}
+        ${row("Rank-1 检索命中率", b.rank1, f.rank1)}
+        ${row("mAP", b.map, f.map)}
+      </table>`;
+  } else {
+    $("reportTable").innerHTML = '<div class="kbd">尚未运行留出集评估/微调。</div>';
+  }
+
+  const job = d.job || {};
+  const running = job.status === "running";
+  $("btnFinetune").disabled = running; $("btnEvalOnly").disabled = running;
+  $("jobStatusLine").textContent = `后台任务：${job.status || "idle"}${job.mode ? " (" + job.mode + ")" : ""}${job.started_at ? " · 开始 " + job.started_at : ""}${job.finished_at ? " · 结束 " + job.finished_at : ""}`;
+  if (job.logs && job.logs.length) $("jobLogs").textContent = job.logs.join("\n");
+  clearTimeout(S.trainTimer);
+  if (running && S.tab === "train") S.trainTimer = setTimeout(() => loadTrainingSummary().catch(() => {}), 2500);
+}
+async function triggerFinetune(evalOnly) {
+  try {
+    await post("/api/training/finetune", {
+      eval_only: evalOnly, epochs: Number($("ftEpochs").value) || 10,
+      manual_only: $("ftManualOnly").checked, reembed: $("ftReembed").checked,
+    });
+    toast(evalOnly ? "已启动基线评估" : "已启动 FastReID 微调");
+    await loadTrainingSummary();
+  } catch (e) { toast(e.message); }
+}
+async function rollbackReID() {
+  const r = await post("/api/training/rollback", {});
+  toast(r.message || "已回退"); await loadTrainingSummary();
+}
+async function exportDataset() {
+  try {
+    const r = await post("/api/training/export", { kind: $("expKind").value, manual_only: $("ftManualOnly").checked });
+    const s = r.summary;
+    $("exportResult").innerHTML = `导出完成：<code>${esc(s.out_dir)}</code><pre class="logbox" style="margin-top:6px;max-height:180px">${esc(JSON.stringify(s.kinds, null, 2))}</pre>`;
+    toast("训练数据集已导出");
+  } catch (e) { toast(e.message); }
+}
+
+/* ======================== 标注记录弹窗 ======================== */
 async function showRecords() {
-  $("recordsOverlay").style.display = "block";
+  $("recordsOverlay").classList.add("show");
   $("recAnnotator").value = $("annotator").value.trim();
   await loadRecords();
 }
-function closeRecords() { $("recordsOverlay").style.display = "none"; }
+function closeRecords() { $("recordsOverlay").classList.remove("show"); }
 async function loadRecords() {
   const who = $("recAnnotator").value.trim();
   const csvQ = who ? `?annotator=${encodeURIComponent(who)}` : "";
   $("recCsv").href = "/api/label/records.csv" + csvQ;
   const r = await api(`/api/label/records?limit=200${csvQ}`);
-  const table = (headTexts, rows) => `
-    <h4 style="margin:10px 0 4px">${esc(headTexts[0])}（${rows.length}）</h4>
-    <table style="width:100%; border-collapse:collapse" border="1">
-      <tr style="color:var(--muted)">${headTexts.map(h => `<th style="padding:3px 6px;text-align:left">${esc(h)}</th>`).join("")}</tr>
-      ${rows.join("") || `<tr><td colspan="${headTexts.length}" style="color:var(--muted)">无记录</td></tr>`}
-    </table>`;
+  const table = (head, rows) => `<h4 style="margin:10px 0 4px">${esc(head[0])}（${rows.length}）</h4>
+    <table class="tbl"><tr>${head.map(h => `<th>${esc(h)}</th>`).join("")}</tr>${rows.join("") || `<tr><td colspan="${head.length}" class="kbd">无记录</td></tr>`}</table>`;
   const caps = r.capture_records.map(x => {
-    const changes = [];
-    if (x.corrected_status) changes.push("状态→" + x.corrected_status);
-    if (x.corrected_stage) changes.push("环节→" + x.corrected_stage);
-    if (x.corrected_direction) changes.push("方向→" + x.corrected_direction);
-    if (x.corrected_color) changes.push("颜色→" + x.corrected_color);
-    if (x.corrected_type) changes.push("车型→" + x.corrected_type);
-    if (x.corrected_plate) changes.push("车牌→" + x.corrected_plate);
-    if (x.corrected_time) changes.push("时间→" + x.corrected_time);
-    if (x.no_vehicle_manual) changes.push("标记误检");
-    if (x.corrected_plate && !changes.some(c => c.startsWith("车牌"))) changes.push("车牌→" + x.corrected_plate);
-    return `<tr><td>#${x.capture_id}</td><td>${esc(x.park || "")}</td><td>${esc(x.order_id || "")}</td>
-      <td>${esc(changes.join("；") || "身份/车牌复核")}</td><td>${esc(x.annotator || "")}</td>
-      <td>${esc(x.updated_at || "")}</td></tr>`;
+    const ch = [];
+    if (x.corrected_plate) ch.push("车牌→" + x.corrected_plate);
+    if (x.corrected_type) ch.push("车型→" + cnType(x.corrected_type));
+    if (x.corrected_color) ch.push("颜色→" + cnColor(x.corrected_color));
+    if (x.no_vehicle_manual) ch.push("误检无车");
+    if (x.corrected_status) ch.push("状态→" + x.corrected_status);
+    if (x.corrected_stage) ch.push("环节→" + x.corrected_stage);
+    if (x.corrected_direction) ch.push("方向→" + x.corrected_direction);
+    if (x.corrected_time) ch.push("时间→" + x.corrected_time);
+    return `<tr><td>#${x.capture_id}</td><td>${esc(x.park || "")}</td><td>${esc(x.order_id || "")}</td><td>${esc(ch.join("；") || "同车/身份复核")}</td><td>${esc(x.annotator || "")}</td><td>${esc(x.updated_at || "")}</td></tr>`;
   });
-  const anchors = r.anchors.map(x => `
-    <tr><td>${esc(x.order_id)}</td><td>${esc(x.park || "")}</td><td>${esc(ANCHOR_CN[x.kind] || x.kind)}</td>
-      <td>${esc(x.anchor_time)}</td><td>${esc(x.annotator || "")}</td><td>${esc(x.created_at || "")}</td></tr>`);
-  const boxes = r.box_edits.map(x => `
-    <tr><td>#${x.capture_id}</td><td>${esc(x.park || "")}</td><td>${esc(x.order_id || "")}</td>
-      <td>${esc(x.box)}</td><td>${esc(x.edited_at || "")}</td></tr>`);
-  const devices = r.devices.map(x => `
-    <tr><td>${esc(x.device)}</td><td>${esc(x.park || "")}</td><td>${esc(x.location)}</td>
-      <td>${esc(x.direction || "—")}</td><td>${esc(x.annotator || "")}</td><td>${esc(x.created_at || "")}</td></tr>`);
+  const boxes = r.box_edits.map(x => `<tr><td>#${x.capture_id}</td><td>${esc(x.park || "")}</td><td>${esc(x.order_id || "")}</td><td>${esc(x.box)}</td><td>${esc(x.edited_at || "")}</td></tr>`);
   $("recordsBody").innerHTML =
     table(["照片", "园区", "订单", "修正内容", "标注人", "时间"], caps) +
-    table(["订单", "园区", "确认类型", "时刻", "标注人", "时间"], anchors) +
-    table(["照片", "园区", "订单", "框 [l,t,r,b]", "时间"], boxes) +
-    table(["设备", "园区", "机位", "方向", "标注人", "时间"], devices);
+    table(["照片", "园区", "订单", "重框 [l,t,r,b]", "时间"], boxes);
 }
 
-/* ---------------- 快捷键与初始化 ---------------- */
-function nextOrder() { if (state.qi + 1 < state.queue.length) selectOrder(state.qi + 1); else toast("队列到底了"); }
-function prevOrder() { if (state.qi > 0) selectOrder(state.qi - 1); }
+/* ======================== 统一快捷键（零冲突） ======================== */
 document.addEventListener("keydown", ev => {
   if (["INPUT", "TEXTAREA", "SELECT"].includes(ev.target.tagName)) return;
   if (ev.key === "Escape") {
-    if ($("recordsOverlay").style.display === "block") { closeRecords(); return; }
-    cancelBox(); return;
+    if ($("imgModal").classList.contains("show")) { closeImgModal(); return; }
+    if ($("advOverlay").classList.contains("show")) { closeAdvDialog(); return; }
+    if ($("recordsOverlay").classList.contains("show")) { closeRecords(); return; }
+    if (S.boxMode) { cancelBox(); return; }
+    return;
   }
-  if (ev.key === "Enter") { if (getBox()) saveBox(); else toast("框未画完：先按键盘 B 键开始框选"); return; }
-  if (ev.key === "b" || ev.key === "B") { startBox(); return; }
-  if (ev.key === "ArrowLeft" || ev.key === "j") { prevOrder(); return; }
-  if (ev.key === "ArrowRight" || ev.key === "k") { nextOrder(); return; }
-  if (ev.key === "s" || ev.key === "S") { savePanel(); return; }
-  if (ev.key === "r" || ev.key === "R") { markReviewed(); return; }
-  if (/^[1-6]$/.test(ev.key)) setStatus(STATUS[+ev.key - 1]);
+  if (S.tab !== "work") return;
+  if (ev.key === "Enter") {
+    if (S.boxMode && getBoxRect()) { saveBox(); return; }
+    if (!$("rNextCapBtn").disabled) { nextQueueItem(); return; }
+  }
+  if (ev.key === "ArrowLeft") { stepCand(-1); return; }
+  if (ev.key === "ArrowRight") { stepCand(1); return; }
+  if (ev.key === "ArrowUp") { ev.preventDefault(); prevQueueItem(); return; }
+  if (ev.key === "ArrowDown") { ev.preventDefault(); nextQueueItem(); return; }
+  const k = ev.key.toLowerCase();
+  if (k === "s" && !$("rSameBtn").disabled) savePair("same");
+  if (k === "d" && !$("rDiffBtn").disabled) savePair("different");
+  if (k === "u" && !$("rUncBtn").disabled) savePair("uncertain");
+  if (k === "n" && !$("rNewBtn").disabled) saveReidAction("new_identity");
+  if (k === "x" && !$("rInvBtn").disabled) saveReidAction("clear_identity", "invalid");
+  if (k === "w" && !$("saveCoreBtn").disabled) saveCoreFields();
+  if (k === "b" && !$("boxStartBtn").disabled) startBox();
+  if (k === "f") { $("reidFullImg").checked = !$("reidFullImg").checked; toggleImgMode(); }
 });
+
+/* ======================== 初始化 ======================== */
 (async function init() {
-  $("annotator").value = localStorage.getItem("label_annotator") || "";
-  $("annotator").onchange = e => localStorage.setItem("label_annotator", e.target.value.trim());
-  const parks = await api("/api/parks");
-  const plist = Array.isArray(parks) ? parks : (parks.park_items || parks.items || []);
-  $("parkSel").innerHTML = '<option value="">全部园区</option>' +
-    plist.map(p => `<option value="${esc(p.park)}">${esc(p.park || "未标注园区")}（${p.captures}）</option>`).join("");
-  await loadQueue();
+  const savedName = localStorage.getItem("label_annotator") || localStorage.getItem("reidAnnotator") || "";
+  $("annotator").value = savedName;
+  $("annotator").onchange = e => {
+    const v = e.target.value.trim();
+    localStorage.setItem("label_annotator", v);
+    localStorage.setItem("reidAnnotator", v);
+  };
+  const savedSize = localStorage.getItem("reid_cand_size") || "lg";
+  const savedFit = localStorage.getItem("reid_cand_fit") || "contain";
+  $("rCandSize").value = savedSize; applyCandSize(savedSize);
+  $("rCandFit").value = savedFit; applyCandFit(savedFit);
+
+  try {
+    const [codes, parks, stages] = await Promise.all([api("/api/color_type_codes"), api("/api/parks"), api("/api/stages")]);
+    if (codes.colors) COLOR_MAP = codes.colors;
+    if (codes.types) TYPE_MAP = codes.types;
+    const plist = Array.isArray(parks) ? parks : (parks.park_items || parks.items || []);
+    $("parkSel").innerHTML = '<option value="">全部园区</option>' +
+      plist.map(p => `<option value="${esc(p.park)}">${esc(p.park || "未标园")} (${p.captures})</option>`).join("");
+    $("stageSel").innerHTML = '<option value="">全部阶段</option>' +
+      (stages || []).map(x => `<option value="${esc(x.stage)}">${esc(x.stage)} (${x.count})</option>`).join("");
+  } catch (e) {}
+
+  if (INITIAL_TAB === "reid") $("qtype").value = "reid_unlabeled";
+  switchTab(INITIAL_TAB === "train" ? "train" : "work");
+  await Promise.all([loadReidStats(), loadQueue()]);
 })();
 </script>
 </body>

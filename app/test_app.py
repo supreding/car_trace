@@ -352,42 +352,60 @@ class AppTestCase(unittest.TestCase):
     # 10. 标注工作流与导出（实施文档 12/13 步）
     def test_annotation_workflow_and_export(self):
         target = self.db.execute(
-            """SELECT id FROM captures WHERE reid_embedding IS NOT NULL
+            """SELECT id, plate_final, plate_confidence, recognition_source, vehicle_id, plate_match_reason
+               FROM captures WHERE reid_embedding IS NOT NULL
                ORDER BY id DESC LIMIT 1""").fetchone()
         other = self.db.execute(
-            """SELECT id FROM captures WHERE reid_embedding IS NOT NULL
+            """SELECT id, plate_final, plate_confidence, recognition_source, vehicle_id, plate_match_reason
+               FROM captures WHERE reid_embedding IS NOT NULL
                AND id!=? ORDER BY id DESC LIMIT 1""",
             (target["id"],)).fetchone()
-        import json as _json
-
-        first = self.client.post(
-            "/api/annotations/capture",
-            json={"capture_id": target["id"], "action": "new_identity",
-                  "usability": "valid", "corrected_plate": "皖KTEST99", "annotator": "测试"},
-        )
-        self.assertEqual(first.status_code, 200, first.get_data(as_text=True))
-        identity_id = first.get_json()["item"]["identity_id"]
-        second = self.client.post(
-            "/api/annotations/pair",
-            json={"capture_id": target["id"], "candidate_id": other["id"],
-                  "relation": "same", "annotator": "测试"},
-        )
-        self.assertEqual(second.status_code, 200, second.get_data(as_text=True))
-        stats = self.get_json("/api/annotations/stats")
-        self.assertGreaterEqual(stats["same_pairs"], 1)
-        exported = self.client.get("/api/annotations/export.csv")
-        self.assertEqual(exported.status_code, 200)
-        self.assertIn("皖KTEST99", exported.get_data(as_text=True))
-        # 清理测试数据，不影响真实标注
-        self.db.execute("DELETE FROM pair_annotations WHERE left_capture_id=? OR right_capture_id=?",
-                        (target["id"], other["id"]))
-        self.db.execute("DELETE FROM capture_annotations WHERE capture_id IN (?, ?)",
-                        (target["id"], other["id"]))
-        self.db.execute("DELETE FROM annotation_identities WHERE id=?", (identity_id,))
-        self.db.execute(
-            "DELETE FROM annotation_audit WHERE capture_id IN (?, ?) AND annotator='测试'",
-            (target["id"], other["id"]))
-        self.db.commit()
+        orig_t, orig_o = dict(target), dict(other)
+        identity_id = None
+        try:
+            first = self.client.post(
+                "/api/annotations/capture",
+                json={"capture_id": target["id"], "action": "new_identity",
+                      "usability": "valid", "corrected_plate": "皖KTEST99", "annotator": "测试"},
+            )
+            self.assertEqual(first.status_code, 200, first.get_data(as_text=True))
+            identity_id = first.get_json()["item"]["identity_id"]
+            # 确认 /api/annotations/capture 也写回 plate_final（修复断链）
+            after_t = self.db.execute(
+                "SELECT plate_final, recognition_source FROM captures WHERE id=?",
+                (target["id"],)).fetchone()
+            self.assertEqual(after_t["plate_final"], "皖KTEST99")
+            self.assertEqual(after_t["recognition_source"], "人工标注")
+            second = self.client.post(
+                "/api/annotations/pair",
+                json={"capture_id": target["id"], "candidate_id": other["id"],
+                      "relation": "same", "sync_cluster": False, "annotator": "测试"},
+            )
+            self.assertEqual(second.status_code, 200, second.get_data(as_text=True))
+            stats = self.get_json("/api/annotations/stats")
+            self.assertGreaterEqual(stats["same_pairs"], 1)
+            exported = self.client.get("/api/annotations/export.csv")
+            self.assertEqual(exported.status_code, 200)
+            self.assertIn("皖KTEST99", exported.get_data(as_text=True))
+        finally:
+            # 清理测试数据并还原 captures 原值，不影响真实标注
+            self.db.execute("DELETE FROM pair_annotations WHERE left_capture_id=? OR right_capture_id=?",
+                            (target["id"], other["id"]))
+            self.db.execute("DELETE FROM capture_annotations WHERE capture_id IN (?, ?)",
+                            (target["id"], other["id"]))
+            if identity_id:
+                self.db.execute("DELETE FROM annotation_identities WHERE id=?", (identity_id,))
+            self.db.execute(
+                "DELETE FROM annotation_audit WHERE capture_id IN (?, ?) AND annotator='测试'",
+                (target["id"], other["id"]))
+            for orig in (orig_t, orig_o):
+                self.db.execute(
+                    """UPDATE captures SET plate_final=?, plate_confidence=?,
+                              recognition_source=?, vehicle_id=?, plate_match_reason=?
+                       WHERE id=?""",
+                    (orig["plate_final"], orig["plate_confidence"], orig["recognition_source"],
+                     orig["vehicle_id"], orig["plate_match_reason"], orig["id"]))
+            self.db.commit()
 
 
 class ProgressStatusTests(unittest.TestCase):
@@ -600,22 +618,29 @@ class LabelWorkspaceTests(unittest.TestCase):
         with closing(server.get_db()) as db:
             orig = dict(db.execute(
                 """SELECT stage, stage_rank, capture_time, hour, ocr_status,
-                          plate_final, vehicle_color FROM captures WHERE id=?""",
+                          plate_final, plate_confidence, recognition_source,
+                          vehicle_color, vehicle_color_conf, vehicle_type, vehicle_type_conf
+                   FROM captures WHERE id=?""",
                 (capture_id,)).fetchone())
         try:
             data = self.post("/api/label/capture", capture_id=capture_id,
-                             annotator="测试", notes="t",
+                             annotator="测试", skip_recluster=True,
                              fields={"corrected_stage": "入磅", "corrected_status": "入磅中",
                                      "corrected_direction": "out", "corrected_color": "白色",
+                                     "corrected_type": "货车",
                                      "corrected_time": "08:00:00",
                                      "corrected_plate": "皖L00001", "no_vehicle_manual": 0,
-                                     "usability": "valid"})
+                                     "usability": "valid", "notes": "字段内备注验证"})
             item = data["item"]
             self.assertEqual(item["stage"], "入磅")                      # 写回
             self.assertEqual(item["capture_time"].split(" ")[1], "08:00:00")
             self.assertEqual(item["ocr_status"], "manual")               # 防OCR覆盖
             self.assertEqual(item["plate_final"], "皖L00001")
-            self.assertEqual(item["vehicle_color"], "白色")
+            self.assertEqual(item["recognition_source"], "人工标注")
+            # 颜色/车型统一落标准英文码（与模型输出对齐，防止聚类第7步误拆）
+            self.assertEqual(item["vehicle_color"], "white")
+            self.assertEqual(item["vehicle_type"], "truck")
+            self.assertEqual(item["notes"], "字段内备注验证")
             detail = self.client.get(f"/api/order/{order_id}").get_json()
             target = [i for i in detail["items"] if i["id"] == capture_id][0]
             self.assertEqual(target["progress_status"], "入磅中")         # override
@@ -623,25 +648,44 @@ class LabelWorkspaceTests(unittest.TestCase):
         finally:
             with closing(server.get_db()) as db:
                 db.execute("""UPDATE captures SET stage=?, stage_rank=?, capture_time=?,
-                              hour=?, ocr_status=?, plate_final=?, vehicle_color=?
+                              hour=?, ocr_status=?, plate_final=?, plate_confidence=?,
+                              recognition_source=?, vehicle_color=?, vehicle_color_conf=?,
+                              vehicle_type=?, vehicle_type_conf=?
                               WHERE id=?""",
                            (orig["stage"], orig["stage_rank"], orig["capture_time"],
                             orig["hour"], orig["ocr_status"], orig["plate_final"],
-                            orig["vehicle_color"], capture_id))
+                            orig["plate_confidence"], orig["recognition_source"],
+                            orig["vehicle_color"], orig["vehicle_color_conf"],
+                            orig["vehicle_type"], orig["vehicle_type_conf"], capture_id))
                 db.execute("DELETE FROM capture_annotations WHERE capture_id=?", (capture_id,))
                 db.execute("DELETE FROM annotation_audit WHERE capture_id=?", (capture_id,))
                 db.commit()
 
     def test_photo_queue_types(self):
-        # 照片级队列：五类都返回照片条目（含 capture_id 供定位）
-        for qtype in ("direction_unknown", "plate_missing", "time_missing",
-                      "attr_low", "attr_review"):
+        # 照片级队列：包含聚类冲突与未关联散图在内的 7 类都返回照片条目
+        for qtype in ("cluster_split", "loose", "direction_unknown", "plate_missing",
+                      "time_missing", "attr_low", "attr_review"):
             data = self.get_json(f"/api/label/queue?type={qtype}&limit=5")
             self.assertEqual(data["level"], "photo")
             for item in data["items"]:
                 self.assertIn("capture_id", item)
                 self.assertIn("order_id", item)
                 self.assertIn("reason", item)
+
+    def test_unified_workbench_routes_and_training_summary(self):
+        # 旧入口 /annotate 与新入口 /label 合并到同一统一工作台模板
+        r_label = self.client.get("/label")
+        self.assertEqual(r_label.status_code, 200)
+        self.assertIn("统一人工标注工作台", r_label.get_data(as_text=True))
+        r_ann = self.client.get("/annotate")
+        self.assertEqual(r_ann.status_code, 200)
+        body_ann = r_ann.get_data(as_text=True)
+        self.assertIn("统一人工标注工作台", body_ann)
+        self.assertIn('INITIAL_TAB = "reid"', body_ann)
+        # 训练就绪度看板接口正常返回四类数据集指标
+        ts = self.get_json("/api/training/summary")
+        for key in ("reid", "detection", "attr", "lpr", "active_reid", "job"):
+            self.assertIn(key, ts)
 
     def test_label_queue_assumed_only(self):
         data = self.client.get("/api/label/queue?type=assumed").get_json()
@@ -708,10 +752,6 @@ class LabelWorkspaceTests(unittest.TestCase):
                 db.commit()
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class GateStageChoiceTests(unittest.TestCase):
     """环节下拉选"进大门/出大门" = 方向修正：环节本身不变、不伪造设备名，
     状态机按方向重算（该帧成为离场确认事件）。"""
@@ -748,6 +788,157 @@ class GateStageChoiceTests(unittest.TestCase):
         target = [i for i in detail["items"] if i["id"] == self.row["id"]][0]
         self.assertEqual(target["progress_status"], "大门出")          # 方向修正生效
         self.assertFalse(detail["progress_assumed"])                  # 离场被确认
+
+
+class ManualClusteringConstraintsTests(unittest.TestCase):
+    """隔离内存库验证：人工车牌/车型/配对约束在 associate_orders 中的精确行为。"""
+
+    def _make_db(self):
+        import build_db
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        build_db.ensure_schema(conn)
+        build_db.ensure_label_schema(conn)
+        return conn, build_db
+
+    def _add_cap(self, conn, cid, park, order_id, plate="", vtype="truck",
+                 lpr_conf=0.85, src="车牌模型", date="2026-08-10"):
+        emb = np.ones(8, dtype=np.float32)
+        emb = (emb / np.linalg.norm(emb)).tobytes()
+        conn.execute(
+            """INSERT INTO captures
+                 (id, filepath, filename, date, order_id, park, stage, stage_rank,
+                  plate_final, lpr_plate, lpr_conf, recognition_source,
+                  vehicle_type, capture_status, reid_embedding, reid_source)
+               VALUES (?,?,?,?,?,?, '入磅', 1, ?,?,?,?, ?, 'vehicle', ?, 'FastReID')""",
+            (cid, f"f{cid}.jpg", f"f{cid}.jpg", date, order_id, park,
+             plate, plate or None, lpr_conf, src, vtype, emb),
+        )
+
+    def test_manual_plate_trusted_and_not_wiped(self):
+        conn, build_db = self._make_db()
+        # 订单 O1 有两帧车牌 皖K11111 + 一帧人工标注车牌 皖K99999（不应被第6步清空）
+        self._add_cap(conn, 1, "P1", "O1", "皖K11111", "truck", 0.96)
+        self._add_cap(conn, 2, "P1", "O1", "皖K11111", "truck", 0.96)
+        self._add_cap(conn, 3, "P1", "O1", "皖K99999", "truck", 0.50, src="人工标注")
+        conn.execute(
+            """INSERT INTO capture_annotations (capture_id, usability, corrected_plate, annotator, updated_at)
+               VALUES (3, 'valid', '皖K99999', '测试', '2026-08-10T10:00:00')"""
+        )
+        # 订单 O2 单帧人工车牌 皖K11112（差1字符，应因人工车牌可信而挂靠到 皖K11111 锚点）
+        self._add_cap(conn, 4, "P1", "O3", "皖K11111", "truck", 0.96)
+        self._add_cap(conn, 5, "P1", "O2", "皖K11112", "truck", 0.50, src="人工标注")
+        conn.execute(
+            """INSERT INTO capture_annotations (capture_id, usability, corrected_plate, annotator, updated_at)
+               VALUES (5, 'valid', '皖K11112', '测试', '2026-08-10T10:00:00')"""
+        )
+        conn.commit()
+        build_db.associate_orders(conn)
+        r3 = conn.execute("SELECT plate_final FROM captures WHERE id=3").fetchone()
+        self.assertEqual(r3["plate_final"], "皖K99999", "人工标注车牌不应被第6步清空")
+        v1 = conn.execute("SELECT vehicle_id FROM captures WHERE id=1").fetchone()["vehicle_id"]
+        v5 = conn.execute("SELECT vehicle_id FROM captures WHERE id=5").fetchone()["vehicle_id"]
+        self.assertEqual(v1, v5, "单帧人工车牌应视为高可信并挂靠到相近锚点")
+
+    def test_pair_same_merges_and_different_blocks_merge(self):
+        conn, build_db = self._make_db()
+        # 两个无牌订单通过 pair_annotations(same) 应合并为同一 vehicle_id
+        self._add_cap(conn, 10, "P1", "NOPLATE_A", "", "truck")
+        self._add_cap(conn, 11, "P1", "NOPLATE_B", "", "truck")
+        conn.execute(
+            """INSERT INTO pair_annotations (left_capture_id, right_capture_id, relation, annotator, updated_at)
+               VALUES (10, 11, 'same', '测试', '2026-08-10T10:00:00')"""
+        )
+        # 两个同牌订单若被人工明确标为 different，严禁自动合并
+        self._add_cap(conn, 20, "P1", "SAMEP_A", "皖K88888", "truck", 0.98)
+        self._add_cap(conn, 21, "P1", "SAMEP_B", "皖K88888", "truck", 0.98)
+        conn.execute(
+            """INSERT INTO pair_annotations (left_capture_id, right_capture_id, relation, annotator, updated_at)
+               VALUES (20, 21, 'different', '测试', '2026-08-10T10:00:00')"""
+        )
+        conn.commit()
+        build_db.associate_orders(conn)
+        v10 = conn.execute("SELECT vehicle_id FROM captures WHERE id=10").fetchone()["vehicle_id"]
+        v11 = conn.execute("SELECT vehicle_id FROM captures WHERE id=11").fetchone()["vehicle_id"]
+        self.assertIsNotNone(v10)
+        self.assertEqual(v10, v11, "人工同车配对应合并无牌订单")
+        v20 = conn.execute("SELECT vehicle_id FROM captures WHERE id=20").fetchone()["vehicle_id"]
+        v21 = conn.execute("SELECT vehicle_id FROM captures WHERE id=21").fetchone()["vehicle_id"]
+        self.assertNotEqual(v20, v21, "人工不同车配对应阻止错误合并")
+
+    def test_replay_manual_normalizes_chinese_type(self):
+        conn, build_db = self._make_db()
+        self._add_cap(conn, 30, "P1", "O9", "皖K55555", "truck", 0.96)
+        self._add_cap(conn, 31, "P1", "O9", "皖K55555", "sedan", 0.96)
+        # 模拟旧记录里曾存有中文 "货车"
+        conn.execute(
+            """INSERT INTO capture_annotations (capture_id, usability, corrected_type, corrected_color, annotator, updated_at)
+               VALUES (31, 'valid', '货车', '红色', '测试', '2026-08-10T10:00:00')"""
+        )
+        conn.commit()
+        build_db.replay_manual(conn)
+        r31 = conn.execute("SELECT vehicle_type, vehicle_color FROM captures WHERE id=31").fetchone()
+        self.assertEqual((r31["vehicle_type"], r31["vehicle_color"]), ("truck", "red"))
+        build_db.associate_orders(conn)
+        v30 = conn.execute("SELECT vehicle_id FROM captures WHERE id=30").fetchone()["vehicle_id"]
+        v31 = conn.execute("SELECT vehicle_id FROM captures WHERE id=31").fetchone()["vehicle_id"]
+        self.assertEqual(v30, v31, "归一为 truck 后不再被第7步拆出聚类")
+
+    def test_osd_device_code_and_rear_direction_flip(self):
+        import build_db
+        # 1) 单图解析：严格按设备编号 DMR=进、DMC=出、CK=仓库抓拍（不被 NVR 误报的「(背向)」干扰）
+        cam, vt = build_db._parse_osd_camera_and_type(
+            "监控点编号：02监控点信息：临泉大门抑拍进设备编号：DMRO1车牌号码：蓝皖KM9U08车辆类型：小货车"
+        )
+        self.assertEqual(cam, "大门抓拍进")
+        cam, vt = build_db._parse_osd_camera_and_type(
+            "监控点编号：01监控点信息：大门抑拍出设备编号：DMC01车牌号码：蓝皖K5713A品牌：特型车-罐车（背向）"
+        )
+        self.assertEqual(cam, "大门抓拍出")
+        self.assertEqual(build_db.normalize_type(vt), "truck")
+        cam, vt = build_db._parse_osd_camera_and_type(
+            "监控点编号：03监控点信息：临泉仓库抑拍1设备编号：CK01车牌号码：黄皖AM9959车辆类型：SUV/MPV品牌：卡车-渣土车"
+        )
+        self.assertEqual(cam, "仓库抓拍")
+        self.assertEqual(vt, "货车")
+
+        # 2) 时序对向连拍纠偏：同车牌 1~60s 内先后触发 DMR -> DMC（或 DMC -> DMR），
+        #    第 2 张改标背向；单独只触发一次 DMC（如地磅直出）必须保持「大门抓拍出」不误翻。
+        conn, build_db = self._make_db()
+        rows = [
+            (1, "P1", "未关联图片", "2026-11-06 07:12:42", "大门抓拍进", "皖KM9V08"),
+            (2, "P1", "未关联图片", "2026-11-06 07:12:49", "大门抓拍出", "皖KM9V08"),
+            (3, "P1", "未关联图片", "2026-11-06 07:30:06", "大门抓拍出", "皖KM9V08"),
+            (4, "P1", "未关联图片", "2026-11-06 07:30:29", "大门抓拍进", "皖KM9V08"),
+            (5, "P1", "未关联图片", "2026-11-06 17:58:09", "大门抓拍出", "皖K5713A"),
+        ]
+        for cid, park, oid, ct, ocam, plate in rows:
+            conn.execute(
+                """INSERT INTO captures
+                     (id, filepath, filename, date, order_id, park, stage, stage_rank,
+                      capture_time, osd_camera, plate_final, osd_plate, capture_status)
+                   VALUES (?,?,?,?,?,?, '抓拍', 3, ?,?,?,?, 'vehicle')""",
+                (cid, f"f{cid}.jpg", f"f{cid}.jpg", "2026-11-06", oid, park, ct, ocam, plate, plate),
+            )
+        conn.commit()
+        fixed = build_db.fix_opposite_gate_rear_directions(conn)
+        self.assertEqual(fixed, 2)
+        cams = {r[0]: r[1] for r in conn.execute("SELECT id, osd_camera FROM captures ORDER BY id").fetchall()}
+        self.assertEqual(cams[1], "大门抓拍进")
+        self.assertEqual(cams[2], "大门抓拍进(背向)")
+        self.assertEqual(cams[3], "大门抓拍出")
+        self.assertEqual(cams[4], "大门抓拍出(背向)")
+        self.assertEqual(cams[5], "大门抓拍出")
+
+    def test_warehouse_snap_confirms_unloading(self):
+        # 入磅仅 2 分钟后拍到仓库抓拍（CK），即使未到 weigh_min 也应实锤「卸货」
+        events = [
+            ("2026-11-10 09:00:00", "入磅", ""),
+            ("2026-11-10 09:02:00", "抓拍", "unload"),
+        ]
+        info = server.compute_progress_status(events, now=datetime(2026, 11, 10, 9, 3, 0))
+        self.assertEqual(info["progress_status"], "卸货")
+        self.assertFalse(info["progress_assumed"])
 
 
 if __name__ == "__main__":
